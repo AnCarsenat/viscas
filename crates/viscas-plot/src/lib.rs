@@ -10,6 +10,7 @@
 pub mod cancel;
 pub mod curve;
 pub mod geom;
+pub mod implicit;
 pub mod options;
 pub mod view;
 
@@ -19,5 +20,6 @@ pub use curve::{
     sample_explicit_x, sample_parametric,
 };
 pub use geom::{LineStyle, Polygon, Polyline, Primitive, Rect, Vec2};
+pub use implicit::plot_implicit;
 pub use options::PlotOptions;
 pub use view::{Affine, Ticks, View, nice_step};
