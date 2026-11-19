@@ -22,12 +22,21 @@ impl Vec2 {
         self.x.hypot(self.y)
     }
 
-    /// Linear interpolation `self + (other - self) * t`.
+    /// Linear interpolation `self + (other - self) * t`, computed from the
+    /// nearer endpoint for accuracy when the endpoints differ hugely.
     pub fn lerp(self, other: Self, t: f64) -> Self {
-        Self::new(
-            self.x + (other.x - self.x) * t,
-            self.y + (other.y - self.y) * t,
-        )
+        if t <= 0.5 {
+            Self::new(
+                self.x + (other.x - self.x) * t,
+                self.y + (other.y - self.y) * t,
+            )
+        } else {
+            let u = 1.0 - t;
+            Self::new(
+                other.x + (self.x - other.x) * u,
+                other.y + (self.y - other.y) * u,
+            )
+        }
     }
 }
 
@@ -245,7 +254,7 @@ fn clip_segment(p0: Vec2, p1: Vec2, r: &Rect) -> Option<(f64, f64)> {
             }
         }
     }
-    Some((t0, t1))
+    (t0 < t1).then_some((t0, t1))
 }
 
 /// Clip an open polyline to `rect`, returning the visible pieces (each with
