@@ -1,0 +1,9 @@
+[package]
+name = "viscas-scene"
+description = "Node tree and reactive dependency graph for Viscas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

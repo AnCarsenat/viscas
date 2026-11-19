@@ -1,0 +1,9 @@
+[package]
+name = "viscas-core"
+description = "Parser, evaluator, exact arithmetic and CAS for Viscas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

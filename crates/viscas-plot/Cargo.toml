@@ -1,0 +1,9 @@
+[package]
+name = "viscas-plot"
+description = "Plot sampling and view transforms for Viscas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

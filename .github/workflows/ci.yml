@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install system deps
+        run: pacman -Syu --noconfirm --needed gtk4 libadwaita pkgconf base-devel rustup git
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup default stable && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
