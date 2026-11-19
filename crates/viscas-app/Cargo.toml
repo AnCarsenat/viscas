@@ -11,4 +11,6 @@ name = "viscas"
 path = "src/main.rs"
 
 [dependencies]
-gtk4.workspace = true
+adw.workspace = true
+gtk4 = { workspace = true, features = ["v4_14"] }
+pangocairo.workspace = true
