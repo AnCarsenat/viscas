@@ -11,7 +11,9 @@ pub mod cancel;
 pub mod curve;
 pub mod geom;
 pub mod implicit;
+pub mod inequality;
 pub mod options;
+pub mod points;
 pub mod view;
 
 pub use cancel::{CancelToken, Cancelled};
@@ -21,5 +23,10 @@ pub use curve::{
 };
 pub use geom::{LineStyle, Polygon, Polyline, Primitive, Rect, Vec2};
 pub use implicit::plot_implicit;
+pub use inequality::{
+    Comparison, Region, plot_explicit_inequality, plot_explicit_x_inequality,
+    plot_implicit_inequality,
+};
 pub use options::PlotOptions;
+pub use points::{plot_point_list, plot_points};
 pub use view::{Affine, Ticks, View, nice_step};
