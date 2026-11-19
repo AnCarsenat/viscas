@@ -1,8 +1,9 @@
-//! Cairo rendering of the Cartesian grid.
+//! Cairo rendering of the Cartesian grid layer.
 
 use adw::prelude::*;
 use gtk::{cairo, gdk, pango};
 
+use super::Layer;
 use super::view::{View, format_tick, grid_steps, ticks};
 
 /// Minimum distance between major gridlines, in logical pixels.
@@ -22,8 +23,8 @@ struct Palette {
 impl Palette {
     /// Derives all grid colors from the widget's foreground color, so the
     /// grid follows light, dark and high-contrast styles automatically.
-    fn from_widget(widget: &impl IsA<gtk::Widget>) -> Self {
-        let fg = widget.as_ref().color();
+    fn from_widget(widget: &gtk::Widget) -> Self {
+        let fg = widget.color();
         let hc = adw::StyleManager::default().is_high_contrast();
         let with_alpha = |a: f32| {
             let mut c = fg;
@@ -44,7 +45,21 @@ fn crisp(v: f64) -> f64 {
     v.floor() + 0.5
 }
 
-pub fn draw_grid(widget: &gtk::DrawingArea, cr: &cairo::Context, view: &View) {
+/// Clamps without panicking when `lo > hi` (tiny widgets): `hi` wins.
+fn clamp_soft(v: f64, lo: f64, hi: f64) -> f64 {
+    v.max(lo).min(hi)
+}
+
+/// Background layer: minor/major gridlines, axes and tick labels.
+pub struct GridLayer;
+
+impl Layer for GridLayer {
+    fn draw(&self, widget: &gtk::Widget, cr: &cairo::Context, view: &View) {
+        draw_grid(widget, cr, view);
+    }
+}
+
+fn draw_grid(widget: &gtk::Widget, cr: &cairo::Context, view: &View) {
     let palette = Palette::from_widget(widget);
     let (w, h) = view.size;
     if w <= 0.0 || h <= 0.0 {
@@ -125,7 +140,7 @@ pub fn draw_grid(widget: &gtk::DrawingArea, cr: &cairo::Context, view: &View) {
         }
         let (tw, th) = text_size(&format_tick(x, steps.major));
         let sx = view.world_to_screen(x, 0.0).0 - tw / 2.0;
-        let sy = (oy + LABEL_GAP).clamp(EDGE_MARGIN, h - th - EDGE_MARGIN);
+        let sy = clamp_soft(oy + LABEL_GAP, EDGE_MARGIN, h - th - EDGE_MARGIN);
         show_layout(cr, &layout, sx, sy);
     }
     for (i, y) in ticks(bounds.y_min, bounds.y_max, steps.major) {
@@ -133,13 +148,15 @@ pub fn draw_grid(widget: &gtk::DrawingArea, cr: &cairo::Context, view: &View) {
             continue;
         }
         let (tw, th) = text_size(&format_tick(y, steps.major));
-        let sx = (ox - LABEL_GAP - tw).clamp(EDGE_MARGIN, w - tw - EDGE_MARGIN);
+        let sx = clamp_soft(ox - LABEL_GAP - tw, EDGE_MARGIN, w - tw - EDGE_MARGIN);
         let sy = view.world_to_screen(0.0, y).1 - th / 2.0;
         show_layout(cr, &layout, sx, sy);
     }
     if (0.0..=w).contains(&ox) && (0.0..=h).contains(&oy) {
-        let (tw, _) = text_size("0");
-        show_layout(cr, &layout, ox - LABEL_GAP - tw, oy + LABEL_GAP);
+        let (tw, th) = text_size("0");
+        let sx = clamp_soft(ox - LABEL_GAP - tw, EDGE_MARGIN, w - tw - EDGE_MARGIN);
+        let sy = clamp_soft(oy + LABEL_GAP, EDGE_MARGIN, h - th - EDGE_MARGIN);
+        show_layout(cr, &layout, sx, sy);
     }
 }
 
@@ -152,4 +169,16 @@ fn stroke(cr: &cairo::Context) {
     // A failed stroke only means the cairo context is in an error state;
     // there is nothing useful to do about it mid-frame.
     let _ = cr.stroke();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_soft;
+
+    #[test]
+    fn clamp_soft_never_panics() {
+        assert_eq!(clamp_soft(5.0, 0.0, 10.0), 5.0);
+        assert_eq!(clamp_soft(-1.0, 0.0, 10.0), 0.0);
+        assert_eq!(clamp_soft(5.0, 4.0, -3.0), -3.0);
+    }
 }

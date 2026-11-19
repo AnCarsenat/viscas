@@ -343,8 +343,10 @@ mod tests {
 
     #[test]
     fn center_is_clamped() {
-        let mut v = View::default();
-        v.scale = MIN_SCALE;
+        let mut v = View {
+            scale: MIN_SCALE,
+            ..View::default()
+        };
         v.pan_by_pixels(-1e9, 1e9);
         assert_eq!(v.center, (MAX_CENTER, MAX_CENTER));
         v.pan_by_pixels(f64::INFINITY, 0.0);

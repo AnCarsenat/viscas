@@ -4,6 +4,7 @@ extern crate gtk4 as gtk;
 
 mod app;
 mod panels;
+mod shortcuts;
 mod viewport;
 mod window;
 

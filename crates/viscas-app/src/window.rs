@@ -6,21 +6,27 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use crate::panels::{self, Panel};
-use crate::viewport;
+use crate::panels::{self, PanelCtx};
+use crate::viewport::Viewport;
 
-/// Sidebar width limits when resized by dragging its edge, in pixels.
+/// Default sidebar width range (the width follows `SIDEBAR_FRACTION` within it).
+const SIDEBAR_DEFAULT_MIN: f64 = 380.0;
+const SIDEBAR_DEFAULT_MAX: f64 = 440.0;
+const SIDEBAR_FRACTION: f64 = 0.3;
+/// Limits for a sidebar width chosen by dragging its edge.
 const SIDEBAR_MIN_WIDTH: f64 = 300.0;
 const SIDEBAR_MAX_WIDTH: f64 = 640.0;
+/// A dragged sidebar never takes more than this fraction of the split view.
+const SIDEBAR_MAX_FRACTION: f64 = 0.6;
 
 /// Builds and returns the main window for `app`.
 pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
-    let stack = panels::build_stack();
+    let stack = panels::build_stack(&PanelCtx::default());
     let split_view = adw::OverlaySplitView::builder()
         .content(&build_content())
-        .min_sidebar_width(380.0)
-        .max_sidebar_width(440.0)
-        .sidebar_width_fraction(0.3)
+        .min_sidebar_width(SIDEBAR_DEFAULT_MIN)
+        .max_sidebar_width(SIDEBAR_DEFAULT_MAX)
+        .sidebar_width_fraction(SIDEBAR_FRACTION)
         .build();
     let sidebar = resizable_sidebar(&split_view, &build_sidebar(&stack));
     split_view.set_sidebar(Some(&sidebar));
@@ -98,7 +104,7 @@ fn build_content() -> gtk::Widget {
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&viewport::build()));
+    toolbar.set_content(Some(Viewport::new().widget()));
     toolbar.upcast()
 }
 
@@ -118,37 +124,88 @@ fn primary_menu() -> gio::Menu {
 /// Lets the user resize the sidebar by dragging its trailing edge.
 ///
 /// `AdwOverlaySplitView` has no built-in resize handle, so a thin strip is
-/// overlaid on the sidebar edge and pins min/max width to the dragged value.
+/// overlaid on the sidebar edge. The drag gesture lives on the stationary
+/// split view (so the moving handle cannot feed back into the drag), only
+/// claims presses on the handle, and derives the width from the absolute
+/// pointer position. The chosen width pins min/max sidebar width while the
+/// split view is expanded; collapsing restores the defaults.
 fn resizable_sidebar(split_view: &adw::OverlaySplitView, sidebar: &gtk::Widget) -> gtk::Widget {
     let handle = gtk::Box::builder()
         .width_request(6)
         .halign(gtk::Align::End)
-        .cursor(&gtk::gdk::Cursor::from_name("col-resize", None).expect("cursor name is valid"))
         .build();
+    handle.set_cursor_from_name(Some("col-resize"));
     let overlay = gtk::Overlay::builder().child(sidebar).build();
     overlay.add_overlay(&handle);
 
-    let start_width = Rc::new(Cell::new(0.0));
+    // Width picked by the user, re-applied when the split view expands.
+    let chosen = Rc::new(Cell::new(None::<f64>));
+
     let drag = gtk::GestureDrag::new();
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
     drag.connect_drag_begin(glib::clone!(
-        #[strong]
-        start_width,
         #[weak]
-        overlay,
-        move |_, _, _| start_width.set(f64::from(overlay.width()))
+        handle,
+        move |gesture, x, y| {
+            let Some(split_view) = gesture.widget() else {
+                return;
+            };
+            let on_handle = split_view
+                .pick(x, y, gtk::PickFlags::DEFAULT)
+                .is_some_and(|w| w == handle || w.is_ancestor(&handle));
+            let collapsed = split_view
+                .downcast_ref::<adw::OverlaySplitView>()
+                .is_some_and(|s| s.is_collapsed());
+            if on_handle && !collapsed {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            } else {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+            }
+        }
     ));
     drag.connect_drag_update(glib::clone!(
-        #[weak]
-        split_view,
-        move |_, dx, _| {
-            let rtl = split_view.direction() == gtk::TextDirection::Rtl;
-            let dx = if rtl { -dx } else { dx };
-            let width = (start_width.get() + dx).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        #[strong]
+        chosen,
+        move |gesture, ox, _| {
+            let Some(split_view) = gesture.widget().and_downcast::<adw::OverlaySplitView>() else {
+                return;
+            };
+            let Some((sx, _)) = gesture.start_point() else {
+                return;
+            };
+            let x = sx + ox;
+            let total = f64::from(split_view.width());
+            let width = if split_view.direction() == gtk::TextDirection::Rtl {
+                total - x
+            } else {
+                x
+            };
+            let max = SIDEBAR_MAX_WIDTH.min(total * SIDEBAR_MAX_FRACTION);
+            let width = width.max(SIDEBAR_MIN_WIDTH).min(max);
+            chosen.set(Some(width));
             split_view.set_min_sidebar_width(width);
             split_view.set_max_sidebar_width(width);
         }
     ));
-    handle.add_controller(drag);
+    split_view.add_controller(drag);
+
+    split_view.connect_collapsed_notify(move |split_view| {
+        if split_view.is_collapsed() {
+            split_view.set_min_sidebar_width(SIDEBAR_DEFAULT_MIN);
+            split_view.set_max_sidebar_width(SIDEBAR_DEFAULT_MAX);
+        } else if let Some(width) = chosen.get() {
+            let total = f64::from(split_view.width());
+            let max = if total > 0.0 {
+                SIDEBAR_MAX_WIDTH.min(total * SIDEBAR_MAX_FRACTION)
+            } else {
+                SIDEBAR_MAX_WIDTH
+            };
+            let width = width.max(SIDEBAR_MIN_WIDTH).min(max);
+            split_view.set_min_sidebar_width(width);
+            split_view.set_max_sidebar_width(width);
+        }
+    });
+
     overlay.upcast()
 }
 
@@ -174,20 +231,4 @@ fn install_actions(
         action.set_enabled(false);
         window.add_action(&action);
     }
-}
-
-/// Keyboard accelerators for window actions, as `(detailed action, accels)`.
-pub fn accels() -> Vec<(String, Vec<String>)> {
-    let mut list = vec![
-        ("win.toggle-sidebar".to_owned(), vec!["F9".to_owned()]),
-        ("win.undo".to_owned(), vec!["<Control>z".to_owned()]),
-        ("win.redo".to_owned(), vec!["<Control><Shift>z".to_owned()]),
-    ];
-    for (i, panel) in Panel::ALL.iter().enumerate() {
-        list.push((
-            format!("win.panel::{}", panel.id()),
-            vec![format!("<Control>{}", i + 1)],
-        ));
-    }
-    list
 }

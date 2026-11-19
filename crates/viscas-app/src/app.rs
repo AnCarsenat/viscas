@@ -3,7 +3,7 @@
 use adw::prelude::*;
 use gtk::gio;
 
-use crate::window;
+use crate::{shortcuts, window};
 
 pub const APP_ID: &str = "io.github.ancarsenat.Viscas";
 
@@ -32,12 +32,7 @@ fn setup(app: &adw::Application) {
         .build();
     app.add_action_entries([quit, about, shortcuts]);
 
-    app.set_accels_for_action("app.quit", &["<Control>q"]);
-    app.set_accels_for_action("app.shortcuts", &["<Control>question"]);
-    for (action, accels) in window::accels() {
-        let accels: Vec<&str> = accels.iter().map(String::as_str).collect();
-        app.set_accels_for_action(&action, &accels);
-    }
+    shortcuts::install(app);
 }
 
 fn show_about(app: &adw::Application) {
@@ -63,15 +58,9 @@ fn show_about(app: &adw::Application) {
 
 /// Temporary shortcuts overview until a proper shortcuts dialog exists.
 fn show_shortcuts(app: &adw::Application) {
-    const SHORTCUTS: &str = "\
-Ctrl+Q\tQuit
-F9\tToggle sidebar
-Ctrl+1 … Ctrl+5\tSwitch sidebar panel
-Scroll\tZoom graph at cursor
-Drag\tPan graph";
     let dialog = adw::AlertDialog::builder()
         .heading("Keyboard Shortcuts")
-        .body(SHORTCUTS)
+        .body(shortcuts::overview())
         .build();
     dialog.add_response("close", "_Close");
     dialog.present(app.active_window().as_ref());

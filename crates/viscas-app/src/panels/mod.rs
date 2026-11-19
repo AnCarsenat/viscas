@@ -12,6 +12,13 @@ mod sheets;
 
 use adw::prelude::*;
 
+/// Shared context handed to every panel when it is built.
+///
+/// Empty for now; it will carry the document/scene handle, the viewport and
+/// other services panels need, so adding one does not change every signature.
+#[derive(Debug, Clone, Default)]
+pub struct PanelCtx {}
+
 /// The sidebar panels, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -84,23 +91,23 @@ impl Panel {
     }
 
     /// Builds the panel's widget.
-    pub fn build(self) -> gtk::Widget {
+    pub fn build(self, ctx: &PanelCtx) -> gtk::Widget {
         match self {
-            Panel::Expressions => expressions::build(),
-            Panel::Console => console::build(),
-            Panel::Sheets => sheets::build(),
-            Panel::Scripts => scripts::build(),
-            Panel::Scene => scene::build(),
+            Panel::Expressions => expressions::build(ctx),
+            Panel::Console => console::build(ctx),
+            Panel::Sheets => sheets::build(ctx),
+            Panel::Scripts => scripts::build(ctx),
+            Panel::Scene => scene::build(ctx),
         }
     }
 }
 
 /// Builds a view stack holding every panel, one page each.
-pub fn build_stack() -> adw::ViewStack {
+pub fn build_stack(ctx: &PanelCtx) -> adw::ViewStack {
     let stack = adw::ViewStack::new();
     for panel in Panel::ALL {
         stack.add_titled_with_icon(
-            &panel.build(),
+            &panel.build(ctx),
             Some(panel.id()),
             panel.title(),
             panel.icon_name(),
