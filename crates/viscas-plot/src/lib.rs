@@ -7,6 +7,7 @@
 //! `?Sized` closure references (so `&dyn Fn(..) + Send + Sync` works) and poll
 //! a [`CancelToken`], which makes them suitable for worker threads.
 
+pub mod analysis;
 pub mod cancel;
 pub mod curve;
 pub mod geom;
@@ -16,6 +17,10 @@ pub mod options;
 pub mod points;
 pub mod view;
 
+pub use analysis::{
+    Feature, FeatureKind, brent_root, explicit_features, find_extrema, find_intersections,
+    find_roots, golden_min, nearest_feature,
+};
 pub use cancel::{CancelToken, Cancelled};
 pub use curve::{
     plot_explicit, plot_explicit_on, plot_explicit_x, plot_parametric, plot_polar, sample_explicit,
