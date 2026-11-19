@@ -55,10 +55,6 @@ impl Default for View {
     }
 }
 
-fn sanitize_px(v: f64) -> f64 {
-    if v.is_finite() { v.max(1.0) } else { 1.0 }
-}
-
 fn span_ok(lo: f64, hi: f64) -> bool {
     let span = hi - lo;
     let c = 0.5 * (lo + hi);
@@ -69,42 +65,89 @@ fn span_ok(lo: f64, hi: f64) -> bool {
         && span >= (c.abs() * MIN_REL_SPAN).max(MIN_ABS_SPAN)
 }
 
+/// Why a [`View`] could not be constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewError {
+    /// Bounds are non-finite, inverted, or the span is too small/large for
+    /// `f64` sampling (relative span below 1e-11 or above 1e15).
+    InvalidBounds,
+    /// Pixel size is non-finite or below 1.
+    InvalidSize,
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ViewError::InvalidBounds => "invalid view bounds",
+            ViewError::InvalidSize => "invalid view pixel size",
+        })
+    }
+}
+
+impl std::error::Error for ViewError {}
+
+fn size_ok(v: f64) -> bool {
+    v.is_finite() && v >= 1.0
+}
+
 impl View {
     /// Create a view showing `bounds` on a `width_px`×`height_px` canvas.
-    /// Invalid bounds fall back to the default `[-10, 10]` ranges per axis.
+    pub fn try_new(bounds: Rect, width_px: f64, height_px: f64) -> Result<Self, ViewError> {
+        if !(size_ok(width_px) && size_ok(height_px)) {
+            return Err(ViewError::InvalidSize);
+        }
+        if !(span_ok(bounds.x_min, bounds.x_max) && span_ok(bounds.y_min, bounds.y_max)) {
+            return Err(ViewError::InvalidBounds);
+        }
+        Ok(Self {
+            x_min: bounds.x_min,
+            x_max: bounds.x_max,
+            y_min: bounds.y_min,
+            y_max: bounds.y_max,
+            width_px,
+            height_px,
+        })
+    }
+
+    /// Like [`View::try_new`] for inputs known to be valid (constants, tests).
+    ///
+    /// # Panics
+    /// If the bounds or size are invalid; use [`View::try_new`] for user input
+    /// and [`View::default`] as a fallback.
     pub fn new(bounds: Rect, width_px: f64, height_px: f64) -> Self {
-        let (x_min, x_max) = if span_ok(bounds.x_min, bounds.x_max) {
-            (bounds.x_min, bounds.x_max)
-        } else {
-            (-10.0, 10.0)
-        };
-        let (y_min, y_max) = if span_ok(bounds.y_min, bounds.y_max) {
-            (bounds.y_min, bounds.y_max)
-        } else {
-            (-10.0, 10.0)
-        };
-        Self {
-            x_min,
-            x_max,
-            y_min,
-            y_max,
-            width_px: sanitize_px(width_px),
-            height_px: sanitize_px(height_px),
+        match Self::try_new(bounds, width_px, height_px) {
+            Ok(v) => v,
+            Err(e) => panic!("{e}: {bounds:?} at {width_px}x{height_px} px"),
         }
     }
 
     /// Aspect-locked view centered at `center` with `units_per_px` world units
     /// per pixel on both axes.
-    pub fn centered(center: Vec2, units_per_px: f64, width_px: f64, height_px: f64) -> Self {
-        let w = sanitize_px(width_px);
-        let h = sanitize_px(height_px);
-        let hx = 0.5 * units_per_px * w;
-        let hy = 0.5 * units_per_px * h;
-        Self::new(
+    pub fn try_centered(
+        center: Vec2,
+        units_per_px: f64,
+        width_px: f64,
+        height_px: f64,
+    ) -> Result<Self, ViewError> {
+        if !(size_ok(width_px) && size_ok(height_px)) {
+            return Err(ViewError::InvalidSize);
+        }
+        let hx = 0.5 * units_per_px * width_px;
+        let hy = 0.5 * units_per_px * height_px;
+        Self::try_new(
             Rect::new(center.x - hx, center.y - hy, center.x + hx, center.y + hy),
-            w,
-            h,
+            width_px,
+            height_px,
         )
+    }
+
+    /// # Panics
+    /// If the resulting view is invalid (see [`View::try_centered`]).
+    pub fn centered(center: Vec2, units_per_px: f64, width_px: f64, height_px: f64) -> Self {
+        match Self::try_centered(center, units_per_px, width_px, height_px) {
+            Ok(v) => v,
+            Err(e) => panic!("{e}"),
+        }
     }
 
     pub fn bounds(&self) -> Rect {
@@ -222,14 +265,20 @@ impl View {
     }
 
     /// Change the canvas size, keeping the center and units per pixel (so
-    /// content does not stretch when the window is resized).
+    /// content does not stretch when the window is resized). Sizes below one
+    /// pixel (a collapsed widget) are treated as one pixel; non-finite sizes
+    /// or sizes that would overflow the span leave the view unchanged.
     pub fn resize(&mut self, width_px: f64, height_px: f64) {
+        if !(width_px.is_finite() && height_px.is_finite()) {
+            return;
+        }
         let (ux, uy) = (self.units_per_px_x(), self.units_per_px_y());
         let c = self.bounds().center();
-        let w = sanitize_px(width_px);
-        let h = sanitize_px(height_px);
+        let (w, h) = (width_px.max(1.0), height_px.max(1.0));
         let (hx, hy) = (0.5 * ux * w, 0.5 * uy * h);
-        *self = Self::new(Rect::new(c.x - hx, c.y - hy, c.x + hx, c.y + hy), w, h);
+        if let Ok(v) = Self::try_new(Rect::new(c.x - hx, c.y - hy, c.x + hx, c.y + hy), w, h) {
+            *self = v;
+        }
     }
 
     /// Grid ticks along x with majors at least `min_major_px` pixels apart.
@@ -294,7 +343,15 @@ impl Ticks {
     pub fn for_range(lo: f64, hi: f64, min_step: f64) -> Self {
         let major_step = nice_step(min_step);
         let minor_step = minor_step(major_step);
-        let ratio = (major_step / minor_step).round() as i64;
+        if !(major_step.is_finite() && minor_step.is_finite() && minor_step > 0.0) {
+            return Self {
+                major_step,
+                minor_step,
+                major: Vec::new(),
+                minor: Vec::new(),
+            };
+        }
+        let ratio = ((major_step / minor_step).round() as i64).max(1);
         let major = Self::positions(lo, hi, major_step, None);
         let minor = Self::positions(lo, hi, minor_step, Some(ratio));
         Self {
@@ -439,10 +496,55 @@ mod tests {
     }
 
     #[test]
-    fn invalid_bounds_fall_back() {
-        let v = View::new(Rect::new(1.0, f64::NAN, 1.0, 2.0), 0.0, -5.0);
-        assert_eq!(v.bounds(), Rect::new(-10.0, -10.0, 10.0, 10.0));
+    fn invalid_views_are_rejected() {
+        let ok = Rect::new(-1.0, -1.0, 1.0, 1.0);
+        assert_eq!(
+            View::try_new(Rect::new(1.0, 0.0, 1.0, 2.0), 10.0, 10.0),
+            Err(ViewError::InvalidBounds)
+        );
+        assert_eq!(
+            View::try_new(Rect::new(0.0, f64::NAN, 1.0, 2.0), 10.0, 10.0),
+            Err(ViewError::InvalidBounds)
+        );
+        assert_eq!(
+            View::try_new(Rect::new(2.0, 0.0, 1.0, 1.0), 10.0, 10.0),
+            Err(ViewError::InvalidBounds)
+        );
+        assert_eq!(View::try_new(ok, 0.0, 10.0), Err(ViewError::InvalidSize));
+        assert_eq!(
+            View::try_new(ok, 10.0, f64::NAN),
+            Err(ViewError::InvalidSize)
+        );
+        assert!(View::try_new(ok, 10.0, 10.0).is_ok());
+        assert!(View::try_centered(Vec2::new(0.0, 0.0), f64::INFINITY, 10.0, 10.0).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid view bounds")]
+    fn new_panics_on_invalid_bounds() {
+        let _ = View::new(Rect::new(1.0, 0.0, 1.0, 1.0), 10.0, 10.0);
+    }
+
+    #[test]
+    fn resize_ignores_garbage_and_clamps_collapsed() {
+        let mut v = view();
+        let before = v;
+        v.resize(f64::NAN, 10.0);
+        assert_eq!(v, before);
+        v.resize(0.0, 0.0);
         assert_eq!(v.width_px(), 1.0);
+    }
+
+    #[test]
+    fn ticks_with_overflowing_steps_do_not_panic() {
+        // nice_step overflows to +inf here (2e308); this used to panic.
+        let t = Ticks::for_range(0.0, 1e308, 1.5e308);
+        assert!(t.major_step.is_infinite());
+        assert!(t.major.is_empty() && t.minor.is_empty());
+        let t = Ticks::for_range(-1.0, 1.0, f64::MAX);
+        assert!(t.minor.is_empty());
+        let t = Ticks::for_range(0.0, 1e-300, 1e-310);
+        assert!(t.major.len() <= 10_001);
     }
 
     #[test]
