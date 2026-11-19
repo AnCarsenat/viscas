@@ -8,7 +8,12 @@
 /// Smallest allowed zoom level, in pixels per world unit.
 pub const MIN_SCALE: f64 = 1e-9;
 /// Largest allowed zoom level, in pixels per world unit.
-pub const MAX_SCALE: f64 = 1e12;
+pub const MAX_SCALE: f64 = 1e6;
+/// Largest allowed distance of the view center from the origin, per axis.
+///
+/// Together with [`MAX_SCALE`] this keeps tick indices far below 2^53 so
+/// `f64` grid math stays exact.
+pub const MAX_CENTER: f64 = 1e9;
 
 /// A 2D camera looking at the Cartesian plane.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,6 +80,7 @@ impl View {
     pub fn pan_by_pixels(&mut self, dx: f64, dy: f64) {
         self.center.0 -= dx / self.scale;
         self.center.1 += dy / self.scale;
+        self.clamp_center();
     }
 
     /// Multiplies the zoom by `factor`, keeping the world point under the
@@ -88,6 +94,18 @@ impl View {
         let moved = self.screen_to_world(sx, sy);
         self.center.0 += anchor.0 - moved.0;
         self.center.1 += anchor.1 - moved.1;
+        self.clamp_center();
+    }
+
+    fn clamp_center(&mut self) {
+        let clamp = |c: f64| {
+            if c.is_finite() {
+                c.clamp(-MAX_CENTER, MAX_CENTER)
+            } else {
+                0.0
+            }
+        };
+        self.center = (clamp(self.center.0), clamp(self.center.1));
     }
 }
 
@@ -143,10 +161,17 @@ pub fn grid_steps(scale: f64, min_major_px: f64) -> GridSteps {
 /// Multiples of `step` within `[min, max]`, as `(index, value)` pairs.
 ///
 /// The index is `value / step` and is handy to tell major from minor lines.
-/// Returns nothing if the range would produce an absurd number of lines.
+/// Returns nothing if the range would produce an absurd number of lines or
+/// tick indices too large to be represented exactly (>= 2^53).
 pub fn ticks(min: f64, max: f64, step: f64) -> impl Iterator<Item = (i64, f64)> {
     const MAX_TICKS: f64 = 10_000.0;
-    let valid = step.is_finite() && step > 0.0 && min.is_finite() && max.is_finite();
+    const MAX_INDEX: f64 = 9_007_199_254_740_992.0; // 2^53
+    let valid = step.is_finite()
+        && step > 0.0
+        && min.is_finite()
+        && max.is_finite()
+        && (min / step).abs() < MAX_INDEX
+        && (max / step).abs() < MAX_INDEX;
     let (first, last) = if valid && (max - min) / step <= MAX_TICKS {
         ((min / step).ceil() as i64, (max / step).floor() as i64)
     } else {
@@ -312,6 +337,20 @@ mod tests {
         assert_eq!(ticks(0.1, 0.9, 1.0).count(), 0);
         assert_eq!(ticks(0.0, 1e9, 1e-3).count(), 0);
         assert_eq!(ticks(0.0, 1.0, 0.0).count(), 0);
+        assert_eq!(ticks(1e17, 1e17 + 4.0, 1.0).count(), 0);
+        assert_eq!(ticks(-1e300, -1e300, 1e-300).count(), 0);
+    }
+
+    #[test]
+    fn center_is_clamped() {
+        let mut v = View::default();
+        v.scale = MIN_SCALE;
+        v.pan_by_pixels(-1e9, 1e9);
+        assert_eq!(v.center, (MAX_CENTER, MAX_CENTER));
+        v.pan_by_pixels(f64::INFINITY, 0.0);
+        assert!(v.center.0.is_finite());
+        v.zoom_at(1e-3, 1e9, -1e9);
+        assert!(v.center.0.abs() <= MAX_CENTER && v.center.1.abs() <= MAX_CENTER);
     }
 
     #[test]
