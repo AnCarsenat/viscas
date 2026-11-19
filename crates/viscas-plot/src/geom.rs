@@ -212,6 +212,43 @@ impl Polygon {
     pub fn area(&self) -> f64 {
         self.signed_area().abs()
     }
+
+    /// Sutherland–Hodgman clip against `rect`. Exact in area for any simple
+    /// polygon (a non-convex input split by the clip yields zero-width
+    /// bridges along the rectangle edge, which fill nothing). `None` if
+    /// nothing remains.
+    pub fn clipped(&self, rect: &Rect) -> Option<Polygon> {
+        if self.points.iter().all(|&p| rect.contains(p)) {
+            return (self.points.len() >= 3).then(|| self.clone());
+        }
+        type Plane = (fn(Vec2) -> f64, f64, f64);
+        let planes: [Plane; 4] = [
+            (|p| p.x, rect.x_min, 1.0),
+            (|p| p.x, rect.x_max, -1.0),
+            (|p| p.y, rect.y_min, 1.0),
+            (|p| p.y, rect.y_max, -1.0),
+        ];
+        let mut pts = self.points.clone();
+        for (coord, level, sign) in planes {
+            let d = |p: Vec2| (coord(p) - level) * sign;
+            let mut out = Vec::with_capacity(pts.len() + 4);
+            for i in 0..pts.len() {
+                let (a, c) = (pts[i], pts[(i + 1) % pts.len()]);
+                let (da, dc) = (d(a), d(c));
+                if da >= 0.0 {
+                    out.push(a);
+                }
+                if (da >= 0.0) != (dc >= 0.0) {
+                    out.push(a.lerp(c, da / (da - dc)));
+                }
+            }
+            pts = out;
+            if pts.len() < 3 {
+                return None;
+            }
+        }
+        Some(Polygon::new(pts))
+    }
 }
 
 /// Draw primitive in world coordinates. The UI maps it through
@@ -435,5 +472,37 @@ mod tests {
         ]);
         assert_eq!(sq.signed_area(), 4.0);
         assert_eq!(sq.area(), 4.0);
+    }
+
+    #[test]
+    fn polygon_clip_to_rect() {
+        let sq = Polygon::new(vec![
+            Vec2::new(-1.0, -1.0),
+            Vec2::new(2.0, -1.0),
+            Vec2::new(2.0, 0.5),
+            Vec2::new(-1.0, 0.5),
+        ]);
+        let c = sq.clipped(&unit()).unwrap();
+        assert!((c.area() - 0.5).abs() < 1e-12);
+        let far = Polygon::new(vec![
+            Vec2::new(5.0, 5.0),
+            Vec2::new(6.0, 5.0),
+            Vec2::new(6.0, 6.0),
+        ]);
+        assert!(far.clipped(&unit()).is_none());
+        // Non-convex "U" crossing the rect top: area stays exact.
+        let u = Polygon::new(vec![
+            Vec2::new(0.1, 0.1),
+            Vec2::new(0.9, 0.1),
+            Vec2::new(0.9, 2.0),
+            Vec2::new(0.7, 2.0),
+            Vec2::new(0.7, 0.5),
+            Vec2::new(0.3, 0.5),
+            Vec2::new(0.3, 2.0),
+            Vec2::new(0.1, 2.0),
+        ]);
+        let c = u.clipped(&unit()).unwrap();
+        let expect = 0.8 * 0.4 + 2.0 * 0.2 * 0.5;
+        assert!((c.area() - expect).abs() < 1e-12, "{}", c.area());
     }
 }

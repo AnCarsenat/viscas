@@ -8,8 +8,10 @@
 //! 1. Uniform initial samples over the parameter range.
 //! 2. Each interval is recursively bisected while the midpoint deviates from
 //!    the chord by more than `tolerance_px` or the chord is longer than
-//!    `max_chord_px` (both measured in screen pixels). Intervals whose three
-//!    samples all lie outside the view on the same side are not refined.
+//!    `max_chord_px` (both measured in screen pixels). Once an interval has
+//!    been halved at least twice, it is no longer refined if its three
+//!    samples all lie outside the view on the same side (the two forced
+//!    levels catch narrow excursions into the view between samples).
 //! 3. Non-finite samples mark domain gaps; the domain boundary is located by
 //!    bisection to full `f64` precision so curves like `sqrt(x)` reach their
 //!    endpoint. Tiny gaps whose sides meet on screen (removable
@@ -18,11 +20,20 @@
 //!    towards the larger jump: if the jump shrinks below the tolerance the
 //!    curve is continuous (steep), otherwise it is a discontinuity
 //!    (asymptote or jump) and the polyline is split there.
+//!
+//! `max_evals` is a hard cap that includes the initial pass; when it is hit
+//! the result is returned with `truncated = true`.
 
-use crate::cancel::{Budget, Cancelled};
+use crate::cancel::{Budget, Cancelled, Sampled};
 use crate::geom::{Polyline, Rect, Vec2};
 use crate::options::PlotOptions;
 use crate::view::View;
+
+/// Polylines plus the truncation flag.
+pub type Curves = Sampled<Vec<Polyline>>;
+
+/// Number of levels an interval is always refined before off-view culling.
+const MIN_CULL_DEPTH: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -31,8 +42,8 @@ struct Sample {
     ok: bool,
 }
 
-struct Sampler<'a, F: ?Sized> {
-    f: &'a F,
+struct Sampler<'s, 'c, F: ?Sized> {
+    f: &'s F,
     sx: f64,
     sy: f64,
     /// View plus a 2 px border; refinement stops outside it.
@@ -40,16 +51,16 @@ struct Sampler<'a, F: ?Sized> {
     tol: f64,
     max_chord: f64,
     max_depth: u32,
-    budget: Budget<'a>,
+    budget: &'s mut Budget<'c>,
     lines: Vec<Vec<Sample>>,
     cur: Vec<Sample>,
 }
 
-impl<'a, F> Sampler<'a, F>
+impl<'s, 'c, F> Sampler<'s, 'c, F>
 where
     F: Fn(f64) -> (f64, f64) + ?Sized,
 {
-    fn new(f: &'a F, view: &View, opts: &'a PlotOptions) -> Self {
+    fn new(f: &'s F, view: &View, opts: &PlotOptions, budget: &'s mut Budget<'c>) -> Self {
         Self {
             f,
             sx: 1.0 / view.units_per_px_x(),
@@ -62,22 +73,25 @@ where
             tol: opts.tolerance_px.max(1e-3),
             max_chord: opts.max_chord_px.max(opts.tolerance_px).max(1e-3),
             max_depth: opts.max_depth,
-            budget: Budget::new(opts.max_evals, &opts.cancel),
+            budget,
             lines: Vec::new(),
             cur: Vec::new(),
         }
     }
 
+    /// Evaluate at `t`, or `None` when the budget is exhausted.
     #[inline]
-    fn eval(&mut self, t: f64) -> Result<Sample, Cancelled> {
-        self.budget.tick()?;
+    fn eval(&mut self, t: f64) -> Result<Option<Sample>, Cancelled> {
+        if !self.budget.take()? {
+            return Ok(None);
+        }
         let (x, y) = (self.f)(t);
         let p = Vec2::new(x, y);
-        Ok(Sample {
+        Ok(Some(Sample {
             t,
             p,
             ok: p.is_finite(),
-        })
+        }))
     }
 
     fn dist_px(&self, a: Vec2, b: Vec2) -> f64 {
@@ -108,8 +122,11 @@ where
     }
 
     fn run(&mut self, t0: f64, t1: f64, n: usize) -> Result<(), Cancelled> {
-        let n = n.max(1);
-        let mut prev = self.eval(t0)?;
+        // Keep at least half of the budget for refinement.
+        let n = n.min(self.budget.remaining() / 2).max(1);
+        let Some(mut prev) = self.eval(t0)? else {
+            return Ok(());
+        };
         if prev.ok {
             self.emit(prev);
         }
@@ -119,7 +136,9 @@ where
             } else {
                 t0 + (t1 - t0) * (i as f64 / n as f64)
             };
-            let s = self.eval(t)?;
+            let Some(s) = self.eval(t)? else {
+                break;
+            };
             self.segment(prev, s, 0)?;
             if s.ok {
                 self.emit(s);
@@ -136,13 +155,13 @@ where
         match (a.ok, b.ok) {
             (false, false) => {
                 // Probe once so narrow islands of definition are not lost.
-                if depth == 0 && !self.budget.exhausted() {
-                    let m = self.eval(0.5 * (a.t + b.t))?;
-                    if m.ok {
-                        self.segment(a, m, depth + 1)?;
-                        self.emit(m);
-                        self.segment(m, b, depth + 1)?;
-                    }
+                if depth == 0
+                    && let Some(m) = self.eval(0.5 * (a.t + b.t))?
+                    && m.ok
+                {
+                    self.segment(a, m, depth + 1)?;
+                    self.emit(m);
+                    self.segment(m, b, depth + 1)?;
                 }
                 Ok(())
             }
@@ -169,20 +188,20 @@ where
     }
 
     fn refine(&mut self, a: Sample, b: Sample, depth: u32) -> Result<(), Cancelled> {
-        if self.budget.exhausted() {
-            return Ok(());
-        }
         let tm = 0.5 * (a.t + b.t);
         if tm <= a.t || tm >= b.t {
             return Ok(());
         }
-        let m = self.eval(tm)?;
+        let Some(m) = self.eval(tm)? else {
+            return Ok(());
+        };
         if !m.ok {
             self.segment(a, m, depth + 1)?;
             return self.segment(m, b, depth + 1);
         }
         let clip = self.refine_rect;
-        if clip.outcode(a.p) & clip.outcode(m.p) & clip.outcode(b.p) != 0 {
+        if depth >= MIN_CULL_DEPTH && clip.outcode(a.p) & clip.outcode(m.p) & clip.outcode(b.p) != 0
+        {
             return Ok(());
         }
         let dev = self.seg_dist_px(m.p, a.p, b.p);
@@ -214,7 +233,7 @@ where
     }
 
     /// Bisect between a finite and a non-finite sample; returns the finite
-    /// sample closest to the domain boundary.
+    /// sample closest to the domain boundary (as close as the budget allows).
     fn boundary(&mut self, good: Sample, bad: Sample) -> Result<Sample, Cancelled> {
         let (mut g, mut b) = (good, bad);
         for _ in 0..64 {
@@ -222,7 +241,9 @@ where
             if tm == g.t || tm == b.t {
                 break;
             }
-            let m = self.eval(tm)?;
+            let Some(m) = self.eval(tm)? else {
+                break;
+            };
             if m.ok {
                 g = m;
             } else {
@@ -233,7 +254,8 @@ where
     }
 
     /// Decide whether a long chord hides a discontinuity. Returns the left and
-    /// right limit samples if it does.
+    /// right limit samples if it does. If the budget runs out the chord is
+    /// conservatively treated as a discontinuity (no vertical connector).
     fn discontinuity(
         &mut self,
         a: Sample,
@@ -248,7 +270,9 @@ where
             if tm <= a.t || tm >= b.t {
                 break;
             }
-            let m = self.eval(tm)?;
+            let Some(m) = self.eval(tm)? else {
+                break;
+            };
             if !m.ok {
                 let l = self.boundary(a, m)?;
                 let r = self.boundary(b, m)?;
@@ -294,6 +318,7 @@ fn normalize_range(t0: f64, t1: f64) -> Option<(f64, f64)> {
     Some(if t0 < t1 { (t0, t1) } else { (t1, t0) })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_with<F>(
     f: &F,
     t0: f64,
@@ -301,18 +326,26 @@ fn sample_with<F>(
     n: usize,
     view: &View,
     opts: &PlotOptions,
+    budget: &mut Budget<'_>,
 ) -> Result<Vec<Polyline>, Cancelled>
 where
     F: Fn(f64) -> (f64, f64) + ?Sized,
 {
-    let mut s = Sampler::new(f, view, opts);
+    let mut s = Sampler::new(f, view, opts, budget);
     s.run(t0, t1, n)?;
     Ok(s.finish(t1 - t0))
 }
 
-fn clip_all(lines: Vec<Polyline>, view: &View, opts: &PlotOptions) -> Vec<Polyline> {
+fn clip_all(c: Curves, view: &View, opts: &PlotOptions) -> Curves {
     let rect = view.bounds().expanded(opts.clip_margin.max(0.0));
-    lines.iter().flat_map(|l| l.clipped(&rect)).collect()
+    Sampled {
+        data: c.data.iter().flat_map(|l| l.clipped(&rect)).collect(),
+        truncated: c.truncated,
+    }
+}
+
+fn parametric_samples(opts: &PlotOptions) -> usize {
+    opts.parametric_samples.clamp(2, 100_000)
 }
 
 /// Adaptive samples of a parametric curve over `t_range`, unclipped (points
@@ -323,14 +356,16 @@ pub fn sample_parametric<F>(
     t_range: (f64, f64),
     view: &View,
     opts: &PlotOptions,
-) -> Result<Vec<Polyline>, Cancelled>
+) -> Result<Curves, Cancelled>
 where
     F: Fn(f64) -> (f64, f64) + ?Sized,
 {
+    let mut budget = Budget::new(opts.max_evals, &opts.cancel);
     let Some((t0, t1)) = normalize_range(t_range.0, t_range.1) else {
-        return Ok(Vec::new());
+        return Ok(Curves::default());
     };
-    let mut lines = sample_with(f, t0, t1, opts.parametric_samples, view, opts)?;
+    let n = parametric_samples(opts);
+    let mut lines = sample_with(f, t0, t1, n, view, opts, &mut budget)?;
     if let [line] = lines.as_mut_slice()
         && line.points.len() > 3
     {
@@ -341,7 +376,10 @@ where
             line.closed = true;
         }
     }
-    Ok(lines)
+    Ok(Sampled {
+        data: lines,
+        truncated: budget.truncated(),
+    })
 }
 
 /// Parametric curve `(x(t), y(t))`, clipped to the view (plus margin).
@@ -350,7 +388,7 @@ pub fn plot_parametric<F>(
     t_range: (f64, f64),
     view: &View,
     opts: &PlotOptions,
-) -> Result<Vec<Polyline>, Cancelled>
+) -> Result<Curves, Cancelled>
 where
     F: Fn(f64) -> (f64, f64) + ?Sized,
 {
@@ -367,7 +405,7 @@ pub fn plot_polar<F>(
     theta_range: (f64, f64),
     view: &View,
     opts: &PlotOptions,
-) -> Result<Vec<Polyline>, Cancelled>
+) -> Result<Curves, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
@@ -395,12 +433,12 @@ fn intersect(range: (f64, f64), lo: f64, hi: f64) -> Option<(f64, f64)> {
     (a < b).then_some((a, b))
 }
 
-/// Adaptive samples of `y = f(x)` for `x` in `x_range`, unclipped.
-pub fn sample_explicit<F>(
+fn explicit_with<F>(
     f: &F,
     x_range: (f64, f64),
     view: &View,
     opts: &PlotOptions,
+    budget: &mut Budget<'_>,
 ) -> Result<Vec<Polyline>, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
@@ -409,7 +447,25 @@ where
         return Ok(Vec::new());
     };
     let n = explicit_samples((b - a) / view.units_per_px_x(), opts);
-    sample_with(&|x: f64| (x, f(x)), a, b, n, view, opts)
+    sample_with(&|x: f64| (x, f(x)), a, b, n, view, opts, budget)
+}
+
+/// Adaptive samples of `y = f(x)` for `x` in `x_range`, unclipped.
+pub fn sample_explicit<F>(
+    f: &F,
+    x_range: (f64, f64),
+    view: &View,
+    opts: &PlotOptions,
+) -> Result<Curves, Cancelled>
+where
+    F: Fn(f64) -> f64 + ?Sized,
+{
+    let mut budget = Budget::new(opts.max_evals, &opts.cancel);
+    let data = explicit_with(f, x_range, view, opts, &mut budget)?;
+    Ok(Sampled {
+        data,
+        truncated: budget.truncated(),
+    })
 }
 
 /// Adaptive samples of `x = f(y)` for `y` in `y_range`, unclipped.
@@ -418,15 +474,20 @@ pub fn sample_explicit_x<F>(
     y_range: (f64, f64),
     view: &View,
     opts: &PlotOptions,
-) -> Result<Vec<Polyline>, Cancelled>
+) -> Result<Curves, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
+    let mut budget = Budget::new(opts.max_evals, &opts.cancel);
     let Some((a, b)) = normalize_range(y_range.0, y_range.1) else {
-        return Ok(Vec::new());
+        return Ok(Curves::default());
     };
     let n = explicit_samples((b - a) / view.units_per_px_y(), opts);
-    sample_with(&|y: f64| (f(y), y), a, b, n, view, opts)
+    let data = sample_with(&|y: f64| (f(y), y), a, b, n, view, opts, &mut budget)?;
+    Ok(Sampled {
+        data,
+        truncated: budget.truncated(),
+    })
 }
 
 /// The x range sampled for the view: the visible range plus one pixel.
@@ -443,7 +504,7 @@ pub(crate) fn view_y_range(view: &View) -> (f64, f64) {
 }
 
 /// `y = f(x)` across the view, clipped.
-pub fn plot_explicit<F>(f: &F, view: &View, opts: &PlotOptions) -> Result<Vec<Polyline>, Cancelled>
+pub fn plot_explicit<F>(f: &F, view: &View, opts: &PlotOptions) -> Result<Curves, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
@@ -454,29 +515,54 @@ where
     ))
 }
 
+/// Several `y = f(x)` curves sharing one `max_evals` budget (e.g. a list of
+/// curves `y = [1, 2, 3] x`). Each curve gets a fair share of what is left,
+/// so a pathological curve cannot starve the ones after it.
+pub fn plot_explicit_many<F>(
+    fs: &[&F],
+    view: &View,
+    opts: &PlotOptions,
+) -> Result<Vec<Curves>, Cancelled>
+where
+    F: Fn(f64) -> f64 + ?Sized,
+{
+    let mut budget = Budget::new(opts.max_evals, &opts.cancel);
+    let total = budget.limit();
+    let mut out = Vec::with_capacity(fs.len());
+    for (i, f) in fs.iter().enumerate() {
+        let share = budget.remaining() / (fs.len() - i);
+        budget.set_limit(budget.evals + share);
+        budget.reset_truncated();
+        let data = explicit_with(*f, view_x_range(view), view, opts, &mut budget)?;
+        let c = Sampled {
+            data,
+            truncated: budget.truncated(),
+        };
+        out.push(clip_all(c, view, opts));
+        budget.set_limit(total);
+    }
+    Ok(out)
+}
+
 /// `y = f(x)` restricted to `x ∈ x_range` (e.g. `y = x² {0 < x < 2}`).
 pub fn plot_explicit_on<F>(
     f: &F,
     x_range: (f64, f64),
     view: &View,
     opts: &PlotOptions,
-) -> Result<Vec<Polyline>, Cancelled>
+) -> Result<Curves, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
     let (lo, hi) = view_x_range(view);
     let Some(r) = intersect(x_range, lo, hi) else {
-        return Ok(Vec::new());
+        return Ok(Curves::default());
     };
     Ok(clip_all(sample_explicit(f, r, view, opts)?, view, opts))
 }
 
 /// `x = f(y)` across the view, clipped.
-pub fn plot_explicit_x<F>(
-    f: &F,
-    view: &View,
-    opts: &PlotOptions,
-) -> Result<Vec<Polyline>, Cancelled>
+pub fn plot_explicit_x<F>(f: &F, view: &View, opts: &PlotOptions) -> Result<Curves, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
@@ -761,8 +847,92 @@ mod tests {
         let v = View::new(Rect::new(-1.0, -1.5, 1.0, 1.5), 1200.0, 800.0);
         let lines = plot_explicit(&f, &v, &o).unwrap();
         assert!(!lines.is_empty());
-        // Budget plus the bounded boundary/discontinuity searches in flight.
-        assert!(count.load(Ordering::Relaxed) < 20_500);
+        assert!(lines.truncated);
+        // A hard cap: never a single evaluation more.
+        assert!(count.load(Ordering::Relaxed) <= 20_000);
+    }
+
+    #[test]
+    fn tiny_budget_is_a_hard_cap_including_initial_pass() {
+        for max in [1, 2, 10, 100, 1000] {
+            let count = AtomicUsize::new(0);
+            let f = |x: f64| {
+                count.fetch_add(1, Ordering::Relaxed);
+                x.tan()
+            };
+            let o = PlotOptions {
+                max_evals: max,
+                ..opts()
+            };
+            let c = plot_explicit(&f, &view(), &o).unwrap();
+            assert!(count.load(Ordering::Relaxed) <= max, "{max}");
+            assert!(c.truncated);
+            let count = AtomicUsize::new(0);
+            let g = |t: f64| {
+                count.fetch_add(1, Ordering::Relaxed);
+                (t.cos(), t.sin())
+            };
+            let o = PlotOptions {
+                max_evals: max,
+                parametric_samples: usize::MAX,
+                ..opts()
+            };
+            plot_parametric(&g, (0.0, TAU), &view(), &o).unwrap();
+            assert!(count.load(Ordering::Relaxed) <= max, "{max}");
+        }
+        assert!(
+            !plot_explicit(&f64::sin, &view(), &opts())
+                .unwrap()
+                .truncated
+        );
+    }
+
+    #[test]
+    fn narrow_excursion_into_view_is_found() {
+        // Baseline far above the view with a ~2 px wide dip down to y = -5,
+        // centered a quarter of the way into an initial interval: the
+        // samples a, m (and b) of that interval are all above the view, so
+        // culling at depth 0 would skip the dip entirely.
+        let v = view();
+        let upp = v.units_per_px_x();
+        let n = ((20.0 + 2.0 * upp) / upp / 3.0).ceil();
+        let h = (20.0 + 2.0 * upp) / n;
+        let c0 = -10.0 - upp + 200.0 * h + 0.25 * h;
+        let f = move |x: f64| 50.0 - 55.0 * (-((x - c0) / 0.015).powi(2)).exp();
+        assert!(f(c0 - 0.25 * h) > 12.0 && f(c0 + 0.25 * h) > 12.0);
+        let c = plot_explicit(&f, &view(), &opts()).unwrap();
+        assert!(!c.is_empty());
+        let min_y = c
+            .iter()
+            .flat_map(|l| l.points.iter())
+            .fold(f64::INFINITY, |m, p| m.min(p.y));
+        assert!(min_y < -4.9, "{min_y}");
+    }
+
+    #[test]
+    fn many_curves_share_one_budget() {
+        let count = AtomicUsize::new(0);
+        let wild = |x: f64| {
+            count.fetch_add(1, Ordering::Relaxed);
+            (1.0 / x).sin()
+        };
+        let tame = |x: f64| {
+            count.fetch_add(1, Ordering::Relaxed);
+            x.sin()
+        };
+        let fs: [&dyn Fn(f64) -> f64; 2] = [&wild, &tame];
+        let o = PlotOptions {
+            max_evals: 6_000,
+            ..opts()
+        };
+        let v = View::new(Rect::new(-1.0, -1.5, 1.0, 1.5), 1200.0, 800.0);
+        let out = plot_explicit_many(&fs, &v, &o).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(count.load(Ordering::Relaxed) <= 6_000);
+        assert!(out[0].truncated);
+        // The tame curve still gets its share and completes.
+        assert!(!out[1].truncated);
+        assert_eq!(out[1].len(), 1);
     }
 
     #[test]

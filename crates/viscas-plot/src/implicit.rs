@@ -2,22 +2,35 @@
 //!
 //! Algorithm:
 //! 1. A coarse grid (`implicit_cell_px`) aligned to world multiples of the
-//!    cell size, so panning does not make contours shimmer.
+//!    cell size, so panning does not make contours shimmer. The coarse grid
+//!    is enlarged up front if it would not fit in `max_evals`.
 //! 2. Cells whose corners change sign are refined as a quadtree down to
-//!    `implicit_depth` levels. Corner values are cached per vertex.
-//! 3. On each refined cell edge with a sign change, the crossing is located
-//!    with a few Illinois (modified regula falsi) steps. If `|F|` at the
-//!    result is not small compared to the edge endpoints the sign change is a
-//!    pole or a jump (e.g. `1/(x y) = 1` across the axes, `y = tan x` at the
-//!    asymptotes) and no contour is produced there.
-//! 4. Saddle cells (four crossings) are disambiguated with the center value.
-//! 5. Segments share crossing points by edge key, so they are stitched into
+//!    `implicit_depth` levels, one whole level at a time. A level is only
+//!    started if the budget can pay for all of it, so budget exhaustion never
+//!    leaves mixed-depth neighbours (T-junctions) along the curve. Corner
+//!    values are cached per vertex.
+//! 3. Coarse cells whose corners all have the same sign are probed at their
+//!    center; a sign change there refines the cell too, which catches small
+//!    closed loops and thin features about one cell wide.
+//! 4. On each refined cell edge with a sign change, the crossing is located
+//!    with Illinois (modified regula falsi) iterations down to a tight
+//!    bracket. If `|F|` there is not small relative to the edge endpoint
+//!    values, the sign change is a pole or a jump (e.g. `1/(x y) = 1` across
+//!    the axes, `y = tan x` at the asymptotes) and no contour is produced.
+//! 5. Saddle cells (four crossings) are disambiguated with the center value.
+//! 6. Segments share crossing points by edge key, so they are stitched into
 //!    polylines by walking edge adjacency; loops come out `closed`.
+//!
+//! Remaining limits: features that never change sign at a sampled vertex or
+//! coarse-cell center are missed. That covers loops much smaller than one
+//! coarse cell away from its center, and zero sets where `F` touches 0
+//! without crossing it (`(x² + y² - 1)² = 0`).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
-use crate::cancel::{Budget, Cancelled};
+use crate::cancel::{Budget, Cancelled, Sampled};
+use crate::curve::Curves;
 use crate::geom::{Polyline, Vec2};
 use crate::options::PlotOptions;
 use crate::view::View;
@@ -29,7 +42,12 @@ pub(crate) struct GridHasher(u64);
 
 impl Hasher for GridHasher {
     fn finish(&self) -> u64 {
-        self.0
+        // splitmix64 finalizer: spreads high-bit differences into the low
+        // bits that hashbrown uses for bucket selection.
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
     }
 
     fn write(&mut self, bytes: &[u8]) {
@@ -110,6 +128,15 @@ impl Cell {
             (i, j, 1, s),
         ]
     }
+
+    fn children(self) -> [Cell; 4] {
+        let h = self.size / 2;
+        [(0, 0), (h, 0), (0, h), (h, h)].map(|(di, dj)| Cell {
+            i: self.i + di,
+            j: self.j + dj,
+            size: h,
+        })
+    }
 }
 
 /// Inside means `F < 0` (finite).
@@ -118,6 +145,27 @@ pub(crate) fn inside(v: f64) -> bool {
     v < 0.0
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// All four corners inside.
+    Full,
+    /// Inside corners together with outside or undefined ones.
+    Mixed,
+    /// All finite with the same sign (outside, or inside handled as Full).
+    Uniform,
+    /// Nothing inside: outside and/or undefined corners.
+    Empty,
+}
+
+/// Evaluations a coarse cell costs: its share of vertices plus one probe.
+const COARSE_COST: usize = 2;
+/// New vertices when one cell is split into four.
+const SPLIT_COST: usize = 5;
+/// Budget kept per mixed cell for edge roots of the next level.
+const CONTOUR_RESERVE: usize = 16;
+/// Illinois iteration cap per edge.
+const EDGE_ITERS: usize = 60;
+
 pub(crate) struct Grid<'a, F: ?Sized> {
     f: &'a F,
     cw: f64,
@@ -125,9 +173,11 @@ pub(crate) struct Grid<'a, F: ?Sized> {
     values: FastMap<Key, f64>,
     edges: FastMap<EdgeKey, Crossing>,
     budget: Budget<'a>,
+    /// The coarse grid was enlarged or a refinement level was skipped.
+    coarsened: bool,
     /// Cells with all four corners inside (any quadtree level).
     pub full: Vec<Cell>,
-    /// Leaf cells with mixed corners.
+    /// Leaf cells with mixed corners (all at the same quadtree level).
     pub mixed: Vec<Cell>,
 }
 
@@ -139,14 +189,25 @@ where
     pub fn build(f: &'a F, view: &View, opts: &'a PlotOptions) -> Result<Self, Cancelled> {
         let depth = opts.implicit_depth.min(8);
         let step: i64 = 1 << depth;
-        let cell_px = opts.implicit_cell_px.max(1.0);
-        let cwc = cell_px * view.units_per_px_x();
-        let chc = cell_px * view.units_per_px_y();
         let b = view.bounds();
-        let ci0 = (b.x_min / cwc).floor() as i64;
-        let ci1 = (b.x_max / cwc).ceil() as i64;
-        let cj0 = (b.y_min / chc).floor() as i64;
-        let cj1 = (b.y_max / chc).ceil() as i64;
+        let mut cell_px = opts.implicit_cell_px.max(1.0);
+        let mut coarsened = false;
+        // Size the coarse grid so that it costs at most half the budget.
+        let (ci0, ci1, cj0, cj1, cwc, chc) = loop {
+            let cwc = cell_px * view.units_per_px_x();
+            let chc = cell_px * view.units_per_px_y();
+            let ci0 = (b.x_min / cwc).floor() as i64;
+            let ci1 = (b.x_max / cwc).ceil() as i64;
+            let cj0 = (b.y_min / chc).floor() as i64;
+            let cj1 = (b.y_max / chc).ceil() as i64;
+            let cells = ((ci1 - ci0).max(1) * (cj1 - cj0).max(1)) as usize;
+            let cost = cells * COARSE_COST + 2 * ((ci1 - ci0) + (cj1 - cj0)) as usize + 1;
+            if cost <= opts.max_evals / 2 || cells == 1 {
+                break (ci0, ci1, cj0, cj1, cwc, chc);
+            }
+            cell_px *= 1.5;
+            coarsened = true;
+        };
         let ncells = ((ci1 - ci0) * (cj1 - cj0)).max(0) as usize;
         let mut g = Grid {
             f,
@@ -154,27 +215,61 @@ where
             ch: chc / step as f64,
             values: FastMap::with_capacity_and_hasher(ncells * 2, Default::default()),
             edges: FastMap::default(),
-            budget: Budget::new(opts.max_evals.max(ncells * 2), &opts.cancel),
+            budget: Budget::new(opts.max_evals, &opts.cancel),
+            coarsened,
             full: Vec::new(),
             mixed: Vec::new(),
         };
-        let mut stack = Vec::new();
+        let mut level = Vec::new();
         for cj in cj0..cj1 {
             for ci in ci0..ci1 {
-                stack.push(Cell {
+                let c = Cell {
                     i: ci * step,
                     j: cj * step,
                     size: step,
-                });
-                while let Some(c) = stack.pop() {
-                    g.classify(c, &mut stack)?;
+                };
+                match g.classify(c)? {
+                    Class::Full => g.full.push(c),
+                    Class::Mixed => level.push(c),
+                    Class::Uniform => {
+                        // Probe the center for features inside the cell.
+                        let corner = g.value(c.corners()[0])?;
+                        if let Some(vc) = g.center_value(c)?
+                            && vc.is_finite()
+                            && inside(vc) != inside(corner)
+                        {
+                            level.push(c);
+                        }
+                    }
+                    Class::Empty => {}
                 }
             }
         }
+        // Refine whole levels while the budget can pay for them.
+        let mut size = step;
+        while size > 1 && !level.is_empty() {
+            if g.budget.remaining() < level.len() * (SPLIT_COST + CONTOUR_RESERVE) {
+                g.coarsened = true;
+                break;
+            }
+            let mut next = Vec::with_capacity(level.len() * 2);
+            for c in level {
+                for child in c.children() {
+                    match g.classify(child)? {
+                        Class::Full => g.full.push(child),
+                        Class::Mixed => next.push(child),
+                        Class::Uniform | Class::Empty => {}
+                    }
+                }
+            }
+            level = next;
+            size /= 2;
+        }
+        g.mixed = level;
         Ok(g)
     }
 
-    fn classify(&mut self, c: Cell, stack: &mut Vec<Cell>) -> Result<(), Cancelled> {
+    fn classify(&mut self, c: Cell) -> Result<Class, Cancelled> {
         let mut neg = 0;
         let mut pos = 0;
         for k in c.corners() {
@@ -185,49 +280,60 @@ where
                 pos += 1;
             }
         }
-        if neg == 4 {
-            self.full.push(c);
-        } else if neg > 0 && (pos > 0 || neg + pos < 4) {
-            if c.size > 1 && !self.budget.exhausted() {
-                let h = c.size / 2;
-                for (di, dj) in [(0, 0), (h, 0), (0, h), (h, h)] {
-                    stack.push(Cell {
-                        i: c.i + di,
-                        j: c.j + dj,
-                        size: h,
-                    });
-                }
-            } else {
-                self.mixed.push(c);
-            }
-        }
-        Ok(())
+        Ok(match (neg, pos) {
+            (4, _) => Class::Full,
+            (0, 4) => Class::Uniform,
+            (0, _) => Class::Empty,
+            _ => Class::Mixed,
+        })
+    }
+
+    /// The budget ran out or forced a coarser grid.
+    pub fn truncated(&self) -> bool {
+        self.coarsened || self.budget.truncated()
     }
 
     pub fn pos(&self, k: Key) -> Vec2 {
         Vec2::new(k.0 as f64 * self.cw, k.1 as f64 * self.ch)
     }
 
-    fn eval(&mut self, p: Vec2) -> Result<f64, Cancelled> {
-        self.budget.tick()?;
+    /// Evaluate `F` (non-finite mapped to NaN), or `None` without budget.
+    fn eval(&mut self, p: Vec2) -> Result<Option<f64>, Cancelled> {
+        if !self.budget.take()? {
+            return Ok(None);
+        }
         let v = (self.f)(p.x, p.y);
-        Ok(if v.is_finite() { v } else { f64::NAN })
+        Ok(Some(if v.is_finite() { v } else { f64::NAN }))
     }
 
+    /// Cached vertex value. The level-wise budgeting means this is always
+    /// granted in practice; if not, the vertex is recorded as undefined.
     pub fn value(&mut self, k: Key) -> Result<f64, Cancelled> {
         if let Some(&v) = self.values.get(&k) {
             return Ok(v);
         }
-        let v = self.eval(self.pos(k))?;
+        let v = self.eval(self.pos(k))?.unwrap_or(f64::NAN);
         self.values.insert(k, v);
         Ok(v)
     }
 
-    /// Value at the center of a cell (not cached).
-    pub fn center_value(&mut self, c: Cell) -> Result<f64, Cancelled> {
+    /// Value at the center of a cell (not cached), `None` without budget.
+    pub fn center_value(&mut self, c: Cell) -> Result<Option<f64>, Cancelled> {
         let h = 0.5 * c.size as f64;
         let p = Vec2::new((c.i as f64 + h) * self.cw, (c.j as f64 + h) * self.ch);
         self.eval(p)
+    }
+
+    /// Center value for saddle resolution, falling back to the corner mean.
+    pub fn saddle_center(&mut self, c: Cell) -> Result<f64, Cancelled> {
+        if let Some(v) = self.center_value(c)? {
+            return Ok(v);
+        }
+        let mut s = 0.0;
+        for k in c.corners() {
+            s += self.value(k)?;
+        }
+        Ok(0.25 * s)
     }
 
     pub fn crossing(&mut self, e: EdgeKey) -> Result<Crossing, Cancelled> {
@@ -247,29 +353,40 @@ where
         Ok(c)
     }
 
-    /// Illinois iterations on the edge, then reject poles/jumps by checking
-    /// that `|F|` actually became small.
+    /// Illinois iterations on the edge down to a tight bracket, then reject
+    /// poles/jumps by checking that `|F|` actually became small. Without
+    /// budget the linear interpolant is used unverified (result truncated).
     fn edge_root(&mut self, a: Vec2, va: f64, b: Vec2, vb: f64) -> Result<Crossing, Cancelled> {
         let lin = a.lerp(b, va / (va - vb));
-        let (mut lo, mut flo, mut hi, mut fhi) = (0.0_f64, va, 1.0_f64, vb);
-        let mut side = 0i8;
-        let mut t = 0.5;
-        let mut ft = f64::NAN;
         let scale = va.abs().max(vb.abs());
-        for _ in 0..6 {
-            t = (lo * fhi - hi * flo) / (fhi - flo);
-            if !t.is_finite() {
+        // Bracket [lo, hi] with true values (glo, ghi) and Illinois-scaled
+        // values (flo, fhi).
+        let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+        let (mut glo, mut ghi) = (va, vb);
+        let (mut flo, mut fhi) = (va, vb);
+        let mut side = 0i8;
+        let mut starved = false;
+        for _ in 0..EDGE_ITERS {
+            if hi - lo <= 1e-12 {
+                break;
+            }
+            let mut t = (lo * fhi - hi * flo) / (fhi - flo);
+            if !(t > lo && t < hi) {
                 t = 0.5 * (lo + hi);
             }
-            ft = self.eval(a.lerp(b, t))?;
+            let Some(ft) = self.eval(a.lerp(b, t))? else {
+                starved = true;
+                break;
+            };
             if !ft.is_finite() {
                 return Ok(Crossing::Pole(lin));
             }
-            if ft.abs() <= 1e-14 * scale {
-                break;
+            if ft == 0.0 {
+                return Ok(Crossing::Root(a.lerp(b, t)));
             }
-            if inside(ft) == inside(flo) {
+            if inside(ft) == inside(glo) {
                 lo = t;
+                glo = ft;
                 flo = ft;
                 if side == -1 {
                     fhi *= 0.5;
@@ -277,6 +394,7 @@ where
                 side = -1;
             } else {
                 hi = t;
+                ghi = ft;
                 fhi = ft;
                 if side == 1 {
                     flo *= 0.5;
@@ -284,9 +402,22 @@ where
                 side = 1;
             }
         }
-        // A true root drives |F| well below both endpoint values; at a jump
-        // or pole it stays comparable to (or exceeds) the smaller one.
-        if ft.abs() <= 0.1 * va.abs().min(vb.abs()) || ft.abs() <= 1e-9 * scale {
+        let (t, best) = if glo.abs() <= ghi.abs() {
+            (lo, glo)
+        } else {
+            (hi, ghi)
+        };
+        if starved {
+            // Cannot verify; keep the best estimate (result is truncated).
+            return Ok(Crossing::Root(if lo == 0.0 && hi == 1.0 {
+                lin
+            } else {
+                a.lerp(b, t)
+            }));
+        }
+        // A true root drives |F| to ~0 relative to the endpoint values; at a
+        // jump it stays at the jump height, at a pole it blows up.
+        if best.abs() <= 1e-6 * scale {
             Ok(Crossing::Root(a.lerp(b, t)))
         } else {
             Ok(Crossing::Pole(lin))
@@ -314,7 +445,7 @@ where
             2 => push(changing[0], changing[1]),
             4 => {
                 let v00 = self.value(c.corners()[0])?;
-                let vc = self.center_value(c)?;
+                let vc = self.saddle_center(c)?;
                 if inside(vc) == inside(v00) {
                     // v00 and v11 are joined through the center.
                     push(0, 1);
@@ -331,9 +462,8 @@ where
 
     pub fn contour(&mut self) -> Result<Vec<Polyline>, Cancelled> {
         let mut segs = Vec::new();
-        for c in std::mem::take(&mut self.mixed).iter().copied() {
+        for c in self.mixed.clone() {
             self.cell_segments(c, &mut segs)?;
-            self.mixed.push(c);
         }
         Ok(stitch(&segs, |e| {
             self.edges
@@ -407,13 +537,17 @@ pub(crate) fn stitch(segs: &[(EdgeKey, EdgeKey)], pos: impl Fn(EdgeKey) -> Vec2)
 }
 
 /// Implicit curve `F(x, y) = 0` over the view.
-pub fn plot_implicit<F>(f: &F, view: &View, opts: &PlotOptions) -> Result<Vec<Polyline>, Cancelled>
+pub fn plot_implicit<F>(f: &F, view: &View, opts: &PlotOptions) -> Result<Curves, Cancelled>
 where
     F: Fn(f64, f64) -> f64 + ?Sized,
 {
     // Crossings are where the sign flips, so `F < 0` vs `F >= 0` is enough.
     let mut g = Grid::build(f, view, opts)?;
-    g.contour()
+    let data = g.contour()?;
+    Ok(Sampled {
+        data,
+        truncated: g.truncated(),
+    })
 }
 
 #[cfg(test)]
@@ -444,8 +578,59 @@ mod tests {
         let lines = plot_implicit(&f, &view(), &opts()).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].closed);
+        assert!(!lines.truncated);
         assert!(lines[0].points.len() > 500);
-        check_on_curve(&lines, f, 1e-6);
+        // Edge roots are iterated to a tight bracket.
+        check_on_curve(&lines, f, 1e-12);
+    }
+
+    #[test]
+    fn budget_exhaustion_keeps_loops_closed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for max in [500, 3_000, 12_000, 25_000, 40_000] {
+            let n = AtomicUsize::new(0);
+            let f = |x: f64, y: f64| {
+                n.fetch_add(1, Ordering::Relaxed);
+                x * x + y * y - 1.0
+            };
+            let o = PlotOptions {
+                max_evals: max,
+                ..opts()
+            };
+            let lines = plot_implicit(&f, &view(), &o).unwrap();
+            assert!(
+                n.load(Ordering::Relaxed) <= max,
+                "{max}: {}",
+                n.load(Ordering::Relaxed)
+            );
+            assert!(lines.truncated, "{max}");
+            assert_eq!(lines.len(), 1, "{max}");
+            assert!(lines[0].closed, "{max}");
+        }
+    }
+
+    #[test]
+    fn center_probe_finds_small_loop() {
+        let v = view();
+        let cell = 8.0 * v.units_per_px_x();
+        // Radius 2.5 px circle centered in a coarse cell: all corners outside.
+        let (cx, cy) = (2.5 * cell, 1.5 * cell);
+        let r = 2.5 * v.units_per_px_x();
+        let f = |x: f64, y: f64| (x - cx).powi(2) + (y - cy).powi(2) - r * r;
+        let lines = plot_implicit(&f, &v, &opts()).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].closed);
+    }
+
+    #[test]
+    fn grid_hasher_spreads_high_bits() {
+        use std::collections::HashSet;
+        use std::hash::BuildHasher;
+        let b = BuildHasherDefault::<GridHasher>::default();
+        let low: HashSet<u64> = (0..1000i64)
+            .map(|k| b.hash_one((k << 40, 7i64)) & 0xffff)
+            .collect();
+        assert!(low.len() > 950, "{}", low.len());
     }
 
     #[test]
@@ -465,7 +650,7 @@ mod tests {
         let f = |x: f64, y: f64| 1.0 / (x * y) - 1.0;
         let lines = plot_implicit(&f, &view(), &opts()).unwrap();
         assert_eq!(lines.len(), 2);
-        check_on_curve(&lines, |x, y| x * y - 1.0, 1e-4);
+        check_on_curve(&lines, |x, y| x * y - 1.0, 1e-9);
     }
 
     #[test]

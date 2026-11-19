@@ -6,9 +6,16 @@
 //! roots). Candidates produced by poles or jumps (`1/x`, `tan`, `floor`) are
 //! rejected by checking that the refined value really behaves like a root or
 //! a smooth extremum.
+//!
+//! All evaluations go through the `PlotOptions::max_evals` budget (a hard
+//! cap) and poll the cancel flag; results carry `truncated` when the budget
+//! ran out.
 
-use crate::cancel::{Budget, CancelToken, Cancelled};
+use std::cell::Cell;
+
+use crate::cancel::{CancelToken, Cancelled, Sampled};
 use crate::geom::Vec2;
+use crate::options::PlotOptions;
 use crate::view::View;
 
 /// What a [`Feature`] point is.
@@ -146,30 +153,81 @@ where
     0.5 * (a + b)
 }
 
+/// Evaluation guard shared by one analysis call: a hard evaluation cap and a
+/// cancel check on every call. Once tripped, every evaluation yields NaN, so
+/// Brent/golden searches stop quickly and candidates are rejected.
+struct Guard<'a> {
+    evals: Cell<usize>,
+    max: usize,
+    cancel: &'a CancelToken,
+    stopped: Cell<bool>,
+}
+
+impl<'a> Guard<'a> {
+    fn new(opts: &'a PlotOptions) -> Self {
+        Self {
+            evals: Cell::new(0),
+            max: opts.max_evals,
+            cancel: &opts.cancel,
+            stopped: Cell::new(false),
+        }
+    }
+
+    fn call<F>(&self, f: &F, x: f64) -> f64
+    where
+        F: Fn(f64) -> f64 + ?Sized,
+    {
+        if self.stopped.get() {
+            return f64::NAN;
+        }
+        if self.cancel.is_cancelled() || self.evals.get() >= self.max {
+            self.stopped.set(true);
+            return f64::NAN;
+        }
+        self.evals.set(self.evals.get() + 1);
+        f(x)
+    }
+
+    fn check(&self) -> Result<(), Cancelled> {
+        self.cancel.check()
+    }
+
+    fn finish<T>(&self, data: T) -> Result<Sampled<T>, Cancelled> {
+        self.check()?;
+        Ok(Sampled {
+            data,
+            truncated: self.stopped.get(),
+        })
+    }
+}
+
+/// Uniform sample count, clamped to `[2, 100 000]` and to a quarter of the
+/// budget so refinement still has room.
+fn sample_count(samples: usize, opts: &PlotOptions) -> usize {
+    samples.clamp(2, 100_000).min(opts.max_evals / 4).max(2)
+}
+
 struct Samples {
     xs: Vec<f64>,
     ys: Vec<f64>,
 }
 
-fn sample<F>(f: &F, x0: f64, x1: f64, n: usize, cancel: &CancelToken) -> Result<Samples, Cancelled>
+fn sample<F>(f: &F, x0: f64, x1: f64, n: usize, guard: &Guard<'_>) -> Result<Samples, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
-    let n = n.max(2);
-    let mut budget = Budget::new(usize::MAX, cancel);
     let mut xs = Vec::with_capacity(n + 1);
     let mut ys = Vec::with_capacity(n + 1);
     for i in 0..=n {
-        budget.tick()?;
         let x = if i == n {
             x1
         } else {
             x0 + (x1 - x0) * (i as f64 / n as f64)
         };
         xs.push(x);
-        ys.push(f(x));
+        ys.push(guard.call(f, x));
     }
-    cancel.check()?;
+    guard.check()?;
     Ok(Samples { xs, ys })
 }
 
@@ -178,46 +236,60 @@ fn dedup_sorted(v: &mut Vec<f64>, eps: f64) {
     v.dedup_by(|a, b| (*a - *b).abs() <= eps);
 }
 
-/// Roots of `f` in `[x0, x1]` from `samples` uniform intervals: sign changes
-/// (refined with Brent, poles/jumps rejected) and touching roots such as
-/// `x²` at 0 (local minima of `|f|` that reach zero).
-pub fn find_roots<F>(
+fn valid_range(x0: f64, x1: f64) -> bool {
+    x0.is_finite() && x1.is_finite() && x0 < x1
+}
+
+fn roots_with<F>(
     f: &F,
     x0: f64,
     x1: f64,
     samples: usize,
-    cancel: &CancelToken,
+    opts: &PlotOptions,
+    guard: &Guard<'_>,
 ) -> Result<Vec<f64>, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
-    if !(x0.is_finite() && x1.is_finite() && x0 < x1) {
+    if !valid_range(x0, x1) {
         return Ok(Vec::new());
     }
-    let Samples { xs, ys } = sample(f, x0, x1, samples, cancel)?;
+    let n = sample_count(samples, opts);
+    let Samples { xs, ys } = sample(f, x0, x1, n, guard)?;
+    let g = |x: f64| guard.call(f, x);
     let span = x1 - x0;
     let xtol = span * 1e-15;
-    let max_abs = ys
-        .iter()
-        .filter(|y| y.is_finite())
-        .fold(0.0_f64, |m, y| m.max(y.abs()));
+    let mut finite = ys.iter().filter(|y| y.is_finite()).peekable();
+    if finite.peek().is_some() && finite.all(|&y| y == 0.0) {
+        // Identically zero (e.g. intersections of a curve with itself): no
+        // isolated roots to report.
+        return Ok(Vec::new());
+    }
     let mut roots = Vec::new();
-    for i in 0..xs.len() {
+    let mut i = 0;
+    while i < xs.len() {
         let y = ys[i];
         if !y.is_finite() {
+            i += 1;
             continue;
         }
         if y == 0.0 {
-            roots.push(xs[i]);
+            // Collapse a run of exact zeros to its midpoint.
+            let start = i;
+            while i + 1 < xs.len() && ys[i + 1] == 0.0 {
+                i += 1;
+            }
+            roots.push(0.5 * (xs[start] + xs[i]));
+            i += 1;
             continue;
         }
         if let Some(&yn) = ys.get(i + 1)
             && yn.is_finite()
             && yn != 0.0
             && (y > 0.0) != (yn > 0.0)
-            && let Some(r) = brent_root(f, xs[i], xs[i + 1], xtol, 200)
+            && let Some(r) = brent_root(&g, xs[i], xs[i + 1], xtol, 200)
         {
-            let fr = f(r);
+            let fr = g(r);
             // A real root drives |f| to ~0; poles blow up and jumps stay put.
             if fr.is_finite() && fr.abs() <= 1e-6 * y.abs().max(yn.abs()) {
                 roots.push(r);
@@ -227,36 +299,66 @@ where
             && let Some(&yn) = ys.get(i + 1)
         {
             let yp = ys[i - 1];
-            let same_sign = yp.is_finite() && yn.is_finite() && (yp > 0.0) == (y > 0.0);
-            let same_sign = same_sign && (yn > 0.0) == (y > 0.0) && yp != 0.0 && yn != 0.0;
+            let same_sign = yp.is_finite()
+                && yn.is_finite()
+                && yp != 0.0
+                && yn != 0.0
+                && (yp > 0.0) == (y > 0.0)
+                && (yn > 0.0) == (y > 0.0);
             if same_sign && y.abs() <= yp.abs() && y.abs() < yn.abs() {
-                let abs_f = |x: f64| f(x).abs();
-                let xm = golden_min(&abs_f, xs[i - 1], xs[i + 1], xtol);
-                if abs_f(xm) <= 1e-10 * max_abs.max(1.0) {
+                let abs_g = |x: f64| g(x).abs();
+                let xm = golden_min(&abs_g, xs[i - 1], xs[i + 1], xtol);
+                // Relative to the neighbouring samples, so a near miss such
+                // as x² + 1e-11 is not reported as a touching root.
+                if abs_g(xm) <= 1e-8 * yp.abs().max(yn.abs()) {
                     roots.push(xm);
                 }
             }
         }
+        i += 1;
     }
+    guard.check()?;
     dedup_sorted(&mut roots, span * 1e-9);
     Ok(roots)
 }
 
-/// Local minima and maxima of `f` strictly inside `[x0, x1]`.
-pub fn find_extrema<F>(
+/// Roots of `f` in `[x0, x1]` from `samples` uniform intervals: sign changes
+/// (refined with Brent, poles/jumps rejected), touching roots such as `x²`
+/// at 0 (local minima of `|f|` that reach zero), and runs of exact zeros
+/// (reported once, at their midpoint). An identically zero `f` has no
+/// isolated roots and yields an empty list.
+pub fn find_roots<F>(
     f: &F,
     x0: f64,
     x1: f64,
     samples: usize,
-    cancel: &CancelToken,
+    opts: &PlotOptions,
+) -> Result<Sampled<Vec<f64>>, Cancelled>
+where
+    F: Fn(f64) -> f64 + ?Sized,
+{
+    let guard = Guard::new(opts);
+    let roots = roots_with(f, x0, x1, samples, opts, &guard)?;
+    guard.finish(roots)
+}
+
+fn extrema_with<F>(
+    f: &F,
+    x0: f64,
+    x1: f64,
+    samples: usize,
+    opts: &PlotOptions,
+    guard: &Guard<'_>,
 ) -> Result<Vec<Feature>, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
-    if !(x0.is_finite() && x1.is_finite() && x0 < x1) {
+    if !valid_range(x0, x1) {
         return Ok(Vec::new());
     }
-    let Samples { xs, ys } = sample(f, x0, x1, samples, cancel)?;
+    let n = sample_count(samples, opts);
+    let Samples { xs, ys } = sample(f, x0, x1, n, guard)?;
+    let g = |x: f64| guard.call(f, x);
     let xtol = (x1 - x0) * 1e-13;
     let mut out: Vec<Feature> = Vec::new();
     for i in 1..xs.len().saturating_sub(1) {
@@ -276,14 +378,14 @@ where
         } else {
             1.0
         };
-        let g = |x: f64| sign * f(x);
-        let xm = golden_min(&g, xs[i - 1], xs[i + 1], xtol);
-        let ym = f(xm);
+        let signed = |x: f64| sign * g(x);
+        let xm = golden_min(&signed, xs[i - 1], xs[i + 1], xtol);
+        let ym = g(xm);
         // Reject poles: near a smooth (or cusp) extremum f barely moves.
         let h = (xs[i + 1] - xs[i - 1]) * 1e-4;
         let scale = (ya - yb).abs() + (yc - yb).abs();
         let smooth = [xm - h, xm + h].iter().all(|&x| {
-            let v = f(x);
+            let v = g(x);
             v.is_finite() && (v - ym).abs() <= 1e-3 * scale
         });
         if ym.is_finite() && smooth {
@@ -293,53 +395,74 @@ where
             });
         }
     }
+    guard.check()?;
     Ok(out)
 }
 
-/// Intersections of `y = f(x)` and `y = g(x)` in `[x0, x1]`.
+/// Local minima and maxima of `f` strictly inside `[x0, x1]`.
+pub fn find_extrema<F>(
+    f: &F,
+    x0: f64,
+    x1: f64,
+    samples: usize,
+    opts: &PlotOptions,
+) -> Result<Sampled<Vec<Feature>>, Cancelled>
+where
+    F: Fn(f64) -> f64 + ?Sized,
+{
+    let guard = Guard::new(opts);
+    let e = extrema_with(f, x0, x1, samples, opts, &guard)?;
+    guard.finish(e)
+}
+
+/// Intersections of `y = f(x)` and `y = g(x)` in `[x0, x1]`. Identical
+/// curves (`f - g ≡ 0`) have no isolated intersections.
 pub fn find_intersections<F, G>(
     f: &F,
     g: &G,
     x0: f64,
     x1: f64,
     samples: usize,
-    cancel: &CancelToken,
-) -> Result<Vec<Vec2>, Cancelled>
+    opts: &PlotOptions,
+) -> Result<Sampled<Vec<Vec2>>, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
     G: Fn(f64) -> f64 + ?Sized,
 {
+    let guard = Guard::new(opts);
     let h = |x: f64| f(x) - g(x);
-    let xs = find_roots(&h, x0, x1, samples, cancel)?;
-    Ok(xs
+    let xs = roots_with(&h, x0, x1, samples, opts, &guard)?;
+    let pts = xs
         .into_iter()
-        .map(|x| Vec2::new(x, f(x)))
+        .map(|x| Vec2::new(x, guard.call(f, x)))
         .filter(|p| p.is_finite())
-        .collect())
+        .collect();
+    guard.finish(pts)
 }
 
 /// Roots, extrema and the y-intercept of `y = f(x)` visible in the view,
-/// sampled at pixel resolution.
+/// sampled at pixel resolution, sharing one evaluation budget.
 pub fn explicit_features<F>(
     f: &F,
     view: &View,
-    cancel: &CancelToken,
-) -> Result<Vec<Feature>, Cancelled>
+    opts: &PlotOptions,
+) -> Result<Sampled<Vec<Feature>>, Cancelled>
 where
     F: Fn(f64) -> f64 + ?Sized,
 {
+    let guard = Guard::new(opts);
     let b = view.bounds();
     let n = view.width_px().ceil() as usize;
-    let mut out: Vec<Feature> = find_roots(f, b.x_min, b.x_max, n, cancel)?
+    let mut out: Vec<Feature> = roots_with(f, b.x_min, b.x_max, n, opts, &guard)?
         .into_iter()
         .map(|x| Feature {
             pos: Vec2::new(x, 0.0),
             kind: FeatureKind::Root,
         })
         .collect();
-    out.extend(find_extrema(f, b.x_min, b.x_max, n, cancel)?);
+    out.extend(extrema_with(f, b.x_min, b.x_max, n, opts, &guard)?);
     if b.x_min <= 0.0 && 0.0 <= b.x_max {
-        let y = f(0.0);
+        let y = guard.call(f, 0.0);
         if y.is_finite() {
             out.push(Feature {
                 pos: Vec2::new(0.0, y),
@@ -348,7 +471,7 @@ where
         }
     }
     out.retain(|ft| b.contains(ft.pos));
-    Ok(out)
+    guard.finish(out)
 }
 
 /// The feature closest to a screen position, within `radius_px` pixels.
@@ -372,8 +495,8 @@ mod tests {
     use crate::Rect;
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
-    fn none() -> CancelToken {
-        CancelToken::none()
+    fn none() -> PlotOptions {
+        PlotOptions::default()
     }
 
     fn close(a: f64, b: f64, tol: f64) -> bool {
@@ -400,7 +523,7 @@ mod tests {
     fn sine_roots() {
         let r = find_roots(&f64::sin, -10.0, 10.0, 1000, &none()).unwrap();
         assert_eq!(r.len(), 7);
-        for (k, x) in (-3..=3).zip(&r) {
+        for (k, x) in (-3..=3).zip(r.iter()) {
             assert!(close(*x, k as f64 * PI, 1e-12), "{x}");
         }
     }
@@ -515,9 +638,10 @@ mod tests {
 
     #[test]
     fn analysis_cancel_and_bad_range() {
-        let t = CancelToken::new();
-        t.cancel();
-        assert_eq!(find_roots(&f64::sin, 0.0, 1.0, 100, &t), Err(Cancelled));
+        let o = PlotOptions::with_cancel(CancelToken::new());
+        o.cancel.cancel();
+        assert_eq!(find_roots(&f64::sin, 0.0, 1.0, 100, &o), Err(Cancelled));
+        assert_eq!(find_extrema(&f64::sin, 0.0, 1.0, 100, &o), Err(Cancelled));
         assert!(
             find_roots(&f64::sin, 1.0, 0.0, 100, &none())
                 .unwrap()
@@ -528,5 +652,56 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn zero_runs_collapse_and_identical_curves_have_no_intersections() {
+        // Zero on [-1, 1], positive outside: one root reported, not hundreds.
+        let f = |x: f64| if x.abs() <= 1.0 { 0.0 } else { x * x - 1.0 };
+        let r = find_roots(&f, -3.0, 3.0, 600, &none()).unwrap();
+        assert_eq!(r.len(), 1, "{:?}", r.data);
+        assert!(r[0].abs() < 1e-9);
+        // Isolated exact zero sample (sin at 0 on a symmetric grid).
+        let r = find_roots(&f64::sin, -1.0, 1.0, 10, &none()).unwrap();
+        assert_eq!(r.data, vec![0.0]);
+        assert!(
+            find_roots(&|_x: f64| 0.0, -1.0, 1.0, 100, &none())
+                .unwrap()
+                .is_empty()
+        );
+        let p = find_intersections(&f64::sin, &f64::sin, -5.0, 5.0, 500, &none()).unwrap();
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn near_miss_is_not_a_touching_root() {
+        let r = find_roots(&|x: f64| x * x + 1e-11, -3.0, 3.1, 1000, &none()).unwrap();
+        assert!(r.is_empty(), "{:?}", r.data);
+        let r = find_roots(&|x: f64| x * x, -3.0, 3.1, 1000, &none()).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn analysis_respects_eval_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = AtomicUsize::new(0);
+        let f = |x: f64| {
+            n.fetch_add(1, Ordering::Relaxed);
+            x.sin()
+        };
+        let o = PlotOptions {
+            max_evals: 300,
+            ..none()
+        };
+        let r = find_roots(&f, -100.0, 100.0, usize::MAX, &o).unwrap();
+        assert!(n.load(Ordering::Relaxed) <= 300);
+        assert!(r.truncated);
+        n.store(0, Ordering::Relaxed);
+        let v = View::new(Rect::new(-50.0, -2.0, 50.0, 2.0), 1200.0, 100.0);
+        let fs = explicit_features(&f, &v, &o).unwrap();
+        assert!(n.load(Ordering::Relaxed) <= 300);
+        assert!(fs.truncated);
+        let full = find_roots(&f64::sin, -10.0, 10.0, 1000, &none()).unwrap();
+        assert!(!full.truncated);
     }
 }

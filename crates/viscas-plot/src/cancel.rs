@@ -1,4 +1,5 @@
-//! Cooperative cancellation for sampling running on worker threads.
+//! Cooperative cancellation and evaluation budgets for sampling running on
+//! worker threads.
 
 use std::fmt;
 use std::sync::Arc;
@@ -57,12 +58,46 @@ impl fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-/// Evaluation counter shared by the samplers: enforces the evaluation budget
-/// and polls the cancel flag every few evaluations.
+/// Result of a sampler whose work may have been cut short by the
+/// evaluation budget (`PlotOptions::max_evals`). Dereferences to the data.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Sampled<T> {
+    pub data: T,
+    /// The evaluation budget ran out, so the result is coarser or
+    /// incomplete. Cancellation is reported as `Err(Cancelled)` instead.
+    pub truncated: bool,
+}
+
+impl<T> std::ops::Deref for Sampled<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.data
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Sampled<Vec<T>> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.data.iter()
+    }
+}
+
+impl<T> Sampled<T> {
+    pub fn into_inner(self) -> T {
+        self.data
+    }
+}
+
+/// Evaluation counter shared by the samplers. It is a hard cap: once `max`
+/// evaluations were granted, [`Budget::take`] refuses and records the
+/// truncation. The cancel flag is polled on every request (one relaxed
+/// atomic load, negligible next to a function evaluation).
 pub(crate) struct Budget<'a> {
     pub evals: usize,
     max: usize,
     cancel: &'a CancelToken,
+    truncated: bool,
 }
 
 impl<'a> Budget<'a> {
@@ -71,20 +106,46 @@ impl<'a> Budget<'a> {
             evals: 0,
             max,
             cancel,
+            truncated: false,
         }
     }
 
+    /// Ask for one evaluation: `Ok(true)` if granted, `Ok(false)` if the
+    /// budget is exhausted, `Err` if cancelled.
     #[inline]
-    pub fn tick(&mut self) -> Result<(), Cancelled> {
-        self.evals += 1;
-        if self.evals & 63 == 0 {
-            self.cancel.check()?;
+    pub fn take(&mut self) -> Result<bool, Cancelled> {
+        self.cancel.check()?;
+        if self.evals >= self.max {
+            self.truncated = true;
+            return Ok(false);
         }
-        Ok(())
+        self.evals += 1;
+        Ok(true)
     }
 
     pub fn exhausted(&self) -> bool {
         self.evals >= self.max
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.max.saturating_sub(self.evals)
+    }
+
+    pub fn limit(&self) -> usize {
+        self.max
+    }
+
+    /// Change the cap (used to give each curve of a list a fair share).
+    pub fn set_limit(&mut self, max: usize) {
+        self.max = max;
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub fn reset_truncated(&mut self) {
+        self.truncated = false;
     }
 }
 
@@ -104,12 +165,32 @@ mod tests {
     }
 
     #[test]
-    fn budget_polls_cancel() {
+    fn budget_checks_cancel_on_every_take() {
         let t = CancelToken::new();
-        t.cancel();
         let mut b = Budget::new(10, &t);
-        let r: Result<(), Cancelled> = (0..64).try_for_each(|_| b.tick());
-        assert_eq!(r, Err(Cancelled));
-        assert!(b.exhausted());
+        assert_eq!(b.take(), Ok(true));
+        t.cancel();
+        assert_eq!(b.take(), Err(Cancelled));
+    }
+
+    #[test]
+    fn budget_is_a_hard_cap() {
+        let t = CancelToken::none();
+        let mut b = Budget::new(3, &t);
+        let granted = (0..10).filter(|_| b.take().unwrap()).count();
+        assert_eq!(granted, 3);
+        assert_eq!(b.evals, 3);
+        assert!(b.exhausted() && b.truncated());
+        assert_eq!(b.remaining(), 0);
+    }
+
+    #[test]
+    fn sampled_derefs() {
+        let s = Sampled {
+            data: vec![1, 2],
+            truncated: false,
+        };
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.into_inner(), vec![1, 2]);
     }
 }

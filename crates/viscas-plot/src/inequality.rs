@@ -6,8 +6,14 @@
 //! fully-inside cells become rectangles (merged into row runs) and boundary
 //! cells become the inside part of the cell clipped at the edge crossings.
 //!
-//! Fill polygons of one region never overlap; the UI should add them all to a
+//! Fill polygons are clipped to the view bounds, so [`Region::area`] is the
+//! visible shaded area. They never overlap; the UI should add them all to a
 //! single path and fill once to avoid anti-aliasing seams between pieces.
+//!
+//! Sign changes through poles (e.g. `1/x < 0`) do bound the shaded region:
+//! the fill closes at the asymptote, but no boundary curve is drawn there.
+//! Boundary cells with an undefined (NaN) corner are left unshaded rather
+//! than guessed, so domain edges may show a gap of up to one finest cell.
 
 use crate::cancel::Cancelled;
 use crate::curve::{sample_explicit, sample_explicit_x, view_x_range, view_y_range};
@@ -52,10 +58,12 @@ pub struct Region {
     pub fill: Vec<Polygon>,
     pub boundary: Vec<Polyline>,
     pub boundary_style: LineStyle,
+    /// The evaluation budget ran out; the region is coarser or incomplete.
+    pub truncated: bool,
 }
 
 impl Region {
-    /// Total fill area (world units²).
+    /// Visible fill area (world units²); fills are clipped to the view.
     pub fn area(&self) -> f64 {
         self.fill.iter().map(Polygon::area).sum()
     }
@@ -105,7 +113,7 @@ where
             (poly.area() > 0.0).then_some(poly)
         })
         .collect();
-    Ok(finish(fill, raw, cmp, view, opts))
+    Ok(finish(fill, raw.data, raw.truncated, cmp, view, opts))
 }
 
 /// `x ⋚ f(y)` over the view (shaded to the left for `<`, right for `>`).
@@ -133,21 +141,28 @@ where
             (poly.area() > 0.0).then_some(poly)
         })
         .collect();
-    Ok(finish(fill, raw, cmp, view, opts))
+    Ok(finish(fill, raw.data, raw.truncated, cmp, view, opts))
+}
+
+fn clip_fill(fill: Vec<Polygon>, view: &View) -> Vec<Polygon> {
+    let b = view.bounds();
+    fill.into_iter().filter_map(|p| p.clipped(&b)).collect()
 }
 
 fn finish(
     fill: Vec<Polygon>,
     raw: Vec<Polyline>,
+    truncated: bool,
     cmp: Comparison,
     view: &View,
     opts: &PlotOptions,
 ) -> Region {
     let rect = view.bounds().expanded(opts.clip_margin.max(0.0));
     Region {
-        fill,
+        fill: clip_fill(fill, view),
         boundary: raw.iter().flat_map(|l| l.clipped(&rect)).collect(),
         boundary_style: cmp.boundary_style(),
+        truncated,
     }
 }
 
@@ -174,9 +189,10 @@ where
     }
     let boundary = grid.contour()?;
     Ok(Region {
-        fill,
+        fill: clip_fill(fill, view),
         boundary,
         boundary_style: cmp.boundary_style(),
+        truncated: grid.truncated(),
     })
 }
 
@@ -233,9 +249,14 @@ where
     let mut cross = [None; 4];
     for k in 0..4 {
         vals[k] = grid.value(corners[k])?;
+        if vals[k].is_nan() {
+            // Undefined corner: the domain edge inside the cell is unknown,
+            // and joining the defined corners would cut across it.
+            return Ok(());
+        }
         cross[k] = grid.crossing(edges[k])?.point();
     }
-    if cross.iter().all(Option::is_some) && !inside(grid.center_value(c)?) {
+    if cross.iter().all(Option::is_some) && !inside(grid.saddle_center(c)?) {
         // Saddle with separated inside corners: one triangle per corner.
         for k in 0..4 {
             if inside(vals[k])
@@ -274,42 +295,16 @@ mod tests {
         PlotOptions::default()
     }
 
-    /// Area of the region clipped to the visible view (Sutherland–Hodgman
-    /// against the view rectangle, exact for any simple polygon).
+    /// Fills are clipped to the view, so this is just the region area.
     fn visible_area(r: &Region, v: &View) -> f64 {
         let b = v.bounds();
-        type Plane = (fn(Vec2) -> f64, f64, f64);
-        let planes: [Plane; 4] = [
-            (|p| p.x, b.x_min, 1.0),
-            (|p| p.x, b.x_max, -1.0),
-            (|p| p.y, b.y_min, 1.0),
-            (|p| p.y, b.y_max, -1.0),
-        ];
-        r.fill
-            .iter()
-            .map(|poly| {
-                let mut pts = poly.points.clone();
-                for (coord, level, sign) in planes {
-                    let d = |p: Vec2| (coord(p) - level) * sign;
-                    let mut out = Vec::new();
-                    for i in 0..pts.len() {
-                        let (a, c) = (pts[i], pts[(i + 1) % pts.len()]);
-                        let (da, dc) = (d(a), d(c));
-                        if da >= 0.0 {
-                            out.push(a);
-                        }
-                        if (da >= 0.0) != (dc >= 0.0) {
-                            out.push(a.lerp(c, da / (da - dc)));
-                        }
-                    }
-                    pts = out;
-                    if pts.is_empty() {
-                        break;
-                    }
-                }
-                Polygon::new(pts).area()
-            })
-            .sum()
+        assert!(
+            r.fill
+                .iter()
+                .flat_map(|p| p.points.iter())
+                .all(|p| b.expanded(1e-12).contains(*p))
+        );
+        r.area()
     }
 
     fn contains(poly: &Polygon, p: Vec2) -> bool {
@@ -418,6 +413,39 @@ mod tests {
         let f = |x: f64, y: f64| (x * x + y * y).powi(2) - 2.0 * (x * x - y * y);
         let r = plot_implicit_inequality(&f, Comparison::Less, &view(), &opts()).unwrap();
         assert!((r.area() - 2.0).abs() < 2e-3, "{}", r.area());
+    }
+
+    #[test]
+    fn undefined_corners_are_not_shaded() {
+        // y < sqrt(x): undefined for x < 0, must not shade across the y axis.
+        let f = |x: f64, y: f64| y - x.sqrt();
+        let v = view();
+        let r = plot_implicit_inequality(&f, Comparison::Less, &v, &opts()).unwrap();
+        assert!(
+            r.fill
+                .iter()
+                .flat_map(|p| p.points.iter())
+                .all(|p| p.x >= -1e-12)
+        );
+        // ∫_0^3 (sqrt(x) + 2) dx clipped at y = 2 is 6 + ∫_0^3 sqrt(x) dx = 6 + 2·3^1.5/3.
+        let expect = 6.0 + 2.0 * 3f64.powf(1.5) / 3.0;
+        assert!((r.area() - expect).abs() < 0.02, "{} vs {expect}", r.area());
+    }
+
+    #[test]
+    fn truncated_region_flag() {
+        let f = |x: f64, y: f64| x * x + y * y - 1.0;
+        let o = PlotOptions {
+            max_evals: 2_000,
+            ..opts()
+        };
+        let r = plot_implicit_inequality(&f, Comparison::Less, &view(), &o).unwrap();
+        assert!(r.truncated);
+        assert!(
+            !plot_implicit_inequality(&f, Comparison::Less, &view(), &opts())
+                .unwrap()
+                .truncated
+        );
     }
 
     #[test]
