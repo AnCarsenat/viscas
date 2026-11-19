@@ -1,6 +1,10 @@
-use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow, glib};
-use gtk4 as gtk;
+extern crate gtk4 as gtk;
+
+mod viewport;
+
+use adw::prelude::*;
+use adw::{Application, ApplicationWindow};
+use gtk::glib;
 
 const APP_ID: &str = "io.github.ancarsenat.Viscas";
 
@@ -16,6 +20,7 @@ fn build_ui(app: &Application) {
         .title("Viscas")
         .default_width(1200)
         .default_height(800)
+        .content(&viewport::build())
         .build();
     window.present();
 }
