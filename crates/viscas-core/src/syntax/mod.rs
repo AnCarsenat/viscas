@@ -1,11 +1,13 @@
 //! Lexer, parser, AST and pretty-printer for the Viscas expression and
 //! scripting language.
 
+pub mod ast;
 pub mod lexer;
 pub mod token;
 
 use std::fmt;
 
+pub use ast::*;
 pub use token::{Keyword, Span, Token, TokenKind};
 
 /// A lexical or syntax error with the offending source range.
