@@ -78,7 +78,8 @@ with a user default.
 1. **Dependency view.** Dependency Graph editor shows nodes as boxes with edges
    for references. Hovering/selecting any node (in any editor) highlights its
    upstream inputs and downstream dependents everywhere. Editing an edge
-   (re-pointing a reference) rewrites the expression.
+   (re-pointing a reference) rewrites the expression. Rendered as an
+   infinite-zoom canvas with nested capsules and patch cables (see decision 8).
 2. **Step-by-step CAS.** Every symbolic result (simplify, solve, derivative,
    integrate, limit…) can expand into its derivation: a sequence of rewrite
    steps with the rule applied, each step typeset and copyable.
@@ -227,7 +228,7 @@ Cargo workspace:
 | M2 | Scene model + scene tree + inspector + expressions editor (text + typeset preview) + 2D plotting |
 | M2b | Structural math editor widget |
 | M3 | All 2D plot kinds, sliders, points, pan/zoom/trace |
-| M4 | Function library (lists, stats, distributions, geometry, regression) + dependency graph editor |
+| M4 | Function library (lists, stats, distributions, geometry, regression) + dependency graph editor (infinite-zoom capsule canvas) |
 | M5 | CAS with step-by-step: simplify/expand/factor/solve/derivative/integrate/limit/series, matrices |
 | M6 | Sheet editor + table nodes + CSV |
 | M7 | Scripting + actions/tickers |
@@ -251,9 +252,18 @@ Each milestone splits into feature branches → PR → review → squash merge (
    own function library. Signature features: dependency view, step-by-step CAS,
    command palette.
 
+8. "A touch of Septabee" (node-based DAW by Lost Robot): borrowed as
+   - **Infinite-zoom node canvas** for the Dependency Graph editor: zoom
+     continuously from the whole document down into a single node; folders are
+     **nested capsules** you fly into instead of expanding in a list.
+   - **Map-like navigation**: smooth fly-to (double-click a node or pick it in
+     the palette to glide the camera there), minimap overview.
+   - **Patch-cable wiring**: references drawn as cables between node ports;
+     dragging a cable re-points a reference.
+   - **Personality**: a little playful microcopy in empty states, tips and
+     errors, never at the cost of clarity. The base look stays Blender-precise.
+
 ## 15. Open questions
 
-1. "A touch of septabee" — reference to be clarified by the owner (what it is,
-   which aspect of its look to borrow).
-2. Keep libadwaita as a dependency for non-visual helpers, or drop it entirely
-   in favour of plain GTK4 + own theme?
+1. Keep libadwaita as a dependency for non-visual helpers, or drop it entirely
+   in favour of plain GTK4 + own theme? (Current plan: drop.)
