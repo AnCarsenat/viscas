@@ -1,10 +1,15 @@
-# Viscas — Requirements (v0.1)
+# Viscas — Requirements (v0.2)
 
-Viscas (VISual CAS) is a desktop graphing calculator and computer algebra system
-built with Rust + GTK4. Goal: everything Desmos can do, plus a real CAS, a
-qalc-grade console, spreadsheets and scripting — in a very clean, keyboard-first UI.
+Viscas (VISual CAS) is a desktop math workstation: graphing, a real CAS, a
+console, spreadsheets and scripting, built with Rust + GTK4.
 
-Status: **accepted v0.1**.
+**Identity.** Viscas is *not* a Desmos or GeoGebra clone. It is a professional
+tool in the spirit of Blender and Godot: a scene tree of nodes, an inspector,
+splittable editor areas, a console as the primary input, and a dark, dense,
+precise interface. Math objects are built, inspected and wired like objects in a
+3D/game engine.
+
+Status: **v0.2 — identity revision**. Supersedes the "Desmos parity" framing of v0.1.
 
 ---
 
@@ -19,43 +24,72 @@ Status: **accepted v0.1**.
    expression list, table cells and (as a subset) scripts.
 4. **Exact first, numeric when needed.** Results stay symbolic/exact
    (`1/3`, `√2`, `π`) until a numeric value is requested or required.
-5. **Clean UI.** GNOME HIG / libadwaita look, minimal chrome, light + dark theme,
-   math rendered as typeset formulas, every action reachable from the keyboard.
+5. **Pro-tool UI.** Blender-like: dark-first custom theme, dense compact widgets,
+   splittable editor areas, drag-to-scrub number fields, precise typography with
+   monospace accents, math rendered as typeset formulas. Every action reachable from
+   the keyboard and the command palette. Own GTK CSS theme — not the stock
+   libadwaita/GNOME look.
+7. **Own identity.** Function names, syntax and behaviours are designed for Viscas
+   (CAS + scripting first), not copied from Desmos/GeoGebra.
 6. **Core is UI-independent.** Parser, CAS, evaluator, scene model and plot sampling
    live in GTK-free crates with unit tests. GTK is only the shell.
 
-## 2. Window layout
+## 2. Window layout — areas and editors
+
+The window is split into **areas**, Blender-style. Each area hosts one **editor**
+and has a thin header strip with an editor-type switcher and editor-specific menus.
+Areas can be split, joined, resized, swapped and maximized (Ctrl+Space).
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ header bar: doc name · undo/redo · view toggles · menu       │
-├───────────────┬──────────────────────────────────────────────┤
-│ LEFT SIDEBAR  │                                              │
-│ [tabs]        │   VIEWPORT(S)  — viewport nodes              │
-│  Expressions  │   (2D graph, later 3D; can split/tab)        │
-│  Console      │                                              │
-│  Sheets       │                                              │
-│  Scripts      │                                              │
-│  Scene        │                                              │
-└───────────────┴──────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ top bar: menus · workspace tabs [Graph][Algebra][Data][Script] · ⌘K │
+├──────────────┬──────────────────────────────────────┬───────────────┤
+│ Scene Tree   │                                      │ Inspector     │
+│ (Godot-like) │          Viewport (2D)               │ (properties   │
+│              │                                      │  of selected  │
+├──────────────┤                                      │  node)        │
+│ Console /    │                                      │               │
+│ Expressions /├──────────────────────────────────────┤               │
+│ Sheet /Script│   Dependency Graph  (optional area)  │               │
+├──────────────┴──────────────────────────────────────┴───────────────┤
+│ status bar: mode (exact/approx · rad/deg) · selection · eval status │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-Sidebar panels (fixed UI, not nodes):
+Editors (UI, not nodes):
 
-| Panel        | Purpose |
-|--------------|---------|
-| Expressions  | Desmos-style ordered list of statement nodes. Typeset editing, color swatch, visibility toggle, inline slider, inline errors. |
-| Console      | REPL like `qalc`, but better: history, typeset output, tab completion, `ans`, unit conversion (`to`), exact/approx toggle, results can be "pinned" into the scene as nodes. |
-| Sheets       | Spreadsheet editor for table nodes: columns are lists, cells hold expressions, formulas reference other columns/nodes, columns plottable. |
-| Scripts      | Code editor for script nodes: syntax highlight, run/stop, output log. |
-| Scene        | Tree view of all nodes: rename, reorder, group in folders, hide, lock, inspect properties and dependencies. |
+| Editor           | Purpose |
+|------------------|---------|
+| Viewport         | Renders a Viewport node (2D now, 3D later). Several can be open at once. |
+| Scene Tree       | Godot-style tree of all nodes: typed icons, rename, reparent by drag, folders, hide/lock toggles, filter. |
+| Inspector        | Properties of the selected node(s): expression, style, ranges, metadata; compact fields, drag-to-scrub numbers, multi-edit. |
+| Console          | Primary input. REPL (qalc-grade): history, typeset output, completion, `ans`, unit conversion, exact/approx; results can be pinned into the scene as nodes. |
+| Expressions      | Flat ordered list of statement nodes for quick editing (a view of the tree, not a separate model). |
+| Sheet            | Spreadsheet editor for table nodes. |
+| Script           | Code editor for script nodes (Viscas language or Rhai). |
+| Dependency Graph | Node-graph view of how nodes depend on each other (see §2.1). |
 
-The sidebar is collapsible and resizable. Viewports fill the remaining space.
+**Workspaces** are saved area layouts (tabs in the top bar): *Graph*, *Algebra*,
+*Data*, *Script*; user-defined workspaces allowed. Layout is stored per document
+with a user default.
+
+### 2.1 Signature features
+
+1. **Dependency view.** Dependency Graph editor shows nodes as boxes with edges
+   for references. Hovering/selecting any node (in any editor) highlights its
+   upstream inputs and downstream dependents everywhere. Editing an edge
+   (re-pointing a reference) rewrites the expression.
+2. **Step-by-step CAS.** Every symbolic result (simplify, solve, derivative,
+   integrate, limit…) can expand into its derivation: a sequence of rewrite
+   steps with the rule applied, each step typeset and copyable.
+3. **Command palette (Ctrl+K).** Fuzzy search over every action, node,
+   function, unit and setting. Keyboard-only workflow is a first-class goal.
 
 ## 3. Node model
 
-Every node has: unique id, optional name, parent, visibility, lock, style
-(color, line width/style, opacity, label), and a body.
+Godot-style scene tree. Every node has: unique id, optional name, type (with
+icon), parent, children, visibility, lock, style (color, line width/style,
+opacity, label), and a body. Node properties are what the Inspector edits.
 
 | Node kind   | Example | Notes |
 |-------------|---------|-------|
@@ -66,8 +100,8 @@ Every node has: unique id, optional name, parent, visibility, lock, style
 | Slider      | `a = 3` with range/step/animation | a Variable with slider metadata |
 | List        | `L = [1..10]` | comprehensions `[k^2 for k=[1..5]]` |
 | Geometry    | `segment(A,B)`, `circle(C,r)`, `polygon(...)` | |
-| Table       | sheet of columns | edited in Sheets panel |
-| Script      | code body | edited in Scripts panel |
+| Table       | sheet of columns | edited in Sheet editor |
+| Script      | code body | edited in Script editor |
 | Action/Ticker | `a -> a+1`, ticker every 100 ms | |
 | Note        | text / markdown | |
 | Folder      | group of nodes | |
@@ -89,7 +123,11 @@ Every node has: unique id, optional name, parent, visibility, lock, style
 
 ## 5. Function library
 
-**Desmos parity (required):**
+Own library, designed around CAS + scripting. Names and behaviours are Viscas's
+own (may use namespaces, e.g. `stats.mean`, `geo.circle`); the list below is the
+capability scope, not an API to copy.
+
+**Numeric & data:**
 - Trig: sin cos tan csc sec cot + inverses + hyperbolic + inverse hyperbolic; degree/radian mode.
 - Elementary: exp ln log log_b sqrt nthroot abs sign floor ceil round mod lcm gcd
   nCr nPr factorial min max.
@@ -105,7 +143,7 @@ Every node has: unique id, optional name, parent, visibility, lock, style
 - Colors: rgb hsv; random; actions and tickers.
 - Complex mode.
 
-**CAS (beyond Desmos):**
+**CAS (every result supports step-by-step, §2.1):**
 - simplify expand factor collect partialfraction
 - solve (equations, systems, inequalities), nsolve (numeric), roots
 - derivative (symbolic, partial), integrate (symbolic + numeric), limit, series/taylor
@@ -127,7 +165,7 @@ Every node has: unique id, optional name, parent, visibility, lock, style
 
 ## 7. Console
 
-- `qalc`-style one-line evaluation with typeset output and exact + approx results.
+- Primary input of the app. One-line evaluation with typeset output and exact + approx results.
 - History (persisted), up/down recall, `ans`, `ans2`.
 - Tab completion for functions, nodes, units.
 - Commands: `:help f`, `:pin` (turn result into node), `:clear`, `:mode deg|rad|exact|approx`, `to <unit>`.
@@ -163,7 +201,7 @@ Every node has: unique id, optional name, parent, visibility, lock, style
 
 ## 11. Non-functional
 
-- Linux first (GTK4 + libadwaita); Windows/macOS best effort.
+- Linux first (GTK4, own CSS theme); Windows/macOS best effort.
 - Startup < 1 s; UI never blocks on computation (cancellable workers).
 - `cargo test` covers parser, CAS, evaluator, scene; CI runs fmt + clippy + test.
 
@@ -177,20 +215,21 @@ Cargo workspace:
 | `viscas-scene`  | node tree, dependency DAG, reactive recompute, undo, (de)serialization | no |
 | `viscas-plot`   | sampling, implicit curves, view transforms → draw primitives | no |
 | `viscas-script` | scripting engine + scene bindings | no |
-| `viscas-app`    | GTK4/libadwaita shell: sidebar panels, viewport widget, math rendering | yes |
+| `viscas-app`    | GTK4 shell: area/editor system, theme, editors, viewport widget, math rendering | yes |
 
 ## 13. Milestones
 
 | M  | Content |
 |----|---------|
-| M0 | Workspace, CI, app shell (header bar + sidebar tabs + empty viewport) |
-| M1 | Parser + exact/numeric evaluator + console panel |
-| M2 | Scene model + expressions panel (text input + typeset preview) + 2D viewport plotting `y=f(x)` |
+| M0 | Workspace, CI, app shell (done) |
+| M0b | Pro theme + area/editor system (split/join/switch), workspaces, status bar, command palette skeleton |
+| M1 | Parser + exact/numeric evaluator + console editor |
+| M2 | Scene model + scene tree + inspector + expressions editor (text + typeset preview) + 2D plotting |
 | M2b | Structural math editor widget |
 | M3 | All 2D plot kinds, sliders, points, pan/zoom/trace |
-| M4 | Function library to Desmos parity (lists, stats, distributions, geometry, regression) |
-| M5 | CAS: simplify/expand/factor/solve/derivative/integrate/limit/series, matrices |
-| M6 | Sheets panel + table nodes + CSV |
+| M4 | Function library (lists, stats, distributions, geometry, regression) + dependency graph editor |
+| M5 | CAS with step-by-step: simplify/expand/factor/solve/derivative/integrate/limit/series, matrices |
+| M6 | Sheet editor + table nodes + CSV |
 | M7 | Scripting + actions/tickers |
 | M8 | Documents: save/load, undo/redo, export; polish |
 | M9 | 3D viewport |
@@ -204,7 +243,17 @@ Each milestone splits into feature branches → PR → review → squash merge (
    for console and CAS. No C dependencies.
 3. 3D: later milestone (M9). 2D viewport code should not block adding it.
 4. Math input: both in v1 — plain-text input with live typeset preview, and a
-   Desmos-style structural editor (cursor inside fractions, exponents, roots).
+   structural editor (cursor inside fractions, exponents, roots).
    Toggle per field; both edit the same AST. Own math layout engine (Cairo/Pango).
 5. Units: physical units and constants. No live currency rates (no network).
 6. License: MIT OR Apache-2.0.
+7. Identity (v0.2): Blender + Godot inspired pro tool, dark-first technical look,
+   own function library. Signature features: dependency view, step-by-step CAS,
+   command palette.
+
+## 15. Open questions
+
+1. "A touch of septabee" — reference to be clarified by the owner (what it is,
+   which aspect of its look to borrow).
+2. Keep libadwaita as a dependency for non-visual helpers, or drop it entirely
+   in favour of plain GTK4 + own theme?
