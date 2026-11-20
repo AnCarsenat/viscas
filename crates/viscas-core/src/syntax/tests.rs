@@ -18,7 +18,7 @@ fn sx(e: &Expr) -> String {
         s.push(')');
         s
     };
-    match &e.kind {
+    match &*e.kind {
         ExprKind::Number { text, imaginary } => {
             format!("{text}{}", if *imaginary { "i" } else { "" })
         }
@@ -1054,7 +1054,7 @@ fn spans() {
     };
     assert_eq!(&src[lhs.span.start..lhs.span.end], "f(x)");
     assert_eq!(&src[rhs.span.start..rhs.span.end], "2 sin(x) + y_{1}");
-    let ExprKind::Add(terms) = &rhs.kind else {
+    let ExprKind::Add(terms) = &*rhs.kind else {
         panic!("expected sum");
     };
     let (prod, y) = (&terms[0].expr, &terms[1].expr);
@@ -1100,61 +1100,71 @@ fn nest(open: &str, inner: &str, close: &str, n: usize) -> String {
     format!("{}{inner}{}", open.repeat(n), close.repeat(n))
 }
 
+/// (open, inner, close, depth units per level, extra units at the innermost
+/// level) for every nesting construct.
+const NESTINGS: &[(&str, &str, &str, usize, usize)] = &[
+    ("(", "x", ")", 1, 0),
+    ("[", "1", "]", 1, 0),
+    ("-", "x", "", 1, 0),
+    ("not ", "x", "", 1, 0),
+    ("√", "x", "", 1, 0),
+    ("sin ", "x", "", 1, 0),
+    ("x^", "x", "", 1, 0),
+    ("|", "x", "|", 1, 0),
+    ("f(", "x", ")", 1, 0),
+    ("{x: ", "1", "}", 1, 0),
+    ("(1 + ", "x", ")", 1, 0),
+    ("[", "k", " for k = L]", 1, 0),
+    ("d/dx ", "x", "", 1, 0),
+    ("∑(k=1, 2) ", "k", "", 1, 1),
+    ("∫ ", "x", " dx", 1, 0),
+    ("L[", "1", "]", 2, 0),
+    ("-(", "x", ")", 2, 0),
+];
+
 #[test]
 fn nesting_limit_errors() {
     on_small_stack(|| {
-        let too_deep = [
-            nest("(", "x", ")", 300),
-            nest("[", "1", "]", 300),
-            nest("-", "x", "", 3000),
-            nest("not ", "x", "", 300),
-            nest("√", "x", "", 300),
-            nest("sin ", "x", "", 300),
-            nest("x^", "x", "", 300),
-            nest("|", "x", "|", 300),
-            nest("f(", "x", ")", 300),
-            nest("L[", "1", "]", 300),
-            nest("{x: ", "1", "}", 300),
-            nest("d/dx ", "x", "", 300),
-            nest("∑(k=1, 2) ", "k", "", 300),
-            nest("∫ ", "x", " dx", 300),
-            nest("-(", "x", ")", 200),
+        for &(open, inner, close, units, extra) in NESTINGS {
+            // The top-level expression itself uses one unit.
+            for n in [(parser::MAX_DEPTH - 1 - extra) / units + 1, 300] {
+                let src = nest(open, inner, close, n);
+                let errs = parse_expr(&src).expect_err(&head(&src));
+                assert!(
+                    errs.iter().any(|e| e.message.contains("nested too deeply")),
+                    "{}… (n = {n}): {errs:?}",
+                    head(&src)
+                );
+            }
+        }
+        for src in [
+            nest("-", "x", "", 200_000),
             "1 mod ".repeat(300) + "1",
             "1 to ".repeat(300) + "1",
-        ];
-        for src in &too_deep {
-            let errs = parse_expr(src).expect_err(&head(src));
-            assert!(
-                errs.iter().any(|e| e.message.contains("too")),
-                "{}…: {errs:?}",
-                &head(src)
-            );
+        ] {
+            let errs = parse_expr(&src).expect_err(&head(&src));
+            assert!(errs.iter().any(|e| e.message.contains("too")), "{errs:?}");
         }
-        let program = nest("if x {\n", "y", "\n}", 300);
+        let program = nest("if x {\n", "y", "\n}", parser::MAX_DEPTH);
         let (_, errs) = parse_program_partial(&program);
         assert!(errs.iter().any(|e| e.message.contains("nested too deeply")));
     });
 }
 
+/// The deepest accepted input of every kind parses, prints, re-parses and
+/// drops on a 2 MiB stack — also in unoptimised builds (about 1 MiB is
+/// used in the worst case).
 #[test]
-fn nesting_just_below_limit_round_trips() {
+fn deepest_accepted_nesting_fits_small_stack() {
     on_small_stack(|| {
-        let ok = [
-            nest("(", "x", ")", 250),
-            nest("[", "1", "]", 250),
-            nest("-", "x", "", 250),
-            nest("x^", "x", "", 250),
-            nest("|", "x", "|", 120),
-            nest("f(", "x", ")", 250),
-            nest("-(", "x", ")", 120),
-            nest("(1 + ", "x", ")", 250),
-            nest("{x: ", "1", "}", 250),
-        ];
-        for src in &ok {
-            let e = parse_expr(src).unwrap_or_else(|e| panic!("{}…: {e:?}", &head(src)));
-            roundtrip_expr(&head(src), &e);
+        for &(open, inner, close, units, extra) in NESTINGS {
+            let src = nest(open, inner, close, (parser::MAX_DEPTH - 1 - extra) / units);
+            let e = parse_expr(&src).unwrap_or_else(|e| panic!("{}…: {e:?}", head(&src)));
+            roundtrip_expr(&head(&src), &e);
         }
-        let program = nest("if x {\n", "y", "\n}", 120);
+        // Each `if` uses one unit; the innermost statement and its
+        // expression use two more.
+        let program = nest("if x {\n", "y", "\n}", parser::MAX_DEPTH - 2);
         let p = program_ok(&program);
         roundtrip_program("nested ifs", &p);
     });
@@ -1167,7 +1177,7 @@ fn long_chains_are_flat() {
         for sep in ["+", "-", "*", "/", " ", " and ", " or "] {
             let src = vec!["x"; n].join(sep);
             let e = parse_expr(&src).unwrap_or_else(|e| panic!("{sep:?}: {e:?}"));
-            let len = match &e.kind {
+            let len = match &*e.kind {
                 ExprKind::Add(v) => v.len(),
                 ExprKind::Mul(v) => v.len(),
                 ExprKind::And(v) | ExprKind::Or(v) => v.len(),
@@ -1314,8 +1324,8 @@ fn mk(kind: ExprKind) -> Expr {
     Expr::new(kind, Span::default())
 }
 
-fn bx(kind: ExprKind) -> Box<Expr> {
-    Box::new(mk(kind))
+fn bx(kind: ExprKind) -> Expr {
+    mk(kind)
 }
 
 fn gen_leaf(r: &mut Rng) -> ExprKind {
@@ -1337,7 +1347,7 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
         return gen_leaf(r);
     }
     let d = depth - 1;
-    let sub = |r: &mut Rng| Box::new(mk(gen_expr(r, d)));
+    let sub = |r: &mut Rng| mk(gen_expr(r, d));
     match r.below(22) {
         0 | 1 => gen_leaf(r),
         2 => ExprKind::Unary {
@@ -1357,7 +1367,7 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
                     } else {
                         AddOp::Add
                     },
-                    expr: *sub(r),
+                    expr: sub(r),
                 })
                 .collect(),
         ),
@@ -1369,12 +1379,12 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
                     } else {
                         MulOp::Mul
                     },
-                    expr: *sub(r),
+                    expr: sub(r),
                 })
                 .collect(),
         ),
         6 => {
-            let items = (0..2 + r.below(2)).map(|_| *sub(r)).collect();
+            let items = (0..2 + r.below(2)).map(|_| sub(r)).collect();
             if r.below(2) == 0 {
                 ExprKind::And(items)
             } else {
@@ -1401,14 +1411,12 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
             ];
             ExprKind::Compare {
                 first: sub(r),
-                rest: (0..n)
-                    .map(|_| (ops[r.below(6) as usize], *sub(r)))
-                    .collect(),
+                rest: (0..n).map(|_| (ops[r.below(6) as usize], sub(r))).collect(),
             }
         }
         9 => ExprKind::Call {
             callee: bx(ExprKind::Ident(r.pick(&["f", "g", "sin", "max"]).into())),
-            args: (0..r.below(3)).map(|_| *sub(r)).collect(),
+            args: (0..r.below(3)).map(|_| sub(r)).collect(),
         },
         10 => ExprKind::Member {
             expr: sub(r),
@@ -1416,9 +1424,9 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
         },
         11 => ExprKind::Index {
             expr: sub(r),
-            indices: (0..1 + r.below(2)).map(|_| *sub(r)).collect(),
+            indices: (0..1 + r.below(2)).map(|_| sub(r)).collect(),
         },
-        12 => ExprKind::List((0..r.below(3)).map(|_| *sub(r)).collect()),
+        12 => ExprKind::List((0..r.below(3)).map(|_| sub(r)).collect()),
         13 => ExprKind::Range {
             start: sub(r),
             second: if r.below(2) == 0 { Some(sub(r)) } else { None },
@@ -1428,16 +1436,16 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
             body: sub(r),
             bindings: vec![Binding {
                 name: "k".into(),
-                iter: *sub(r),
+                iter: sub(r),
                 span: Span::default(),
             }],
         },
-        15 => ExprKind::Tuple(vec![*sub(r), *sub(r)]),
+        15 => ExprKind::Tuple(vec![sub(r), sub(r)]),
         16 => {
             if r.below(3) == 0 {
                 ExprKind::Piecewise {
                     branches: vec![Branch {
-                        cond: *sub(r),
+                        cond: sub(r),
                         value: None,
                     }],
                     otherwise: None,
@@ -1445,16 +1453,16 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
             } else {
                 ExprKind::Piecewise {
                     branches: vec![Branch {
-                        cond: *sub(r),
-                        value: Some(*sub(r)),
+                        cond: sub(r),
+                        value: Some(sub(r)),
                     }],
                     otherwise: if r.below(2) == 0 { Some(sub(r)) } else { None },
                 }
             }
         }
         17 => ExprKind::Restrict {
-            expr: Box::new(mk(gen_no_restrict(r, d))),
-            conds: vec![*sub(r)],
+            expr: mk(gen_no_restrict(r, d)),
+            conds: vec![sub(r)],
         },
         18 => ExprKind::Derivative {
             var: r.pick(&["x", "θ", "t_1"]).into(),
@@ -1503,9 +1511,9 @@ fn parser_producible(e: &Expr) -> bool {
     visit(e, &mut |e| {
         // A differential-looking name inside an integrand is ambiguous
         // (`∫ x dt dt`); the parser treats it as the end of the integrand.
-        if let ExprKind::Integral { body, .. } = &e.kind {
+        if let ExprKind::Integral { body, .. } = &*e.kind {
             visit(body, &mut |b| {
-                if matches!(&b.kind, ExprKind::Ident(n) if parser::differential_var(n).is_some()) {
+                if matches!(&*b.kind, ExprKind::Ident(n) if parser::differential_var(n).is_some()) {
                     ok = false;
                 }
             });
@@ -1517,7 +1525,7 @@ fn parser_producible(e: &Expr) -> bool {
 fn visit(e: &Expr, f: &mut impl FnMut(&Expr)) {
     f(e);
     let mut go = |c: &Expr| visit(c, f);
-    match &e.kind {
+    match &*e.kind {
         ExprKind::Number { .. } | ExprKind::Str(_) | ExprKind::Ident(_) => {}
         ExprKind::Prime { expr, .. }
         | ExprKind::Unary { expr, .. }

@@ -13,12 +13,9 @@ type PResult<X> = Result<X, ParseError>;
 /// maximum length of non-flattened left-assoc chains (`mod`, `to`).
 /// Together with flat n-ary sums/products this bounds the depth of every
 /// tree the parser builds, so printing and dropping stay shallow too.
-pub const MAX_DEPTH: usize = 256;
-
-/// Nesting levels parsed per stack segment (see `Parser::nested`).
-const STACK_SEGMENT_LEVELS: usize = 16;
-/// Stack size of each extra segment thread (~16 levels × 25 KiB in debug).
-const STACK_SEGMENT_BYTES: usize = 8 << 20;
+/// Chosen so that the deepest accepted input parses, prints and drops
+/// comfortably on a 2 MiB thread stack even in unoptimised builds.
+pub const MAX_DEPTH: usize = 64;
 
 /// Functions that may be applied without parentheses (`sin x`, `ln 2x`).
 /// Identifiers starting with `log_` (`log_2 x`) are included as well.
@@ -263,50 +260,31 @@ impl Parser {
         r
     }
 
-    /// Run `f` one nesting level deeper, failing past [`MAX_DEPTH`].
-    ///
-    /// Every [`STACK_SEGMENT_LEVELS`] levels the parse continues on a fresh
-    /// thread stack (a std-only equivalent of `stacker`), so the caller's
-    /// stack only ever holds a bounded number of recursive frames — even in
-    /// unoptimised builds, where one bracket level costs ~25 KiB.
-    fn nested<R: Send>(&mut self, f: impl FnOnce(&mut Self) -> PResult<R> + Send) -> PResult<R> {
+    /// Go one nesting level deeper, failing past [`MAX_DEPTH`]. The caller
+    /// decrements `depth` when done.
+    fn enter(&mut self) -> PResult<()> {
         if self.depth >= MAX_DEPTH {
-            return Err(ParseError::new(
-                self.peek_span(),
-                format!("expression nested too deeply (limit {MAX_DEPTH})"),
-            ));
+            return Err(self.too_deep());
         }
         self.depth += 1;
-        let r = if self.depth.is_multiple_of(STACK_SEGMENT_LEVELS) {
-            self.on_fresh_stack(f)
-        } else {
-            f(self)
-        };
-        self.depth -= 1;
-        r
+        Ok(())
     }
 
     #[cold]
-    fn on_fresh_stack<R: Send>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> PResult<R> + Send,
-    ) -> PResult<R> {
-        let span = self.peek_span();
-        std::thread::scope(|scope| {
-            let spawned = std::thread::Builder::new()
-                .name("viscas-parse".into())
-                .stack_size(STACK_SEGMENT_BYTES)
-                .spawn_scoped(scope, || f(self));
-            match spawned {
-                Ok(handle) => handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                Err(_) => Err(ParseError::new(
-                    span,
-                    "expression nested too deeply (out of stack space)",
-                )),
-            }
-        })
+    #[inline(never)]
+    fn too_deep(&self) -> ParseError {
+        ParseError::new(
+            self.peek_span(),
+            format!("expression nested too deeply (limit {MAX_DEPTH})"),
+        )
+    }
+
+    /// Run `f` one nesting level deeper, failing past [`MAX_DEPTH`].
+    fn nested<R>(&mut self, f: impl FnOnce(&mut Self) -> PResult<R>) -> PResult<R> {
+        self.enter()?;
+        let r = f(self);
+        self.depth -= 1;
+        r
     }
 
     fn node(&self, kind: ExprKind, start: usize) -> Expr {
@@ -577,24 +555,23 @@ impl Parser {
     // ------------------------------------------------------------------
 
     pub(crate) fn parse_expr(&mut self) -> PResult<Expr> {
-        self.nested(|p| {
-            let e = p.parse_to()?;
-            if !(p.ctx.allow_restrict && p.at(&T::LBrace)) {
-                return Ok(e);
-            }
-            let mut conds = Vec::new();
-            while p.at(&T::LBrace) {
-                p.parse_brace_conds(&mut conds)?;
-            }
-            let start = e.span.start;
-            Ok(p.node(
-                ExprKind::Restrict {
-                    expr: Box::new(e),
-                    conds,
-                },
-                start,
-            ))
-        })
+        self.enter()?;
+        let r = self.parse_to();
+        self.depth -= 1;
+        match r {
+            Ok(e) if self.ctx.allow_restrict && self.at(&T::LBrace) => self.parse_restrict(e),
+            r => r,
+        }
+    }
+
+    #[inline(never)]
+    fn parse_restrict(&mut self, e: Expr) -> PResult<Expr> {
+        let mut conds = Vec::new();
+        while self.at(&T::LBrace) {
+            self.parse_brace_conds(&mut conds)?;
+        }
+        let start = e.span.start;
+        Ok(self.node(ExprKind::Restrict { expr: e, conds }, start))
     }
 
     fn chain_too_long(&self, op: &str) -> ParseError {
@@ -620,47 +597,53 @@ impl Parser {
         Ok(lhs)
     }
 
-    /// `next (kw next)*` collected into a flat list.
-    fn parse_nary(
-        &mut self,
-        kw: Keyword,
-        next: fn(&mut Self) -> PResult<Expr>,
-        make: fn(Vec<Expr>) -> ExprKind,
-    ) -> PResult<Expr> {
-        let first = next(self)?;
-        if !self.at(&T::Keyword(kw)) {
+    fn parse_or(&mut self) -> PResult<Expr> {
+        let first = self.parse_and()?;
+        if !self.at(&T::Keyword(Keyword::Or)) {
             return Ok(first);
         }
         let start = first.span.start;
         let mut items = vec![first];
-        while self.eat(&T::Keyword(kw)) {
+        while self.eat(&T::Keyword(Keyword::Or)) {
             self.skip_newlines();
-            items.push(next(self)?);
+            items.push(self.parse_and()?);
         }
-        Ok(self.node(make(items), start))
-    }
-
-    fn parse_or(&mut self) -> PResult<Expr> {
-        self.parse_nary(Keyword::Or, Self::parse_and, ExprKind::Or)
+        Ok(self.node(ExprKind::Or(items), start))
     }
 
     fn parse_and(&mut self) -> PResult<Expr> {
-        self.parse_nary(Keyword::And, Self::parse_not, ExprKind::And)
+        let first = self.parse_not()?;
+        if !self.at(&T::Keyword(Keyword::And)) {
+            return Ok(first);
+        }
+        let start = first.span.start;
+        let mut items = vec![first];
+        while self.eat(&T::Keyword(Keyword::And)) {
+            self.skip_newlines();
+            items.push(self.parse_not()?);
+        }
+        Ok(self.node(ExprKind::And(items), start))
     }
 
     fn parse_not(&mut self) -> PResult<Expr> {
         if self.at(&T::Keyword(Keyword::Not)) {
-            let start = self.bump().span.start;
-            let e = self.nested(|p| p.parse_not())?;
-            return Ok(self.node(
-                ExprKind::Unary {
-                    op: UnaryOp::Not,
-                    expr: Box::new(e),
-                },
-                start,
-            ));
+            return self.parse_prefix_op(UnaryOp::Not, Self::parse_not);
         }
         self.parse_compare()
+    }
+
+    /// `op operand`, one nesting level deeper.
+    #[inline(never)]
+    fn parse_prefix_op(
+        &mut self,
+        op: UnaryOp,
+        operand: fn(&mut Self) -> PResult<Expr>,
+    ) -> PResult<Expr> {
+        let start = self.bump().span.start;
+        self.enter()?;
+        let r = operand(self);
+        self.depth -= 1;
+        Ok(self.node(ExprKind::Unary { op, expr: r? }, start))
     }
 
     fn parse_compare(&mut self) -> PResult<Expr> {
@@ -685,13 +668,7 @@ impl Parser {
             return Ok(first);
         }
         let start = first.span.start;
-        Ok(self.node(
-            ExprKind::Compare {
-                first: Box::new(first),
-                rest,
-            },
-            start,
-        ))
+        Ok(self.node(ExprKind::Compare { first, rest }, start))
     }
 
     fn parse_additive(&mut self) -> PResult<Expr> {
@@ -828,20 +805,11 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
-        let op = match self.peek() {
-            T::Minus => UnaryOp::Neg,
-            T::Plus => UnaryOp::Pos,
-            _ => return self.parse_power(),
-        };
-        let start = self.bump().span.start;
-        let e = self.nested(|p| p.parse_unary())?;
-        Ok(self.node(
-            ExprKind::Unary {
-                op,
-                expr: Box::new(e),
-            },
-            start,
-        ))
+        match self.peek() {
+            T::Minus => self.parse_prefix_op(UnaryOp::Neg, Self::parse_unary),
+            T::Plus => self.parse_prefix_op(UnaryOp::Pos, Self::parse_unary),
+            _ => self.parse_power(),
+        }
     }
 
     fn parse_power(&mut self) -> PResult<Expr> {
@@ -856,23 +824,17 @@ impl Parser {
 
     /// Right operand of `^`: allows a leading sign (`2^-3`), right-assoc.
     fn parse_exponent(&mut self) -> PResult<Expr> {
-        self.nested(|p| {
-            let op = match p.peek() {
-                T::Minus => UnaryOp::Neg,
-                T::Plus => UnaryOp::Pos,
-                T::LBrace => return Err(p.brace_group_error()),
-                _ => return p.parse_power(),
-            };
-            let start = p.bump().span.start;
-            let e = p.parse_exponent()?;
-            Ok(p.node(
-                ExprKind::Unary {
-                    op,
-                    expr: Box::new(e),
-                },
-                start,
-            ))
-        })
+        match self.peek() {
+            T::Minus => self.parse_prefix_op(UnaryOp::Neg, Self::parse_exponent),
+            T::Plus => self.parse_prefix_op(UnaryOp::Pos, Self::parse_exponent),
+            T::LBrace => Err(self.brace_group_error()),
+            _ => {
+                self.enter()?;
+                let r = self.parse_power();
+                self.depth -= 1;
+                r
+            }
+        }
     }
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
@@ -882,43 +844,25 @@ impl Parser {
             match self.peek() {
                 T::LParen if is_callable(&e) && !matches!(self.prev_kind(), Some(T::RParen)) => {
                     let args = self.parse_call_args()?;
-                    e = self.node(
-                        ExprKind::Call {
-                            callee: Box::new(e),
-                            args,
-                        },
-                        start,
-                    );
+                    e = self.node(ExprKind::Call { callee: e, args }, start);
                 }
                 T::LBracket if !matches!(self.prev_kind(), Some(T::Number { .. })) => {
                     let open = self.bump();
                     let inner = self
                         .with_ctx(GROUP_CTX, |p| p.nested(|p| p.parse_bracket_body(open.span)))?;
-                    let indices = match inner.kind {
+                    let indices = match *inner.kind {
                         ExprKind::List(items) if items.is_empty() => {
                             return Err(ParseError::new(inner.span, "empty index `[]`"));
                         }
                         ExprKind::List(items) => items,
                         kind => vec![Expr::new(kind, inner.span)],
                     };
-                    e = self.node(
-                        ExprKind::Index {
-                            expr: Box::new(e),
-                            indices,
-                        },
-                        start,
-                    );
+                    e = self.node(ExprKind::Index { expr: e, indices }, start);
                 }
                 T::Dot => {
                     self.bump();
                     let (name, _) = self.expect_ident()?;
-                    e = self.node(
-                        ExprKind::Member {
-                            expr: Box::new(e),
-                            name,
-                        },
-                        start,
-                    );
+                    e = self.node(ExprKind::Member { expr: e, name }, start);
                 }
                 T::Bang | T::Percent => {
                     let op = if self.bump().kind == T::Bang {
@@ -926,17 +870,11 @@ impl Parser {
                     } else {
                         PostfixOp::Percent
                     };
-                    e = self.node(
-                        ExprKind::Postfix {
-                            op,
-                            expr: Box::new(e),
-                        },
-                        start,
-                    );
+                    e = self.node(ExprKind::Postfix { op, expr: e }, start);
                 }
                 T::Prime => {
                     self.bump();
-                    e = match e.kind {
+                    e = match *e.kind {
                         ExprKind::Prime { expr, order } => self.node(
                             ExprKind::Prime {
                                 expr,
@@ -946,7 +884,7 @@ impl Parser {
                         ),
                         kind => self.node(
                             ExprKind::Prime {
-                                expr: Box::new(Expr::new(kind, e.span)),
+                                expr: Expr::new(kind, e.span),
                                 order: 1,
                             },
                             start,
@@ -1003,7 +941,7 @@ impl Parser {
             self.expect(T::RBracket)?;
             return Ok(self.node(
                 ExprKind::Comprehension {
-                    body: Box::new(first),
+                    body: first,
                     bindings,
                 },
                 start,
@@ -1028,9 +966,9 @@ impl Parser {
                 let second = it.next();
                 return Ok(self.node(
                     ExprKind::Range {
-                        start: Box::new(start_e),
-                        second: second.map(Box::new),
-                        end: Box::new(end),
+                        start: start_e,
+                        second,
+                        end,
                     },
                     start,
                 ));
@@ -1102,7 +1040,7 @@ impl Parser {
                 let callee = Expr::new(ExprKind::Ident("abs".into()), tok.span);
                 Ok(self.node(
                     ExprKind::Call {
-                        callee: Box::new(callee),
+                        callee,
                         args: vec![inner],
                     },
                     start,
@@ -1115,7 +1053,7 @@ impl Parser {
                 let callee = Expr::new(ExprKind::Ident(name.into()), tok.span);
                 Ok(self.node(
                     ExprKind::Call {
-                        callee: Box::new(callee),
+                        callee,
                         args: vec![arg],
                     },
                     start,
@@ -1154,7 +1092,7 @@ impl Parser {
                 ExprKind::Derivative {
                     var,
                     order,
-                    expr: Box::new(body),
+                    expr: body,
                 },
                 start,
             ));
@@ -1187,12 +1125,12 @@ impl Parser {
         if self.at(&T::Caret) {
             self.bump();
             let exp = self.parse_exponent()?;
-            let callee_name = match &exp.kind {
+            let callee_name = match &*exp.kind {
                 ExprKind::Unary {
                     op: UnaryOp::Neg,
                     expr,
                 } if TRIG.contains(&name.as_str())
-                    && matches!(&expr.kind, ExprKind::Number { text, imaginary: false } if text == "1") =>
+                    && matches!(&*expr.kind, ExprKind::Number { text, imaginary: false } if text == "1") =>
                 {
                     Some(format!("arc{name}"))
                 }
@@ -1209,18 +1147,12 @@ impl Parser {
                 (None, _) => binary(BinOp::Pow, ident, exp),
                 (Some(args), Some(arc)) => {
                     let callee = Expr::new(ExprKind::Ident(arc), span);
-                    self.node(
-                        ExprKind::Call {
-                            callee: Box::new(callee),
-                            args,
-                        },
-                        start,
-                    )
+                    self.node(ExprKind::Call { callee, args }, start)
                 }
                 (Some(args), None) => {
                     let call = self.node(
                         ExprKind::Call {
-                            callee: Box::new(ident),
+                            callee: ident,
                             args,
                         },
                         start,
@@ -1236,7 +1168,7 @@ impl Parser {
             let arg = self.parse_fn_arg()?;
             return Ok(self.node(
                 ExprKind::Call {
-                    callee: Box::new(ident),
+                    callee: ident,
                     args: vec![arg],
                 },
                 start,
@@ -1321,7 +1253,7 @@ impl Parser {
                 p.expect(T::Comma)?;
                 let hi = p.parse_expr()?;
                 p.expect(T::RParen)?;
-                Ok((Box::new(lo), Box::new(hi)))
+                Ok((lo, hi))
             })?)
         } else {
             None
@@ -1341,14 +1273,7 @@ impl Parser {
                 return Err(self.unexpected("differential (e.g. `dx`) closing the integral"));
             }
         };
-        Ok(self.node(
-            ExprKind::Integral {
-                bounds,
-                body: Box::new(body),
-                var,
-            },
-            start,
-        ))
+        Ok(self.node(ExprKind::Integral { bounds, body, var }, start))
     }
 
     fn parse_bigop(&mut self, op: BigOpKind) -> PResult<Expr> {
@@ -1368,9 +1293,9 @@ impl Parser {
             ExprKind::BigOp {
                 op,
                 var,
-                from: Box::new(from),
-                to: Box::new(to),
-                body: Box::new(body),
+                from,
+                to,
+                body,
             },
             start,
         ))
@@ -1398,7 +1323,7 @@ impl Parser {
                     if branches.is_empty() {
                         branches.push(Branch { cond, value: None });
                     } else {
-                        otherwise = Some(Box::new(cond));
+                        otherwise = Some(cond);
                     }
                     break;
                 } else {
@@ -1422,14 +1347,7 @@ impl Parser {
 
 fn binary(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
     let span = lhs.span.to(rhs.span);
-    Expr::new(
-        ExprKind::Binary {
-            op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        },
-        span,
-    )
+    Expr::new(ExprKind::Binary { op, lhs, rhs }, span)
 }
 
 fn collapse_add(mut terms: Vec<Term>) -> Expr {
@@ -1453,7 +1371,7 @@ fn collapse_mul(mut factors: Vec<Factor>) -> Expr {
 
 fn is_callable(e: &Expr) -> bool {
     matches!(
-        e.kind,
+        *e.kind,
         ExprKind::Ident(_) | ExprKind::Prime { .. } | ExprKind::Member { .. }
     )
 }

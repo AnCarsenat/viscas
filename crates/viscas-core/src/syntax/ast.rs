@@ -18,7 +18,9 @@ use super::token::Span;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Expr {
-    pub kind: ExprKind,
+    /// Boxed so `Expr` stays small (24 bytes): keeps parser stack frames
+    /// and `Result<Expr, _>` temporaries compact.
+    pub kind: Box<ExprKind>,
     pub span: Span,
 }
 
@@ -132,17 +134,17 @@ pub enum ExprKind {
     Ident(String),
     /// `f'`, `f''` — `order` primes applied to `expr`.
     Prime {
-        expr: Box<Expr>,
+        expr: Expr,
         order: u32,
     },
     Unary {
         op: UnaryOp,
-        expr: Box<Expr>,
+        expr: Expr,
     },
     Binary {
         op: BinOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
+        lhs: Expr,
+        rhs: Expr,
     },
     /// `t0 ± t1 ± ...` — at least two terms; the first has [`AddOp::Add`].
     /// A parenthesised sum inside a sum stays a nested node.
@@ -156,11 +158,11 @@ pub enum ExprKind {
     Or(Vec<Expr>),
     Postfix {
         op: PostfixOp,
-        expr: Box<Expr>,
+        expr: Expr,
     },
     /// Comparison chain `first op1 e1 op2 e2 ...` (`0 < x < 2`).
     Compare {
-        first: Box<Expr>,
+        first: Expr,
         rest: Vec<(CmpOp, Expr)>,
     },
     /// `callee(args)`; also produced for paren-less application `sin x`,
@@ -168,32 +170,32 @@ pub enum ExprKind {
     /// later pass may reinterpret it as multiplication when `x` is not a
     /// function.
     Call {
-        callee: Box<Expr>,
+        callee: Expr,
         args: Vec<Expr>,
     },
     /// `expr.name`
     Member {
-        expr: Box<Expr>,
+        expr: Expr,
         name: String,
     },
     /// `expr[i1, i2, ...]` (at least one index). `L[2]` has one index,
     /// `L[1, 3]` two, `L[[1, 3]]` one (a list). Ranges `L[2..4]` and
     /// filters `L[L > 3]` are single indices.
     Index {
-        expr: Box<Expr>,
+        expr: Expr,
         indices: Vec<Expr>,
     },
     /// `[a, b, c]`; matrices are lists of lists.
     List(Vec<Expr>),
     /// `[start..end]` or `[start, second..end]`.
     Range {
-        start: Box<Expr>,
-        second: Option<Box<Expr>>,
-        end: Box<Expr>,
+        start: Expr,
+        second: Option<Expr>,
+        end: Expr,
     },
     /// `[body for k = iter, j = iter2]`
     Comprehension {
-        body: Box<Expr>,
+        body: Expr,
         bindings: Vec<Binding>,
     },
     /// `(a, b, ...)` with at least two elements.
@@ -201,33 +203,33 @@ pub enum ExprKind {
     /// `{c1: v1, c2: v2, otherwise}`
     Piecewise {
         branches: Vec<Branch>,
-        otherwise: Option<Box<Expr>>,
+        otherwise: Option<Expr>,
     },
     /// `expr {cond, ...}` nested inside brackets/parentheses. Restrictions
     /// at the end of a statement are stored on the statement instead.
     Restrict {
-        expr: Box<Expr>,
+        expr: Expr,
         conds: Vec<Expr>,
     },
     /// `d/dx expr`, `d^2/dx^2 expr`
     Derivative {
         var: String,
         order: u32,
-        expr: Box<Expr>,
+        expr: Expr,
     },
     /// `∫(lo, hi) body dx` or indefinite `∫ body dx`.
     Integral {
-        bounds: Option<(Box<Expr>, Box<Expr>)>,
-        body: Box<Expr>,
+        bounds: Option<(Expr, Expr)>,
+        body: Expr,
         var: String,
     },
     /// `∑(k = from, to) body` / `∏(...)`.
     BigOp {
         op: BigOpKind,
         var: String,
-        from: Box<Expr>,
-        to: Box<Expr>,
-        body: Box<Expr>,
+        from: Expr,
+        to: Expr,
+        body: Expr,
     },
 }
 
@@ -317,7 +319,10 @@ pub struct Program {
 
 impl Expr {
     pub fn new(kind: ExprKind, span: Span) -> Self {
-        Expr { kind, span }
+        Expr {
+            kind: Box::new(kind),
+            span,
+        }
     }
 
     /// A copy with every span reset to the default, for structural comparison.
@@ -329,7 +334,7 @@ impl Expr {
 
     pub fn clear_spans(&mut self) {
         self.span = Span::default();
-        match &mut self.kind {
+        match &mut *self.kind {
             ExprKind::Number { .. } | ExprKind::Str(_) | ExprKind::Ident(_) => {}
             ExprKind::Prime { expr, .. }
             | ExprKind::Unary { expr, .. }
@@ -509,7 +514,7 @@ mod prec {
 }
 
 fn precedence(e: &Expr) -> u8 {
-    match &e.kind {
+    match &*e.kind {
         ExprKind::Restrict { .. } => prec::RESTRICT,
         ExprKind::Binary { op, .. } => match op {
             BinOp::To => prec::TO,
@@ -547,7 +552,10 @@ fn precedence(e: &Expr) -> u8 {
 /// Greedy prefix operators swallow everything up to the next `+`/`-`, so
 /// they need parentheses when something multiplicative follows them.
 fn is_greedy(e: &Expr) -> bool {
-    matches!(e.kind, ExprKind::Derivative { .. } | ExprKind::BigOp { .. })
+    matches!(
+        *e.kind,
+        ExprKind::Derivative { .. } | ExprKind::BigOp { .. }
+    )
 }
 
 fn child(f: &mut fmt::Formatter<'_>, e: &Expr, min: u8) -> fmt::Result {
@@ -560,7 +568,7 @@ fn child(f: &mut fmt::Formatter<'_>, e: &Expr, min: u8) -> fmt::Result {
 
 /// Left operand of a multiplicative operator (`*`, `/`, `mod`).
 fn mul_lhs(f: &mut fmt::Formatter<'_>, e: &Expr, allow_mul: bool) -> fmt::Result {
-    let nested_mul = !allow_mul && matches!(e.kind, ExprKind::Mul(_));
+    let nested_mul = !allow_mul && matches!(*e.kind, ExprKind::Mul(_));
     if precedence(e) < prec::MUL || is_greedy(e) || nested_mul {
         write!(f, "({e})")
     } else {
@@ -604,7 +612,7 @@ fn write_str_literal(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
 
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
+        match &*self.kind {
             ExprKind::Number { text, imaginary } => {
                 f.write_str(text)?;
                 if *imaginary {
@@ -663,7 +671,7 @@ impl fmt::Display for Expr {
                             // Not produced by the parser; keep it re-parseable.
                             f.write_char('-')?;
                             child(f, &t.expr, prec::UNARY)?;
-                        } else if matches!(t.expr.kind, ExprKind::Add(_)) {
+                        } else if matches!(*t.expr.kind, ExprKind::Add(_)) {
                             write!(f, "({})", t.expr)?;
                         } else {
                             child(f, &t.expr, prec::ADD)?;
@@ -703,7 +711,7 @@ impl fmt::Display for Expr {
                 Ok(())
             }
             ExprKind::And(items) | ExprKind::Or(items) => {
-                let (sep, p) = if matches!(self.kind, ExprKind::And(_)) {
+                let (sep, p) = if matches!(*self.kind, ExprKind::And(_)) {
                     (" and ", prec::AND)
                 } else {
                     (" or ", prec::OR)
@@ -732,7 +740,7 @@ impl fmt::Display for Expr {
                 Ok(())
             }
             ExprKind::Call { callee, args } => {
-                match &callee.kind {
+                match &*callee.kind {
                     ExprKind::Ident(name) => f.write_str(name)?,
                     _ => child(f, callee, prec::POSTFIX)?,
                 }
@@ -745,19 +753,19 @@ impl fmt::Display for Expr {
                 write!(f, ".{name}")
             }
             ExprKind::Index { expr, indices } => {
-                if matches!(expr.kind, ExprKind::Number { .. }) {
+                if matches!(*expr.kind, ExprKind::Number { .. }) {
                     write!(f, "({expr})")?;
                 } else {
                     child(f, expr, prec::POSTFIX)?;
                 }
                 f.write_char('[')?;
                 match indices.as_slice() {
-                    [
-                        single @ Expr {
-                            kind: ExprKind::Range { .. } | ExprKind::Comprehension { .. },
-                            ..
-                        },
-                    ] => {
+                    [single]
+                        if matches!(
+                            *single.kind,
+                            ExprKind::Range { .. } | ExprKind::Comprehension { .. }
+                        ) =>
+                    {
                         let s = single.to_string();
                         f.write_str(&s[1..s.len() - 1])?;
                     }
