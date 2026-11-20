@@ -11,7 +11,7 @@ See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the full spec and roadmap.
 
 ## Build
 
-Requires Rust (stable), GTK ≥ 4.14 and libadwaita ≥ 1.5 development packages.
+Requires Rust (stable) and GTK ≥ 4.14 development packages.
 
 ```sh
 cargo run -p viscas-app
@@ -26,7 +26,7 @@ cargo test --workspace
 | `viscas-scene` | node tree, dependency graph |
 | `viscas-plot` | plot sampling, view transforms |
 | `viscas-script` | Viscas script + Rhai bindings |
-| `viscas-app` | GTK4/libadwaita UI |
+| `viscas-app` | GTK4 UI: area/editor shell, own theme |
 
 ## License
 

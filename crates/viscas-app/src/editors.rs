@@ -126,7 +126,7 @@ fn header_menus(kind: EditorKind) -> &'static [(&'static str, &'static [&'static
         EditorKind::Console => &[("Session", &["Clear", "Copy Result", "Pin as Node"])],
         EditorKind::Expressions => &[("Edit", &["New Expression", "Sort"])],
         EditorKind::Sheet => &[("Table", &["Add Column", "Import CSV", "Export CSV"])],
-        EditorKind::Script => &[("Script", &["Run", "Stop"])],
+        EditorKind::Script => &[("Run", &["Run Script", "Stop"])],
         EditorKind::DependencyGraph => {
             &[("View", &["Frame All", "Show Upstream", "Show Downstream"])]
         }
