@@ -3,8 +3,9 @@
 **VISual CAS** — a graphing calculator and computer algebra system for the desktop,
 written in Rust with GTK4.
 
-Desmos-level graphing, a real CAS, a `qalc`-style console, spreadsheets and
-scripting, in a clean keyboard-first UI where everything in a document is a node.
+Graphing, a real CAS, a console, spreadsheets and scripting in a pro-tool UI
+inspired by Blender and Godot: a scene tree of nodes, an inspector, splittable
+editor areas and a command palette.
 
 See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the full spec and roadmap.
 
