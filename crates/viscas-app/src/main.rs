@@ -1,21 +1,22 @@
-//! Viscas desktop application (GTK4 + libadwaita shell).
+//! Viscas desktop application (plain GTK4 shell with its own theme).
 
 extern crate gtk4 as gtk;
 
 mod app;
-#[allow(dead_code, reason = "wired into the window in the next commit")]
+mod areas;
+mod commands;
+mod editors;
 mod fuzzy;
-#[allow(dead_code, reason = "wired into the window in the next commit")]
 mod layout;
-mod panels;
+mod palette;
 mod shortcuts;
+mod theme;
 mod viewport;
 mod window;
-#[allow(dead_code, reason = "wired into the window in the next commit")]
 mod workspace;
 
-use adw::prelude::*;
 use gtk::glib;
+use gtk::prelude::*;
 
 fn main() -> glib::ExitCode {
     app::build().run()

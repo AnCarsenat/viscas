@@ -1,12 +1,12 @@
 //! The single table of keyboard accelerators, and the code applying it.
 
-use adw::prelude::*;
+use gtk::prelude::*;
 
-use crate::panels::Panel;
+use crate::workspace::Workspace;
 
 /// One accelerator binding.
 pub struct Shortcut {
-    /// Detailed action name, e.g. `win.panel::console`.
+    /// Detailed action name, e.g. `win.workspace::graph`.
     pub action: String,
     /// Accelerator in `gtk::accelerator_parse` syntax.
     pub accel: &'static str,
@@ -16,17 +16,21 @@ pub struct Shortcut {
 
 /// Every accelerator in the app, in display order.
 pub fn all() -> Vec<Shortcut> {
-    const PANEL_ACCELS: [&str; 5] = [
-        "<Control>1",
-        "<Control>2",
-        "<Control>3",
-        "<Control>4",
-        "<Control>5",
+    const WORKSPACE_ACCELS: [&str; 4] = [
+        "<Control><Alt>1",
+        "<Control><Alt>2",
+        "<Control><Alt>3",
+        "<Control><Alt>4",
     ];
     let fixed = [
+        ("win.palette", "<Control>k", "Command palette"),
+        (
+            "win.maximize-area",
+            "<Control>space",
+            "Maximize / restore area",
+        ),
         ("app.quit", "<Control>q", "Quit"),
         ("app.shortcuts", "<Control>question", "Keyboard shortcuts"),
-        ("win.toggle-sidebar", "F9", "Toggle sidebar"),
         ("win.undo", "<Control>z", "Undo"),
         ("win.redo", "<Control><Shift>z", "Redo"),
     ];
@@ -39,38 +43,48 @@ pub fn all() -> Vec<Shortcut> {
         })
         .collect();
     list.extend(
-        Panel::ALL
+        Workspace::ALL
             .iter()
-            .zip(PANEL_ACCELS)
-            .map(|(panel, accel)| Shortcut {
-                action: format!("win.panel::{}", panel.id()),
+            .zip(WORKSPACE_ACCELS)
+            .map(|(ws, accel)| Shortcut {
+                action: format!("win.workspace::{}", ws.id()),
                 accel,
-                title: format!("Show {} panel", panel.title()),
+                title: format!("{} workspace", ws.title()),
             }),
     );
     list
 }
 
 /// Registers every accelerator of [`all`] on the application.
-pub fn install(app: &adw::Application) {
+pub fn install(app: &gtk::Application) {
     for shortcut in all() {
         app.set_accels_for_action(&shortcut.action, &[shortcut.accel]);
     }
+}
+
+/// Human-readable label of an accelerator, e.g. `Ctrl+K`.
+fn label(accel: &str) -> String {
+    gtk::accelerator_parse(accel)
+        .map(|(key, mods)| gtk::accelerator_get_label(key, mods).to_string())
+        .unwrap_or_else(|| accel.to_owned())
+}
+
+/// Accelerator label of the detailed action `action`, if it has one.
+pub fn label_for(action: &str) -> Option<String> {
+    all()
+        .into_iter()
+        .find(|s| s.action == action)
+        .map(|s| label(s.accel))
 }
 
 /// Plain-text overview of the shortcuts, one per line.
 pub fn overview() -> String {
     let mut lines: Vec<String> = all()
         .iter()
-        .map(|s| {
-            let label = gtk::accelerator_parse(s.accel)
-                .map(|(key, mods)| gtk::accelerator_get_label(key, mods).to_string())
-                .unwrap_or_else(|| s.accel.to_owned());
-            format!("{label}\t{}", s.title)
-        })
+        .map(|s| format!("{:<18}{}", label(s.accel), s.title))
         .collect();
-    lines.push("Scroll\tZoom graph at cursor".to_owned());
-    lines.push("Drag\tPan graph".to_owned());
+    lines.push(format!("{:<18}Zoom graph at cursor", "Scroll"));
+    lines.push(format!("{:<18}Pan graph", "Drag"));
     lines.join("\n")
 }
 
