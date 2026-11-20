@@ -125,6 +125,8 @@ pub enum TokenKind {
     Gt,
     Ge,
     Tilde,
+    /// `|` (absolute value bars)
+    Bar,
     /// `->` or `→`
     Arrow,
     /// `√`
@@ -177,6 +179,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Gt => "`>`",
             TokenKind::Ge => "`>=`",
             TokenKind::Tilde => "`~`",
+            TokenKind::Bar => "`|`",
             TokenKind::Arrow => "`->`",
             TokenKind::Sqrt => "`√`",
             TokenKind::Cbrt => "`∛`",

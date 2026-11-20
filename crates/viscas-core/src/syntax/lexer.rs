@@ -16,6 +16,8 @@
 //!   Greek letter (`dθ`) is one identifier so differentials work.
 //! - Unicode operator aliases: `· × ⋅` → `*`, `÷` → `/`, `−` → `-`,
 //!   `≤ ≥ ≠`, `→` → `->`, `′` → `'`, `**` → `^`, `...` → `..`.
+//! - A string literal never spans lines: an unterminated string ends at the
+//!   newline, which is kept as a separate token so the next line still parses.
 
 use super::ParseError;
 use super::token::{Keyword, Span, Token, TokenKind};
@@ -230,23 +232,37 @@ impl Lexer<'_> {
         self.bump();
         let mut value = String::new();
         loop {
-            match self.bump() {
+            match self.peek() {
+                // Leave the newline for the next statement.
                 None | Some('\n') => {
                     self.error(start, "unterminated string literal");
                     break;
                 }
-                Some('"') => break,
-                Some('\\') => match self.bump() {
-                    Some('n') => value.push('\n'),
-                    Some('t') => value.push('\t'),
-                    Some('"') => value.push('"'),
-                    Some('\\') => value.push('\\'),
-                    other => {
-                        let esc_start = self.pos - other.map_or(0, char::len_utf8) - 1;
-                        self.error(esc_start, "unknown escape sequence");
+                Some('"') => {
+                    self.bump();
+                    break;
+                }
+                Some('\\') => {
+                    let esc_start = self.pos;
+                    self.bump();
+                    match self.peek() {
+                        Some('n') => value.push('\n'),
+                        Some('t') => value.push('\t'),
+                        Some('"') => value.push('"'),
+                        Some('\\') => value.push('\\'),
+                        None | Some('\n') => continue,
+                        Some(_) => {
+                            self.bump();
+                            self.error(esc_start, "unknown escape sequence");
+                            continue;
+                        }
                     }
-                },
-                Some(c) => value.push(c),
+                    self.bump();
+                }
+                Some(c) => {
+                    value.push(c);
+                    self.bump();
+                }
             }
         }
         self.push(TokenKind::Str(value), start);
@@ -313,6 +329,7 @@ impl Lexer<'_> {
             '>' => T::Gt,
             '≥' => T::Ge,
             '~' => T::Tilde,
+            '|' => T::Bar,
             '→' => T::Arrow,
             '√' => T::Sqrt,
             '∛' => T::Cbrt,
