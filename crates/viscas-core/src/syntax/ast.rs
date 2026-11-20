@@ -1,13 +1,19 @@
 //! Abstract syntax tree and its canonical pretty-printer.
 //!
 //! Every [`Expr`] and [`Stmt`] carries the byte [`Span`] it was parsed from.
+//! Sums, products and `and`/`or` chains are n-ary ([`ExprKind::Add`],
+//! [`ExprKind::Mul`], [`ExprKind::And`], [`ExprKind::Or`]), so long chains
+//! never produce deep trees.
+//!
 //! The [`Display`](fmt::Display) implementations print *canonical* text:
 //! minimal parentheses, explicit `*`, ASCII operators (`<=`, `!=`, `==`),
-//! `sqrt(x)` for `√x`, and `∫ ∑ ∏` for calculus operators. Re-parsing the
-//! printed text yields the same tree up to spans (see [`Expr::without_spans`]).
+//! `sqrt(x)` for `√x`, `abs(x)` for `|x|`, and `∫ ∑ ∏` for calculus
+//! operators. Re-parsing the printed text yields the same tree up to spans
+//! (see [`Expr::without_spans`]).
 
 use std::fmt::{self, Write as _};
 
+use super::parser::{differential_var, is_prefix_function};
 use super::token::Span;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,18 +32,39 @@ pub enum UnaryOp {
     Not,
 }
 
+/// Binary operators that are not flattened into n-ary nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
     Mod,
     Pow,
-    And,
-    Or,
     /// Unit conversion `a to b`.
     To,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddOp {
+    Add,
+    Sub,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MulOp {
+    Mul,
+    Div,
+}
+
+/// One term of an [`ExprKind::Add`]: `+ expr` or `- expr`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Term {
+    pub op: AddOp,
+    pub expr: Expr,
+}
+
+/// One factor of an [`ExprKind::Mul`]: `* expr` or `/ expr`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Factor {
+    pub op: MulOp,
+    pub expr: Expr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +144,16 @@ pub enum ExprKind {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// `t0 ± t1 ± ...` — at least two terms; the first has [`AddOp::Add`].
+    /// A parenthesised sum inside a sum stays a nested node.
+    Add(Vec<Term>),
+    /// `f0 */ f1 */ ...` — at least two factors; the first has
+    /// [`MulOp::Mul`]. Implicit and explicit multiplication both land here.
+    Mul(Vec<Factor>),
+    /// `a and b and ...` (at least two operands).
+    And(Vec<Expr>),
+    /// `a or b or ...` (at least two operands).
+    Or(Vec<Expr>),
     Postfix {
         op: PostfixOp,
         expr: Box<Expr>,
@@ -126,9 +163,10 @@ pub enum ExprKind {
         first: Box<Expr>,
         rest: Vec<(CmpOp, Expr)>,
     },
-    /// `callee(args)`; also produced for paren-less application `sin x`.
-    /// `x(y)` always parses as a call — a later pass may reinterpret it as
-    /// multiplication when `x` is not a function.
+    /// `callee(args)`; also produced for paren-less application `sin x`,
+    /// `√x` (`sqrt`) and `|x|` (`abs`). `x(y)` always parses as a call — a
+    /// later pass may reinterpret it as multiplication when `x` is not a
+    /// function.
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
@@ -138,11 +176,12 @@ pub enum ExprKind {
         expr: Box<Expr>,
         name: String,
     },
-    /// `expr[index]`; `index` is a list/range for `L[1, 3]` / `L[2..4]`, a
-    /// condition for filters `L[L > 3]`, or a plain expression.
+    /// `expr[i1, i2, ...]` (at least one index). `L[2]` has one index,
+    /// `L[1, 3]` two, `L[[1, 3]]` one (a list). Ranges `L[2..4]` and
+    /// filters `L[L > 3]` are single indices.
     Index {
         expr: Box<Expr>,
-        index: Box<Expr>,
+        indices: Vec<Expr>,
     },
     /// `[a, b, c]`; matrices are lists of lists.
     List(Vec<Expr>),
@@ -164,7 +203,8 @@ pub enum ExprKind {
         branches: Vec<Branch>,
         otherwise: Option<Box<Expr>>,
     },
-    /// `expr {cond, ...}` — a domain restriction.
+    /// `expr {cond, ...}` nested inside brackets/parentheses. Restrictions
+    /// at the end of a statement are stored on the statement instead.
     Restrict {
         expr: Box<Expr>,
         conds: Vec<Expr>,
@@ -212,23 +252,29 @@ pub enum ElseBranch {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
-    /// A bare expression, including inequalities `x^2 + y^2 < 4`.
-    Expr(Expr),
-    /// `lhs = rhs`: definition (`a = 3`, `f(x) = x^2`) or equation
-    /// (`y = sin x`, `x^2 + y^2 = 4`). A later pass classifies it.
+    /// A bare expression, including inequalities `x^2 + y^2 < 4`, with
+    /// optional trailing restrictions `{x > 0}`.
+    Expr {
+        expr: Expr,
+        restrictions: Vec<Expr>,
+    },
+    /// `lhs = rhs {restrictions}`: definition (`a = 3`, `f(x) = x^2`) or
+    /// equation (`y = sin x`, `x^2 + y^2 = 4`). A later pass classifies it.
+    /// Restrictions apply to the whole relation.
     Equation {
         lhs: Expr,
         rhs: Expr,
+        restrictions: Vec<Expr>,
     },
-    /// `lhs ~ rhs`
+    /// `lhs ~ rhs {restrictions}`
     Regression {
         lhs: Expr,
         rhs: Expr,
+        restrictions: Vec<Expr>,
     },
-    /// `target -> value`
+    /// `a -> a + 1, b -> 0` (at least one `(target, value)` pair).
     Action {
-        target: Expr,
-        value: Expr,
+        actions: Vec<(Expr, Expr)>,
     },
     /// `let name = value`
     Let {
@@ -294,6 +340,12 @@ impl Expr {
                 lhs.clear_spans();
                 rhs.clear_spans();
             }
+            ExprKind::Add(terms) => terms.iter_mut().for_each(|t| t.expr.clear_spans()),
+            ExprKind::Mul(factors) => factors.iter_mut().for_each(|f| f.expr.clear_spans()),
+            ExprKind::And(items)
+            | ExprKind::Or(items)
+            | ExprKind::List(items)
+            | ExprKind::Tuple(items) => items.iter_mut().for_each(Expr::clear_spans),
             ExprKind::Compare { first, rest } => {
                 first.clear_spans();
                 rest.iter_mut().for_each(|(_, e)| e.clear_spans());
@@ -302,12 +354,9 @@ impl Expr {
                 callee.clear_spans();
                 args.iter_mut().for_each(Expr::clear_spans);
             }
-            ExprKind::Index { expr, index } => {
+            ExprKind::Index { expr, indices } => {
                 expr.clear_spans();
-                index.clear_spans();
-            }
-            ExprKind::List(items) | ExprKind::Tuple(items) => {
-                items.iter_mut().for_each(Expr::clear_spans)
+                indices.iter_mut().for_each(Expr::clear_spans);
             }
             ExprKind::Range { start, second, end } => {
                 start.clear_spans();
@@ -374,14 +423,30 @@ impl Stmt {
     pub fn clear_spans(&mut self) {
         self.span = Span::default();
         match &mut self.kind {
-            StmtKind::Expr(e) | StmtKind::Let { value: e, .. } => e.clear_spans(),
-            StmtKind::Equation { lhs, rhs } | StmtKind::Regression { lhs, rhs } => {
+            StmtKind::Expr { expr, restrictions } => {
+                expr.clear_spans();
+                restrictions.iter_mut().for_each(Expr::clear_spans);
+            }
+            StmtKind::Let { value: e, .. } => e.clear_spans(),
+            StmtKind::Equation {
+                lhs,
+                rhs,
+                restrictions,
+            }
+            | StmtKind::Regression {
+                lhs,
+                rhs,
+                restrictions,
+            } => {
                 lhs.clear_spans();
                 rhs.clear_spans();
+                restrictions.iter_mut().for_each(Expr::clear_spans);
             }
-            StmtKind::Action { target, value } => {
-                target.clear_spans();
-                value.clear_spans();
+            StmtKind::Action { actions } => {
+                for (t, v) in actions {
+                    t.clear_spans();
+                    v.clear_spans();
+                }
             }
             StmtKind::If {
                 cond,
@@ -448,12 +513,13 @@ fn precedence(e: &Expr) -> u8 {
         ExprKind::Restrict { .. } => prec::RESTRICT,
         ExprKind::Binary { op, .. } => match op {
             BinOp::To => prec::TO,
-            BinOp::Or => prec::OR,
-            BinOp::And => prec::AND,
-            BinOp::Add | BinOp::Sub => prec::ADD,
-            BinOp::Mul | BinOp::Div | BinOp::Mod => prec::MUL,
+            BinOp::Mod => prec::MUL,
             BinOp::Pow => prec::POW,
         },
+        ExprKind::Or(_) => prec::OR,
+        ExprKind::And(_) => prec::AND,
+        ExprKind::Add(_) => prec::ADD,
+        ExprKind::Mul(_) => prec::MUL,
         ExprKind::Unary {
             op: UnaryOp::Not, ..
         } => prec::NOT,
@@ -492,6 +558,26 @@ fn child(f: &mut fmt::Formatter<'_>, e: &Expr, min: u8) -> fmt::Result {
     }
 }
 
+/// Left operand of a multiplicative operator (`*`, `/`, `mod`).
+fn mul_lhs(f: &mut fmt::Formatter<'_>, e: &Expr, allow_mul: bool) -> fmt::Result {
+    let nested_mul = !allow_mul && matches!(e.kind, ExprKind::Mul(_));
+    if precedence(e) < prec::MUL || is_greedy(e) || nested_mul {
+        write!(f, "({e})")
+    } else {
+        write!(f, "{e}")
+    }
+}
+
+/// Does the printed text start with a differential such as `dx`? After a
+/// `/` that would turn `d / dx` into a derivative header.
+fn starts_with_differential(s: &str) -> bool {
+    let end = s
+        .char_indices()
+        .find(|&(_, c)| !(c.is_alphanumeric() || c == '_'))
+        .map_or(s.len(), |(i, _)| i);
+    differential_var(&s[..end]).is_some()
+}
+
 fn comma_list(f: &mut fmt::Formatter<'_>, items: &[Expr]) -> fmt::Result {
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
@@ -527,6 +613,9 @@ impl fmt::Display for Expr {
                 Ok(())
             }
             ExprKind::Str(s) => write_str_literal(f, s),
+            // A bare prefix-function name is parenthesised so that `(sin) - x`
+            // does not re-parse as `sin(-x)`.
+            ExprKind::Ident(name) if is_prefix_function(name) => write!(f, "({name})"),
             ExprKind::Ident(name) => f.write_str(name),
             ExprKind::Prime { expr, order } => {
                 child(f, expr, prec::POSTFIX)?;
@@ -544,29 +633,88 @@ impl fmt::Display for Expr {
                 f.write_str(s)?;
                 child(f, expr, min)
             }
-            ExprKind::Binary { op, lhs, rhs } => {
-                let (sep, p) = match op {
-                    BinOp::Pow => {
-                        child(f, lhs, prec::POSTFIX)?;
-                        f.write_char('^')?;
-                        return child(f, rhs, prec::POW);
+            ExprKind::Binary { op, lhs, rhs } => match op {
+                BinOp::Pow => {
+                    child(f, lhs, prec::POSTFIX)?;
+                    f.write_char('^')?;
+                    // `x^{...}` is rejected by the parser (braces do not group).
+                    let exp = rhs.to_string();
+                    if precedence(rhs) < prec::POW || exp.starts_with('{') {
+                        write!(f, "({exp})")
+                    } else {
+                        f.write_str(&exp)
                     }
-                    BinOp::Add => (" + ", prec::ADD),
-                    BinOp::Sub => (" - ", prec::ADD),
-                    BinOp::Mul => (" * ", prec::MUL),
-                    BinOp::Div => (" / ", prec::MUL),
-                    BinOp::Mod => (" mod ", prec::MUL),
-                    BinOp::And => (" and ", prec::AND),
-                    BinOp::Or => (" or ", prec::OR),
-                    BinOp::To => (" to ", prec::TO),
-                };
-                if p == prec::MUL && is_greedy(lhs) {
-                    write!(f, "({lhs})")?;
-                } else {
-                    child(f, lhs, p)?;
                 }
-                f.write_str(sep)?;
-                child(f, rhs, p + 1)
+                BinOp::Mod => {
+                    mul_lhs(f, lhs, true)?;
+                    f.write_str(" mod ")?;
+                    child(f, rhs, prec::UNARY)
+                }
+                BinOp::To => {
+                    child(f, lhs, prec::TO)?;
+                    f.write_str(" to ")?;
+                    child(f, rhs, prec::TO + 1)
+                }
+            },
+            ExprKind::Add(terms) => {
+                for (i, t) in terms.iter().enumerate() {
+                    if i == 0 {
+                        if t.op == AddOp::Sub {
+                            // Not produced by the parser; keep it re-parseable.
+                            f.write_char('-')?;
+                            child(f, &t.expr, prec::UNARY)?;
+                        } else if matches!(t.expr.kind, ExprKind::Add(_)) {
+                            write!(f, "({})", t.expr)?;
+                        } else {
+                            child(f, &t.expr, prec::ADD)?;
+                        }
+                        continue;
+                    }
+                    f.write_str(match t.op {
+                        AddOp::Add => " + ",
+                        AddOp::Sub => " - ",
+                    })?;
+                    child(f, &t.expr, prec::ADD + 1)?;
+                }
+                Ok(())
+            }
+            ExprKind::Mul(factors) => {
+                for (i, fa) in factors.iter().enumerate() {
+                    if i == 0 {
+                        mul_lhs(f, &fa.expr, false)?;
+                        continue;
+                    }
+                    match fa.op {
+                        MulOp::Mul => {
+                            f.write_str(" * ")?;
+                            child(f, &fa.expr, prec::UNARY)?;
+                        }
+                        MulOp::Div => {
+                            f.write_str(" / ")?;
+                            let s = fa.expr.to_string();
+                            if precedence(&fa.expr) < prec::UNARY || starts_with_differential(&s) {
+                                write!(f, "({s})")?;
+                            } else {
+                                f.write_str(&s)?;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ExprKind::And(items) | ExprKind::Or(items) => {
+                let (sep, p) = if matches!(self.kind, ExprKind::And(_)) {
+                    (" and ", prec::AND)
+                } else {
+                    (" or ", prec::OR)
+                };
+                for (i, e) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(sep)?;
+                    }
+                    child(f, e, p + 1)?;
+                }
+                Ok(())
             }
             ExprKind::Postfix { op, expr } => {
                 child(f, expr, prec::POSTFIX)?;
@@ -584,7 +732,10 @@ impl fmt::Display for Expr {
                 Ok(())
             }
             ExprKind::Call { callee, args } => {
-                child(f, callee, prec::POSTFIX)?;
+                match &callee.kind {
+                    ExprKind::Ident(name) => f.write_str(name)?,
+                    _ => child(f, callee, prec::POSTFIX)?,
+                }
                 f.write_char('(')?;
                 comma_list(f, args)?;
                 f.write_char(')')
@@ -593,20 +744,24 @@ impl fmt::Display for Expr {
                 child(f, expr, prec::POSTFIX)?;
                 write!(f, ".{name}")
             }
-            ExprKind::Index { expr, index } => {
+            ExprKind::Index { expr, indices } => {
                 if matches!(expr.kind, ExprKind::Number { .. }) {
                     write!(f, "({expr})")?;
                 } else {
                     child(f, expr, prec::POSTFIX)?;
                 }
                 f.write_char('[')?;
-                match &index.kind {
-                    ExprKind::List(items) if items.len() != 1 => comma_list(f, items)?,
-                    ExprKind::Range { .. } | ExprKind::Comprehension { .. } => {
-                        let s = index.to_string();
+                match indices.as_slice() {
+                    [
+                        single @ Expr {
+                            kind: ExprKind::Range { .. } | ExprKind::Comprehension { .. },
+                            ..
+                        },
+                    ] => {
+                        let s = single.to_string();
                         f.write_str(&s[1..s.len() - 1])?;
                     }
-                    _ => write!(f, "{index}")?,
+                    _ => comma_list(f, indices)?,
                 }
                 f.write_char(']')
             }
@@ -671,7 +826,7 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "d^{order}/d{var}^{order} ")?;
                 }
-                child(f, expr, prec::MUL)
+                write_greedy_body(f, expr)
             }
             ExprKind::Integral { bounds, body, var } => {
                 let mut b = String::new();
@@ -699,9 +854,20 @@ impl fmt::Display for Expr {
                     BigOpKind::Product => '∏',
                 };
                 write!(f, "{sym}({var} = {from}, {to}) ")?;
-                child(f, body, prec::MUL)
+                write_greedy_body(f, body)
             }
         }
+    }
+}
+
+/// Body of `d/dx` / `∑` / `∏`: a product; a leading sign must be wrapped
+/// (`d/dx -x` would read as `(d/dx) - x`), as must a leading `{`.
+fn write_greedy_body(f: &mut fmt::Formatter<'_>, body: &Expr) -> fmt::Result {
+    let s = body.to_string();
+    if precedence(body) < prec::MUL || s.starts_with(['-', '+', '{']) {
+        write!(f, "({s})")
+    } else {
+        f.write_str(&s)
     }
 }
 
@@ -722,10 +888,19 @@ fn write_block(f: &mut fmt::Formatter<'_>, block: &Block, depth: usize) -> fmt::
     f.write_char('}')
 }
 
-/// Conditions of `if`/`while`/`for` are followed by `{`, so a trailing
-/// restriction must be parenthesised.
-fn write_header_expr(f: &mut fmt::Formatter<'_>, e: &Expr) -> fmt::Result {
+/// Statement-level expression: a trailing `{` would be read as a
+/// restriction (or a block), so a top-level `Restrict` is parenthesised.
+fn top(f: &mut fmt::Formatter<'_>, e: &Expr) -> fmt::Result {
     child(f, e, prec::TO)
+}
+
+fn write_restrictions(f: &mut fmt::Formatter<'_>, conds: &[Expr]) -> fmt::Result {
+    if conds.is_empty() {
+        return Ok(());
+    }
+    f.write_str(" {")?;
+    comma_list(f, conds)?;
+    f.write_char('}')
 }
 
 fn write_stmt(f: &mut fmt::Formatter<'_>, stmt: &Stmt, depth: usize) -> fmt::Result {
@@ -737,18 +912,51 @@ fn write_stmt(f: &mut fmt::Formatter<'_>, stmt: &Stmt, depth: usize) -> fmt::Res
 
 fn write_stmt_body(f: &mut fmt::Formatter<'_>, stmt: &Stmt, depth: usize) -> fmt::Result {
     match &stmt.kind {
-        StmtKind::Expr(e) => write!(f, "{e}"),
-        StmtKind::Equation { lhs, rhs } => write!(f, "{lhs} = {rhs}"),
-        StmtKind::Regression { lhs, rhs } => write!(f, "{lhs} ~ {rhs}"),
-        StmtKind::Action { target, value } => write!(f, "{target} -> {value}"),
-        StmtKind::Let { name, value } => write!(f, "let {name} = {value}"),
+        StmtKind::Expr { expr, restrictions } => {
+            top(f, expr)?;
+            write_restrictions(f, restrictions)
+        }
+        StmtKind::Equation {
+            lhs,
+            rhs,
+            restrictions,
+        }
+        | StmtKind::Regression {
+            lhs,
+            rhs,
+            restrictions,
+        } => {
+            top(f, lhs)?;
+            f.write_str(if matches!(stmt.kind, StmtKind::Equation { .. }) {
+                " = "
+            } else {
+                " ~ "
+            })?;
+            top(f, rhs)?;
+            write_restrictions(f, restrictions)
+        }
+        StmtKind::Action { actions } => {
+            for (i, (target, value)) in actions.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                top(f, target)?;
+                f.write_str(" -> ")?;
+                top(f, value)?;
+            }
+            Ok(())
+        }
+        StmtKind::Let { name, value } => {
+            write!(f, "let {name} = ")?;
+            top(f, value)
+        }
         StmtKind::If {
             cond,
             then,
             otherwise,
         } => {
             f.write_str("if ")?;
-            write_header_expr(f, cond)?;
+            top(f, cond)?;
             f.write_char(' ')?;
             write_block(f, then, depth)?;
             match otherwise {
@@ -765,13 +973,13 @@ fn write_stmt_body(f: &mut fmt::Formatter<'_>, stmt: &Stmt, depth: usize) -> fmt
         }
         StmtKind::For { var, iter, body } => {
             write!(f, "for {var} in ")?;
-            write_header_expr(f, iter)?;
+            top(f, iter)?;
             f.write_char(' ')?;
             write_block(f, body, depth)
         }
         StmtKind::While { cond, body } => {
             f.write_str("while ")?;
-            write_header_expr(f, cond)?;
+            top(f, cond)?;
             f.write_char(' ')?;
             write_block(f, body, depth)
         }
@@ -780,7 +988,10 @@ fn write_stmt_body(f: &mut fmt::Formatter<'_>, stmt: &Stmt, depth: usize) -> fmt
             write_block(f, body, depth)
         }
         StmtKind::Return(None) => f.write_str("return"),
-        StmtKind::Return(Some(e)) => write!(f, "return {e}"),
+        StmtKind::Return(Some(e)) => {
+            f.write_str("return ")?;
+            top(f, e)
+        }
     }
 }
 

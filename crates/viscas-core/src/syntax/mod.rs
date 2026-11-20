@@ -14,22 +14,26 @@
 //!             | 'if' head block ('else' (if-stmt | block))?
 //!             | 'for' IDENT 'in' head block | 'while' head block
 //!             | 'fn' IDENT '(' params ')' block | 'return' expr?
-//!             | expr (('=' | '~' | '->') expr)?
+//!             | expr ('=' expr | '~' expr)? restrictions
+//!             | expr '->' expr (',' expr '->' expr)*
+//! restrictions := ('{' expr (',' expr)* '}')*
 //! block      := '{' program '}'
-//! expr       := to ('{' conds '}')*                  restriction
+//! expr       := to                                  (+ nested restriction)
 //! to         := or ('to' or)*                        unit conversion
-//! or / and   := left-assoc chains of 'or' / 'and'
+//! or / and   := n-ary chains of 'or' / 'and'
 //! not        := 'not' not | compare
 //! compare    := additive (cmpop additive)*           chainable: 0 < x < 2
-//! additive   := mult (('+' | '-') mult)*
-//! mult       := unary (('*' | '/' | 'mod') unary | <implicit> power)*
+//! additive   := mult (('+' | '-') mult)*             n-ary
+//! mult       := unary ('*' unary | '/' juxt | 'mod' unary | <implicit> power)*
+//! juxt       := unary (<implicit> power)*            1/2x = 1/(2x)
 //! unary      := ('-' | '+') unary | power             -x^2 = -(x^2)
 //! power      := postfix ('^' exponent)?               right-assoc
 //! exponent   := ('-' | '+') exponent | power          2^-3
 //! postfix    := primary (call | index | '.' IDENT | '!' | '%' | "'")*
 //! primary    := NUMBER | STRING | IDENT | '(' expr ')' | tuple | list
-//!             | range | comprehension | piecewise | '√' exponent
-//!             | 'd/dx' mult | '∫' ... 'dx' | '∑(k=a,b)' mult | '∏(...)' mult
+//!             | range | comprehension | piecewise | '|' expr '|'
+//!             | '√' juxt | 'd/dx' mult | '∫' ... 'dx'
+//!             | '∑(k=a,b)' mult | '∏(...)' mult
 //! ```
 //!
 //! - `cmpop` is `< <= > >= == !=` (and unicode `≤ ≥ ≠`). A single `=` is an
@@ -37,49 +41,73 @@
 //!   `if`/`while` heads; at statement level it produces
 //!   [`StmtKind::Equation`] (definition vs. equation is decided later).
 //! - Inequalities such as `x^2 + y^2 < 4` are plain expression statements.
-//! - A `{...}` directly following an expression is a *restriction*
-//!   (`y = x^2 {0 < x < 2}` restricts the right-hand side). A `{` never
-//!   starts an implicit multiplication; piecewise braces appear only in
-//!   operand position (`{x < 0: -x, x}`, `2 + {x > 0}`).
+//! - Restrictions: `{...}` groups at the end of an expression, equation or
+//!   regression statement are stored on the statement and apply to the whole
+//!   relation (`y = x^2 {0 < x < 2}`, `x^2 + y^2 < 4 {x > 0}`). Inside
+//!   brackets/parentheses a trailing `{...}` becomes an
+//!   [`ExprKind::Restrict`] node (`[x {x > 0}, -x]`); [`parse_expr`] also
+//!   returns one for a trailing group. A `{` never starts an implicit
+//!   multiplication; piecewise braces appear only in operand position
+//!   (`{x < 0: -x, x}`, `2 + {x > 0}`). Braces never group: `x^{2}` and
+//!   `√{x}` are errors (write `x^(2)`).
 //! - `name(args)` (also `f'(x)`, `P.f(x)`) is always a call; a later pass may
 //!   reinterpret `x(y+1)` as multiplication if `x` is not a function.
-//!   `L[...]` is indexing (list `L[1, 3]`, range `L[2..4]`, filter `L[L > 3]`).
+//!   `L[i, j, ...]` indexes with one or more indices (`L[2]`, `L[1, 3]`,
+//!   range `L[2..4]`, filter `L[L > 3]`); `L[[1, 3]]` is one list index.
 //! - Lists `[1, 2]`, ranges `[1..10]` / `[0, 0.1..1]` (`...` also accepted),
 //!   comprehensions `[k^2 for k = [1..5], j = L]`, matrices as nested lists.
-//! - Calculus: `d/dx f(x)`, `d^2/dx^2 f`; `∫(a, b) expr dx`, indefinite
-//!   `∫ expr dx` (also `int(a, b) expr dx`); `∑(k = 1, n) expr` /
-//!   `sum(k = 1, n) expr`, `∏` / `prod`. The derivative, sum and product
-//!   bodies extend over a whole product (`∑(k=1,n) 2k + 1` is
+//! - Absolute value `|x|` becomes `abs(x)`. A `|` in operand position opens
+//!   a bar; in operator position it closes the innermost open bar, so
+//!   `||x| - 1|` is `abs(abs(x) - 1)` and `|x + |y||` is `abs(x + abs(y))`.
+//!   Outside any open bar, a `|` after an operand starts an implicitly
+//!   multiplied abs: `|a|b|c|` is `abs(a)·b·abs(c)`.
+//! - Calculus: `d/dx f(x)`, `d^2/dx^2 f` (orders must match); `∫(a, b) expr
+//!   dx`, indefinite `∫ expr dx` (also `int(a, b) expr dx`); `∑(k = 1, n)
+//!   expr` / `sum(k = 1, n) expr`, `∏` / `prod`. The derivative, sum and
+//!   product bodies extend over a whole product (`∑(k=1,n) 2k + 1` is
 //!   `(∑ 2k) + 1`); the integrand extends to the differential (`dx`, `dθ`,
 //!   `dt_1`: the letter `d` followed by one letter and an optional
-//!   subscript). `sum(...)`/`int(...)` without that header shape are calls.
-//! - `√x` / `∛x` become calls to `sqrt` / `cbrt`.
+//!   subscript). `d/dx` is only a derivative when an operand (not a sign or
+//!   `{`) follows, so `d/dx + 1` is a division; write `d/dx (-x)`.
+//!   `sum(...)`/`int(...)` without the header shape are calls.
+//! - `a -> 1, b -> b + 1` is one action statement with several updates.
+//! - Limits: nesting deeper than [`parser::MAX_DEPTH`] is an error; sums,
+//!   products, `and`/`or` chains, comparison chains and lists are flat, so
+//!   long inputs never build deep trees.
 //!
-//! # Implicit multiplication (modelled on Desmos)
+//! # Implicit multiplication
 //!
-//! Juxtaposition multiplies with the same precedence as `*`, left-assoc,
-//! so `1/2x` is `(1/2)·x` and `-2x` is `(-2)·x`. After an operand, the
-//! following tokens start an implicit factor:
+//! Juxtaposition multiplies. It is the way formulas are written on paper,
+//! so it binds *tighter* than an explicit `/`: the right operand of `/` takes
+//! every implicitly multiplied factor that follows, so `1/2x` is `1/(2x)`
+//! and `1/2 x` (with a space) is the same — whitespace never changes the
+//! meaning. Explicit `*` and `mod` are ordinary left-assoc operators at the
+//! same level as `/` (`a / b * c` is `(a/b)·c`). `-2x` is `(-2)·x`.
+//! After an operand, the following tokens start an implicit factor:
 //!
-//! - an identifier (`2x`, `x y`, `2 sin x`) — note identifiers may be
-//!   multi-letter (`xy` is one name, `km` is a unit); single Greek letters
-//!   never merge, so `2πr` is `2·π·r`;
+//! - an identifier (`2x`, `x y`, `2 sin x`). Identifiers may be
+//!   multi-letter (`xy` is one name, `km` is a unit); the evaluator splits
+//!   an *undefined* multi-letter name into a product of its letters. Single
+//!   Greek letters never merge, so `2πr` is `2·π·r`;
 //! - a number, unless directly after another number (`x 2` is `x·2`, but
-//!   `2 3` is an error);
+//!   `2 3` is an error, as is `x^2 3`);
 //! - `(` (`2(x+1)`, `(a)(b)`), unless the operand is callable (`f(x)`);
-//! - `√`, `∫`, `∑`, `∏`, and `d/dx`;
+//! - `|`, `√`, `∫`, `∑`, `∏`, and `d/dx`;
 //! - `[` only right after a number (`2[1, 2]`); otherwise it indexes.
 //!
 //! Prefix functions (`sin cos tan … ln log exp log_b`, see
-//! [`parser::PREFIX_FUNCTIONS`]) can be applied without parentheses. Their
-//! argument is a juxtaposition of power terms, stopping at any explicit
-//! operator and before the next prefix function name:
+//! [`parser::PREFIX_FUNCTIONS`]) and `√` / `∛` can be applied without
+//! parentheses. Their argument is an optional sign followed by a
+//! juxtaposition of power terms; it stops at any explicit operator and
+//! before the next prefix function name. This keeps `sin 2x` reading as
+//! the sine of `2x`, while `sin x cos x` stays a product of two functions:
 //!
 //! | input          | parses as            |
 //! |----------------|----------------------|
 //! | `sin x`        | `sin(x)`             |
 //! | `sin 2x`       | `sin(2·x)`           |
 //! | `sin x^2`      | `sin(x^2)`           |
+//! | `sin -x`       | `sin(-x)`            |
 //! | `sin x cos x`  | `sin(x)·cos(x)`      |
 //! | `2 sin x`      | `2·sin(x)`           |
 //! | `sin x + 1`    | `sin(x) + 1`         |
@@ -87,6 +115,8 @@
 //! | `sin cos x`    | `sin(cos(x))`        |
 //! | `sin(x)^2`, `sin^2 x` | `sin(x)^2`    |
 //! | `sin^-1 x`     | `arcsin(x)`          |
+//! | `√2x`          | `sqrt(2·x)`          |
+//! | `√x + 1`       | `sqrt(x) + 1`        |
 //!
 //! Units are plain identifiers here: `5 km/h to m/s` is
 //! `((5·km)/h) to (m/s)`.

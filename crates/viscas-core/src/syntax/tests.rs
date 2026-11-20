@@ -35,18 +35,50 @@ fn sx(e: &Expr) -> String {
         }
         ExprKind::Binary { op, lhs, rhs } => {
             let h = match op {
-                BinOp::Add => "+",
-                BinOp::Sub => "-",
-                BinOp::Mul => "*",
-                BinOp::Div => "/",
                 BinOp::Mod => "mod",
                 BinOp::Pow => "^",
-                BinOp::And => "and",
-                BinOp::Or => "or",
                 BinOp::To => "to",
             };
             list(h, vec![sx(lhs), sx(rhs)])
         }
+        ExprKind::Add(terms) => {
+            if terms.iter().all(|t| t.op == AddOp::Add) {
+                list("+", terms.iter().map(|t| sx(&t.expr)).collect())
+            } else if terms.len() == 2 {
+                list("-", vec![sx(&terms[0].expr), sx(&terms[1].expr)])
+            } else {
+                let items = terms
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| match (i, t.op) {
+                        (0, _) => sx(&t.expr),
+                        (_, AddOp::Add) => format!("+{}", sx(&t.expr)),
+                        (_, AddOp::Sub) => format!("-{}", sx(&t.expr)),
+                    })
+                    .collect();
+                list("±", items)
+            }
+        }
+        ExprKind::Mul(factors) => {
+            if factors.iter().all(|f| f.op == MulOp::Mul) {
+                list("*", factors.iter().map(|f| sx(&f.expr)).collect())
+            } else if factors.len() == 2 {
+                list("/", vec![sx(&factors[0].expr), sx(&factors[1].expr)])
+            } else {
+                let items = factors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| match (i, f.op) {
+                        (0, _) => sx(&f.expr),
+                        (_, MulOp::Mul) => format!("*{}", sx(&f.expr)),
+                        (_, MulOp::Div) => format!("/{}", sx(&f.expr)),
+                    })
+                    .collect();
+                list("*/", items)
+            }
+        }
+        ExprKind::And(items) => list("and", items.iter().map(sx).collect()),
+        ExprKind::Or(items) => list("or", items.iter().map(sx).collect()),
         ExprKind::Postfix { op, expr } => {
             let h = match op {
                 PostfixOp::Factorial => "!",
@@ -71,7 +103,11 @@ fn sx(e: &Expr) -> String {
             list("call", items)
         }
         ExprKind::Member { expr, name } => list(".", vec![sx(expr), name.clone()]),
-        ExprKind::Index { expr, index } => list("index", vec![sx(expr), sx(index)]),
+        ExprKind::Index { expr, indices } => {
+            let mut items = vec![sx(expr)];
+            items.extend(indices.iter().map(sx));
+            list("index", items)
+        }
         ExprKind::List(items) => list("list", items.iter().map(sx).collect()),
         ExprKind::Tuple(items) => list("tuple", items.iter().map(sx).collect()),
         ExprKind::Range { start, second, end } => {
@@ -153,12 +189,42 @@ fn sx_block(b: &Block) -> String {
     s
 }
 
+/// Statement restrictions, rendered as ` {c1 c2}` (empty when none).
+fn sx_conds(conds: &[Expr]) -> String {
+    if conds.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = conds.iter().map(sx).collect();
+    format!(" {{{}}}", items.join(" "))
+}
+
 fn sx_stmt(s: &Stmt) -> String {
     match &s.kind {
-        StmtKind::Expr(e) => sx(e),
-        StmtKind::Equation { lhs, rhs } => format!("(= {} {})", sx(lhs), sx(rhs)),
-        StmtKind::Regression { lhs, rhs } => format!("(~ {} {})", sx(lhs), sx(rhs)),
-        StmtKind::Action { target, value } => format!("(-> {} {})", sx(target), sx(value)),
+        StmtKind::Expr { expr, restrictions } if restrictions.is_empty() => sx(expr),
+        StmtKind::Expr { expr, restrictions } => {
+            format!("(where {}{})", sx(expr), sx_conds(restrictions))
+        }
+        StmtKind::Equation {
+            lhs,
+            rhs,
+            restrictions,
+        } => format!("(= {} {}{})", sx(lhs), sx(rhs), sx_conds(restrictions)),
+        StmtKind::Regression {
+            lhs,
+            rhs,
+            restrictions,
+        } => format!("(~ {} {}{})", sx(lhs), sx(rhs), sx_conds(restrictions)),
+        StmtKind::Action { actions } => {
+            let parts: Vec<String> = actions
+                .iter()
+                .map(|(t, v)| format!("(-> {} {})", sx(t), sx(v)))
+                .collect();
+            if parts.len() == 1 {
+                parts[0].clone()
+            } else {
+                format!("(actions {})", parts.join(" "))
+            }
+        }
         StmtKind::Let { name, value } => format!("(let {name} {})", sx(value)),
         StmtKind::If {
             cond,
@@ -479,9 +545,14 @@ fn precedence_and_associativity() {
     check_exprs(&[
         ("1 + 2 * 3", "(+ 1 (* 2 3))"),
         ("(1 + 2) * 3", "(* (+ 1 2) 3)"),
-        ("1 - 2 - 3", "(- (- 1 2) 3)"),
+        ("1 - 2 - 3", "(± 1 -2 -3)"),
+        ("(1 - 2) - 3", "(- (- 1 2) 3)"),
+        ("a + b - c + d", "(± a +b -c +d)"),
         ("1 - (2 - 3)", "(- 1 (- 2 3))"),
-        ("8 / 4 / 2", "(/ (/ 8 4) 2)"),
+        ("8 / 4 / 2", "(*/ 8 /4 /2)"),
+        ("a / b * c", "(*/ a /b *c)"),
+        ("a * b mod c * d", "(* (mod (* a b) c) d)"),
+        ("a mod b mod c", "(mod (mod a b) c)"),
         ("2^3^2", "(^ 2 (^ 3 2))"),
         ("(2^3)^2", "(^ (^ 2 3) 2)"),
         ("-x^2", "(neg (^ x 2))"),
@@ -498,7 +569,7 @@ fn precedence_and_associativity() {
         ("50%", "(% 50)"),
         ("x * -y", "(* x (neg y))"),
         ("a − b", "(- a b)"),
-        ("a · b × c ÷ d", "(/ (* (* a b) c) d)"),
+        ("a · b × c ÷ d", "(*/ a *b *c /d)"),
         ("1 +\n 2", "(+ 1 2)"),
         ("x**2", "(^ x 2)"),
     ]);
@@ -535,16 +606,28 @@ fn implicit_multiplication() {
         ("2(x+1)", "(* 2 (+ x 1))"),
         ("(a)(b)", "(* a b)"),
         ("(a + 1)(a - 1)", "(* (+ a 1) (- a 1))"),
-        ("2πr", "(* (* 2 π) r)"),
+        ("2πr", "(* 2 π r)"),
         ("x 2", "(* x 2)"),
-        ("1/2x", "(* (/ 1 2) x)"),
+        ("1/2x", "(/ 1 (* 2 x))"),
+        ("1/2 x", "(/ 1 (* 2 x))"),
+        ("1/2 sin x", "(/ 1 (* 2 (call sin x)))"),
+        ("2x/3y", "(*/ 2 *x /(* 3 y))"),
+        ("1/2 * x", "(*/ 1 /2 *x)"),
+        ("(1/2)x", "(* (/ 1 2) x)"),
         ("-2x", "(* (neg 2) x)"),
         ("2x^2", "(* 2 (^ x 2))"),
         ("2x!", "(* 2 (! x))"),
         ("3i x", "(* 3i x)"),
         ("2[1, 2]", "(* 2 (list 1 2))"),
         ("2√x", "(* 2 (call sqrt x))"),
-        ("a b c", "(* (* a b) c)"),
+        ("|x|", "(call abs x)"),
+        ("2|x|", "(* 2 (call abs x))"),
+        ("||x| - 1|", "(call abs (- (call abs x) 1))"),
+        ("|x + |y||", "(call abs (+ x (call abs y)))"),
+        ("|a|b|c|", "(* (call abs a) b (call abs c))"),
+        ("|(a, b)|", "(call abs (tuple a b))"),
+        ("sin |x|", "(call sin (call abs x))"),
+        ("a b c", "(* a b c)"),
         ("2 f(x)", "(* 2 (call f x))"),
         ("f(x)(y)", "(* (call f x) y)"),
     ]);
@@ -559,12 +642,15 @@ fn prefix_function_application() {
         ("sin x^2", "(call sin (^ x 2))"),
         ("sin x cos x", "(* (call sin x) (call cos x))"),
         ("2 sin x", "(* 2 (call sin x))"),
-        ("2 sin x cos x", "(* (* 2 (call sin x)) (call cos x))"),
+        ("2 sin x cos x", "(* 2 (call sin x) (call cos x))"),
         ("sin x + 1", "(+ (call sin x) 1)"),
         ("sin x / 2", "(/ (call sin x) 2)"),
         ("sin x y", "(call sin (* x y))"),
         ("sin cos x", "(call sin (call cos x))"),
-        ("sin 2πx", "(call sin (* (* 2 π) x))"),
+        ("sin 2πx", "(call sin (* 2 π x))"),
+        ("sin -x", "(call sin (neg x))"),
+        ("sin -2x", "(call sin (* (neg 2) x))"),
+        ("sin - x", "(call sin (neg x))"),
         ("sin(x)^2", "(^ (call sin x) 2)"),
         ("sin^2 x", "(^ (call sin x) 2)"),
         ("sin^2(x)", "(^ (call sin x) 2)"),
@@ -577,7 +663,11 @@ fn prefix_function_application() {
         ("sin", "sin"),
         ("sin * x", "(* sin x)"),
         ("cos(x) sin(x)", "(* (call cos x) (call sin x))"),
-        ("√2x", "(* (call sqrt 2) x)"),
+        ("√2x", "(call sqrt (* 2 x))"),
+        ("√x y", "(call sqrt (* x y))"),
+        ("√x sin x", "(* (call sqrt x) (call sin x))"),
+        ("√x + 1", "(+ (call sqrt x) 1)"),
+        ("√-x", "(call sqrt (neg x))"),
         ("√(x+1)", "(call sqrt (+ x 1))"),
         ("√x^2", "(call sqrt (^ x 2))"),
         ("∛8", "(call cbrt 8)"),
@@ -599,7 +689,9 @@ fn postfix_calls_members_indexing() {
         ("P.f(2)", "(call (. P f) 2)"),
         ("L[2]", "(index L 2)"),
         ("L[L > 3]", "(index L (> L 3))"),
-        ("L[1, 3]", "(index L (list 1 3))"),
+        ("L[1, 3]", "(index L 1 3)"),
+        ("L[[1, 3]]", "(index L (list 1 3))"),
+        ("M[1, 2]", "(index M 1 2)"),
         ("L[2..4]", "(index L (range 2 4))"),
         ("L[1][2]", "(index (index L 1) 2)"),
         ("M[1][2]^2", "(^ (index (index M 1) 2) 2)"),
@@ -657,7 +749,11 @@ fn calculus() {
         ("d/dx f(x)", "(d/dx (call f x))"),
         ("d/dx sin x", "(d/dx (call sin x))"),
         ("d/dx x^2 + 1", "(+ (d/dx (^ x 2)) 1)"),
-        ("d/dx 2x y", "(d/dx (* (* 2 x) y))"),
+        ("d/dx 2x y", "(d/dx (* 2 x y))"),
+        ("d/dx (-x)", "(d/dx (neg x))"),
+        ("d / dx + 1", "(+ (/ d dx) 1)"),
+        ("d/dx - 1", "(- (/ d dx) 1)"),
+        ("d/dx {x}", "(restrict (/ d dx) x)"),
         ("d/dx (x + 1)", "(d/dx (+ x 1))"),
         ("d^2/dx^2 x^3", "(d2/dx (^ x 3))"),
         ("d/dθ sin θ", "(d/dθ (call sin θ))"),
@@ -691,11 +787,12 @@ fn calculus() {
 #[test]
 fn units_and_conversion() {
     check_exprs(&[
-        ("5 km/h to m/s", "(to (/ (* 5 km) h) (/ m s))"),
+        ("5 km/h to m/s", "(to (*/ 5 *km /h) (/ m s))"),
         ("3 m to in", "(to (* 3 m) in)"),
         ("1 to a to b", "(to (to 1 a) b)"),
         ("x + 1 to y or z", "(to (+ x 1) (or y z))"),
-        ("2 kg m/s^2", "(/ (* (* 2 kg) m) (^ s 2))"),
+        ("2 kg m/s^2", "(*/ 2 *kg *m /(^ s 2))"),
+        ("1 kg m / s s", "(*/ 1 *kg *m /(* s s))"),
     ]);
 }
 
@@ -712,10 +809,21 @@ fn statements() {
         ("y = sin x", "(= y (call sin x))"),
         ("x^2 + y^2 = 4", "(= (+ (^ x 2) (^ y 2)) 4)"),
         ("x^2 + y^2 < 4", "(< (+ (^ x 2) (^ y 2)) 4)"),
+        ("y = x^2 {0 < x < 2}", "(= y (^ x 2) {(cmp 0 < x < 2)})"),
+        ("y = x {x > 0}{x < 1}", "(= y x {(> x 0) (< x 1)})"),
+        ("y = x {x > 0, x < 1}", "(= y x {(> x 0) (< x 1)})"),
         (
-            "y = x^2 {0 < x < 2}",
-            "(= y (restrict (^ x 2) (cmp 0 < x < 2)))",
+            "x^2 + y^2 = 4 {x > 0}",
+            "(= (+ (^ x 2) (^ y 2)) 4 {(> x 0)})",
         ),
+        (
+            "x^2 + y^2 < 4 {x > 0}",
+            "(where (< (+ (^ x 2) (^ y 2)) 4) {(> x 0)})",
+        ),
+        ("y1 ~ m x1 + b {x1 > 0}", "(~ y1 (+ (* m x1) b) {(> x1 0)})"),
+        ("(x {x > 0}) = 1", "(= (restrict x (> x 0)) 1)"),
+        ("a -> 1, b -> b + 1", "(actions (-> a 1) (-> b (+ b 1)))"),
+        ("a -> 1,\n b -> 2", "(actions (-> a 1) (-> b 2))"),
         ("y1 ~ m x1 + b", "(~ y1 (+ (* m x1) b))"),
         ("a -> a + 1", "(-> a (+ a 1))"),
         ("a → a + 1", "(-> a (+ a 1))"),
@@ -841,6 +949,14 @@ fn expression_errors() {
         ("(1, 2", 1, "expected `)`"),
         ("2 3", 1, "expected end of input"),
         ("a <", 1, "unexpected end of input"),
+        ("x^{2}", 1, "braces do not group"),
+        ("√{x}", 1, "braces do not group"),
+        ("sin^{2} x", 1, "braces do not group"),
+        ("d^3/dx^2 f", 1, "derivative order mismatch"),
+        ("d^0/dx^0 f", 1, "derivative order mismatch"),
+        ("|x", 1, "expected `|`"),
+        ("|x + 1", 1, "expected `|`"),
+        ("|a|b|", 1, "unexpected end of input"),
     ]);
 }
 
@@ -857,6 +973,11 @@ fn statement_errors() {
         ("if x { 1 } y", "expected end of statement"),
         ("a = 1\nb = 2", "expected end of input"),
         ("if x {", "unclosed block"),
+        ("let x = 3 {x > 0}", "expected end of statement"),
+        ("return x {x > 0}", "expected end of statement"),
+        ("a -> 1 {x > 0}", "expected end of statement"),
+        ("a -> 1, b", "expected `->`"),
+        ("y = x {x > 0} = 2", "expected end of statement"),
     ];
     for (src, needle) in cases {
         let errs = parse_statement(src).expect_err(src);
@@ -894,6 +1015,12 @@ fn program_error_recovery() {
     assert_eq!(errs.len(), 2, "{errs:?}");
     assert_eq!(sx_program(&prog), "(= b 2)");
 
+    // An unterminated string stops at the end of its line.
+    let (prog, errs) = parse_program_partial("s = \"ab\nx = 1");
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].message.contains("unterminated string"));
+    assert_eq!(sx_program(&prog), "(= s \"ab\") (= x 1)");
+
     // Lexical and syntax errors are reported together, sorted by position.
     let (_, errs) = parse_program_partial("x = 1 $\ny = 1 +");
     assert_eq!(errs.len(), 2, "{errs:?}");
@@ -922,17 +1049,15 @@ fn spans() {
     let src = "f(x) = 2 sin(x) + y_{1}";
     let s = stmt_ok(src);
     assert_eq!(s.span, Span::new(0, src.len()));
-    let StmtKind::Equation { lhs, rhs } = &s.kind else {
+    let StmtKind::Equation { lhs, rhs, .. } = &s.kind else {
         panic!("expected equation");
     };
     assert_eq!(&src[lhs.span.start..lhs.span.end], "f(x)");
     assert_eq!(&src[rhs.span.start..rhs.span.end], "2 sin(x) + y_{1}");
-    let ExprKind::Binary {
-        lhs: prod, rhs: y, ..
-    } = &rhs.kind
-    else {
+    let ExprKind::Add(terms) = &rhs.kind else {
         panic!("expected sum");
     };
+    let (prod, y) = (&terms[0].expr, &terms[1].expr);
     assert_eq!(&src[prod.span.start..prod.span.end], "2 sin(x)");
     assert_eq!(&src[y.span.start..y.span.end], "y_{1}");
 
@@ -953,6 +1078,131 @@ fn spans() {
 }
 
 // ---------------------------------------------------------------------------
+// Limits: deep nesting and long chains must not overflow the stack
+// ---------------------------------------------------------------------------
+
+/// Run `f` on a thread with a 2 MiB stack (the default for test threads,
+/// stated explicitly so the limit is part of the test).
+fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .expect("thread panicked (stack overflow?)");
+}
+
+fn head(src: &str) -> String {
+    src.chars().take(20).collect()
+}
+
+fn nest(open: &str, inner: &str, close: &str, n: usize) -> String {
+    format!("{}{inner}{}", open.repeat(n), close.repeat(n))
+}
+
+#[test]
+fn nesting_limit_errors() {
+    on_small_stack(|| {
+        let too_deep = [
+            nest("(", "x", ")", 300),
+            nest("[", "1", "]", 300),
+            nest("-", "x", "", 3000),
+            nest("not ", "x", "", 300),
+            nest("√", "x", "", 300),
+            nest("sin ", "x", "", 300),
+            nest("x^", "x", "", 300),
+            nest("|", "x", "|", 300),
+            nest("f(", "x", ")", 300),
+            nest("L[", "1", "]", 300),
+            nest("{x: ", "1", "}", 300),
+            nest("d/dx ", "x", "", 300),
+            nest("∑(k=1, 2) ", "k", "", 300),
+            nest("∫ ", "x", " dx", 300),
+            nest("-(", "x", ")", 200),
+            "1 mod ".repeat(300) + "1",
+            "1 to ".repeat(300) + "1",
+        ];
+        for src in &too_deep {
+            let errs = parse_expr(src).expect_err(&head(src));
+            assert!(
+                errs.iter().any(|e| e.message.contains("too")),
+                "{}…: {errs:?}",
+                &head(src)
+            );
+        }
+        let program = nest("if x {\n", "y", "\n}", 300);
+        let (_, errs) = parse_program_partial(&program);
+        assert!(errs.iter().any(|e| e.message.contains("nested too deeply")));
+    });
+}
+
+#[test]
+fn nesting_just_below_limit_round_trips() {
+    on_small_stack(|| {
+        let ok = [
+            nest("(", "x", ")", 250),
+            nest("[", "1", "]", 250),
+            nest("-", "x", "", 250),
+            nest("x^", "x", "", 250),
+            nest("|", "x", "|", 120),
+            nest("f(", "x", ")", 250),
+            nest("-(", "x", ")", 120),
+            nest("(1 + ", "x", ")", 250),
+            nest("{x: ", "1", "}", 250),
+        ];
+        for src in &ok {
+            let e = parse_expr(src).unwrap_or_else(|e| panic!("{}…: {e:?}", &head(src)));
+            roundtrip_expr(&head(src), &e);
+        }
+        let program = nest("if x {\n", "y", "\n}", 120);
+        let p = program_ok(&program);
+        roundtrip_program("nested ifs", &p);
+    });
+}
+
+#[test]
+fn long_chains_are_flat() {
+    on_small_stack(|| {
+        let n = 100_000;
+        for sep in ["+", "-", "*", "/", " ", " and ", " or "] {
+            let src = vec!["x"; n].join(sep);
+            let e = parse_expr(&src).unwrap_or_else(|e| panic!("{sep:?}: {e:?}"));
+            let len = match &e.kind {
+                ExprKind::Add(v) => v.len(),
+                ExprKind::Mul(v) => v.len(),
+                ExprKind::And(v) | ExprKind::Or(v) => v.len(),
+                other => panic!("{sep:?}: unexpected {other:?}"),
+            };
+            assert_eq!(len, n, "{sep:?}");
+            let printed = e.to_string();
+            let again = parse_expr(&printed).unwrap();
+            assert_eq!(again.without_spans(), e.without_spans());
+            drop(again);
+            drop(e);
+        }
+        // Long comparison chains and lists are flat as well.
+        let src = vec!["x"; n].join(" < ");
+        assert!(parse_expr(&src).is_ok());
+        let src = format!("[{}]", vec!["1"; n].join(", "));
+        assert!(parse_expr(&src).is_ok());
+        // Many statements.
+        let src = "a = 1\n".repeat(n);
+        assert_eq!(program_ok(&src).stmts.len(), n);
+    });
+}
+
+#[test]
+fn integral_header_scan_is_linear() {
+    // `∫(...)` scans its parentheses once; a long bound must stay fast.
+    let src = format!("∫({}x, 1) x dx", "x+".repeat(50_000));
+    let start = std::time::Instant::now();
+    assert!(parse_expr(&src).is_ok());
+    assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+    let src = format!("int({}x, 1) x dx", "x+".repeat(50_000));
+    assert!(parse_expr(&src).is_ok());
+}
+
+// ---------------------------------------------------------------------------
 // Pretty-printer
 // ---------------------------------------------------------------------------
 
@@ -964,7 +1214,23 @@ fn canonical_printing() {
         ("(-x)^2", "(-x)^2"),
         ("2^-3", "2^(-3)"),
         ("a - (b - c)", "a - (b - c)"),
-        ("(a - b) - c", "a - b - c"),
+        ("(a - b) - c", "(a - b) - c"),
+        ("a - b - c", "a - b - c"),
+        ("1/2x", "1 / (2 * x)"),
+        ("a / b * c", "a / b * c"),
+        ("(a * b) * c", "(a * b) * c"),
+        ("(a and b) and c", "(a and b) and c"),
+        ("a and b and c", "a and b and c"),
+        ("|x|", "abs(x)"),
+        ("sin", "(sin)"),
+        ("sin^2", "(sin)^2"),
+        ("(sin) - x", "(sin) - x"),
+        ("d / dx", "d / (dx)"),
+        ("d / dx(y)", "d/dx y"),
+        ("x^({a: 1})", "x^({a: 1})"),
+        ("d/dx (-x)", "d/dx (-x)"),
+        ("d/dx ({x > 0: 1})", "d/dx ({x > 0: 1})"),
+        ("L[[1, 2]]", "L[[1, 2]]"),
         ("2^(3^2)", "2^3^2"),
         ("x ≤ 1", "x <= 1"),
         ("√x", "sqrt(x)"),
@@ -1060,7 +1326,7 @@ fn gen_leaf(r: &mut Rng) -> ExprKind {
         },
         1 => ExprKind::Str(r.pick(&["", "a b", "q\"uote", "x\\y\n"]).into()),
         _ => ExprKind::Ident(
-            r.pick(&["x", "y", "a1", "θ", "π", "x_1", "km", "sin", "f"])
+            r.pick(&["x", "y", "a1", "θ", "π", "x_1", "km", "sin", "f", "d", "dt"])
                 .into(),
         ),
     }
@@ -1078,21 +1344,43 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
             op: [UnaryOp::Neg, UnaryOp::Pos, UnaryOp::Not][r.below(3) as usize],
             expr: sub(r),
         },
-        3..=6 => ExprKind::Binary {
-            op: [
-                BinOp::Add,
-                BinOp::Sub,
-                BinOp::Mul,
-                BinOp::Div,
-                BinOp::Mod,
-                BinOp::Pow,
-                BinOp::And,
-                BinOp::Or,
-                BinOp::To,
-            ][r.below(9) as usize],
+        3 => ExprKind::Binary {
+            op: [BinOp::Mod, BinOp::Pow, BinOp::To][r.below(3) as usize],
             lhs: sub(r),
             rhs: sub(r),
         },
+        4 => ExprKind::Add(
+            (0..2 + r.below(2))
+                .map(|i| Term {
+                    op: if i > 0 && r.below(2) == 0 {
+                        AddOp::Sub
+                    } else {
+                        AddOp::Add
+                    },
+                    expr: *sub(r),
+                })
+                .collect(),
+        ),
+        5 => ExprKind::Mul(
+            (0..2 + r.below(2))
+                .map(|i| Factor {
+                    op: if i > 0 && r.below(2) == 0 {
+                        MulOp::Div
+                    } else {
+                        MulOp::Mul
+                    },
+                    expr: *sub(r),
+                })
+                .collect(),
+        ),
+        6 => {
+            let items = (0..2 + r.below(2)).map(|_| *sub(r)).collect();
+            if r.below(2) == 0 {
+                ExprKind::And(items)
+            } else {
+                ExprKind::Or(items)
+            }
+        }
         7 => ExprKind::Postfix {
             op: if r.below(2) == 0 {
                 PostfixOp::Factorial
@@ -1128,7 +1416,7 @@ fn gen_expr(r: &mut Rng, depth: u32) -> ExprKind {
         },
         11 => ExprKind::Index {
             expr: sub(r),
-            index: sub(r),
+            indices: (0..1 + r.below(2)).map(|_| *sub(r)).collect(),
         },
         12 => ExprKind::List((0..r.below(3)).map(|_| *sub(r)).collect()),
         13 => ExprKind::Range {
@@ -1212,21 +1500,16 @@ fn gen_no_restrict(r: &mut Rng, depth: u32) -> ExprKind {
 /// The generator can produce a few shapes the parser never does; skip them.
 fn parser_producible(e: &Expr) -> bool {
     let mut ok = true;
-    visit(e, &mut |e| match &e.kind {
-        // `L[[x]]` is the canonical form of a one-element list index, but the
-        // parser never builds `Index` with an empty list.
-        ExprKind::Index { index, .. } => {
-            if matches!(&index.kind, ExprKind::List(v) if v.is_empty()) {
-                ok = false;
-            }
+    visit(e, &mut |e| {
+        // A differential-looking name inside an integrand is ambiguous
+        // (`∫ x dt dt`); the parser treats it as the end of the integrand.
+        if let ExprKind::Integral { body, .. } = &e.kind {
+            visit(body, &mut |b| {
+                if matches!(&b.kind, ExprKind::Ident(n) if parser::differential_var(n).is_some()) {
+                    ok = false;
+                }
+            });
         }
-        // `sin^-1 x` is rewritten to `arcsin`; avoid `sin^(-1)` callees.
-        ExprKind::Binary {
-            op: BinOp::Pow,
-            lhs,
-            ..
-        } if matches!(&lhs.kind, ExprKind::Ident(n) if n == "sin") => ok = false,
-        _ => {}
     });
     ok
 }
@@ -1253,11 +1536,15 @@ fn visit(e: &Expr, f: &mut impl FnMut(&Expr)) {
             go(callee);
             args.iter().for_each(go);
         }
-        ExprKind::Index { expr, index } => {
+        ExprKind::Index { expr, indices } => {
             go(expr);
-            go(index);
+            indices.iter().for_each(go);
         }
-        ExprKind::List(v) | ExprKind::Tuple(v) => v.iter().for_each(go),
+        ExprKind::Add(terms) => terms.iter().for_each(|t| go(&t.expr)),
+        ExprKind::Mul(factors) => factors.iter().for_each(|f| go(&f.expr)),
+        ExprKind::List(v) | ExprKind::Tuple(v) | ExprKind::And(v) | ExprKind::Or(v) => {
+            v.iter().for_each(go)
+        }
         ExprKind::Range { start, second, end } => {
             go(start);
             if let Some(s) = second {
@@ -1304,9 +1591,12 @@ fn visit(e: &Expr, f: &mut impl FnMut(&Expr)) {
 
 #[test]
 fn property_print_parse_roundtrip() {
-    let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+    // `VISCAS_PROPTEST_ITERS` / `VISCAS_PROPTEST_SEED` allow longer local runs.
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+    let iters = env("VISCAS_PROPTEST_ITERS").unwrap_or(3000) as u32;
+    let mut r = Rng(env("VISCAS_PROPTEST_SEED").unwrap_or(0x9E37_79B9_7F4A_7C15) | 1);
     let mut checked = 0;
-    for i in 0..3000 {
+    for i in 0..iters {
         let e = mk(gen_expr(&mut r, 1 + (i % 5)));
         if !parser_producible(&e) {
             continue;
@@ -1326,5 +1616,5 @@ fn property_print_parse_roundtrip() {
         );
         checked += 1;
     }
-    assert!(checked > 2000, "only {checked} trees checked");
+    assert!(checked * 3 > iters * 2, "only {checked} trees checked");
 }

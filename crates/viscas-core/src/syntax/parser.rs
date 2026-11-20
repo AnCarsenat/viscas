@@ -9,6 +9,17 @@ use super::token::{Keyword, Span, Token, TokenKind as T};
 
 type PResult<X> = Result<X, ParseError>;
 
+/// Maximum nesting depth (brackets, prefix operators, blocks, …) and
+/// maximum length of non-flattened left-assoc chains (`mod`, `to`).
+/// Together with flat n-ary sums/products this bounds the depth of every
+/// tree the parser builds, so printing and dropping stay shallow too.
+pub const MAX_DEPTH: usize = 256;
+
+/// Nesting levels parsed per stack segment (see `Parser::nested`).
+const STACK_SEGMENT_LEVELS: usize = 16;
+/// Stack size of each extra segment thread (~16 levels × 25 KiB in debug).
+const STACK_SEGMENT_BYTES: usize = 8 << 20;
+
 /// Functions that may be applied without parentheses (`sin x`, `ln 2x`).
 /// Identifiers starting with `log_` (`log_2 x`) are included as well.
 pub const PREFIX_FUNCTIONS: &[&str] = &[
@@ -45,21 +56,32 @@ pub fn differential_var(name: &str) -> Option<&str> {
 
 #[derive(Clone, Copy, Debug)]
 struct Ctx {
-    /// Inside `()`, `[]` or expression braces: newlines are insignificant.
+    /// Inside `()`, `[]`, `||` or expression braces: newlines are
+    /// insignificant.
     group: bool,
     /// `=` is an equality comparison (otherwise it ends the expression).
     allow_eq: bool,
-    /// A trailing `{...}` is a restriction (disabled in `if`/`while` heads).
+    /// A trailing `{...}` is an expression-level restriction. Off at
+    /// statement level (restrictions belong to the statement) and in
+    /// `if`/`while`/`for` heads (the `{` starts the body).
     allow_restrict: bool,
     /// Parsing an integrand: `dx`-style identifiers end the expression.
     in_integral: bool,
+    /// Directly inside `|...|`: a `|` in operator position closes it.
+    in_abs: bool,
 }
 
 const STMT_CTX: Ctx = Ctx {
     group: false,
     allow_eq: false,
-    allow_restrict: true,
+    allow_restrict: false,
     in_integral: false,
+    in_abs: false,
+};
+
+const EXPR_CTX: Ctx = Ctx {
+    allow_restrict: true,
+    ..STMT_CTX
 };
 
 const GROUP_CTX: Ctx = Ctx {
@@ -67,12 +89,14 @@ const GROUP_CTX: Ctx = Ctx {
     allow_eq: true,
     allow_restrict: true,
     in_integral: false,
+    in_abs: false,
 };
 
 pub(crate) struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     ctx: Ctx,
+    depth: usize,
     prev: Option<usize>,
     prev_end: usize,
     pub(crate) errors: Vec<ParseError>,
@@ -85,6 +109,7 @@ impl Parser {
             tokens,
             pos: 0,
             ctx: STMT_CTX,
+            depth: 0,
             prev: None,
             prev_end: 0,
             errors: Vec::new(),
@@ -97,7 +122,7 @@ impl Parser {
 
     pub(crate) fn expr_entry(&mut self) -> PResult<Expr> {
         self.skip_newlines();
-        let e = self.parse_expr()?;
+        let e = self.with_ctx(EXPR_CTX, |p| p.parse_expr())?;
         self.skip_newlines();
         self.expect_eof()?;
         Ok(e)
@@ -134,7 +159,11 @@ impl Parser {
 
     /// Index of the current token, skipping newlines inside groups.
     fn cur(&self) -> usize {
-        let mut i = self.pos;
+        self.skip_from(self.pos)
+    }
+
+    /// First token index at or after `i` that is not an insignificant newline.
+    fn skip_from(&self, mut i: usize) -> usize {
         if self.ctx.group {
             while matches!(self.tokens[i].kind, T::Newline) {
                 i += 1;
@@ -153,23 +182,14 @@ impl Parser {
 
     /// The `n`-th upcoming token (0 = current), skipping newlines in groups.
     fn look(&self, n: usize) -> &T {
-        let mut i = self.pos;
-        let mut left = n;
-        loop {
-            let kind = &self.tokens[i].kind;
-            if matches!(kind, T::Eof) {
-                return kind;
+        let mut i = self.cur();
+        for _ in 0..n {
+            if matches!(self.tokens[i].kind, T::Eof) {
+                break;
             }
-            if self.ctx.group && matches!(kind, T::Newline) {
-                i += 1;
-                continue;
-            }
-            if left == 0 {
-                return kind;
-            }
-            left -= 1;
-            i += 1;
+            i = self.skip_from(i + 1);
         }
+        &self.tokens[i].kind
     }
 
     fn prev_kind(&self) -> Option<&T> {
@@ -243,6 +263,52 @@ impl Parser {
         r
     }
 
+    /// Run `f` one nesting level deeper, failing past [`MAX_DEPTH`].
+    ///
+    /// Every [`STACK_SEGMENT_LEVELS`] levels the parse continues on a fresh
+    /// thread stack (a std-only equivalent of `stacker`), so the caller's
+    /// stack only ever holds a bounded number of recursive frames — even in
+    /// unoptimised builds, where one bracket level costs ~25 KiB.
+    fn nested<R: Send>(&mut self, f: impl FnOnce(&mut Self) -> PResult<R> + Send) -> PResult<R> {
+        if self.depth >= MAX_DEPTH {
+            return Err(ParseError::new(
+                self.peek_span(),
+                format!("expression nested too deeply (limit {MAX_DEPTH})"),
+            ));
+        }
+        self.depth += 1;
+        let r = if self.depth.is_multiple_of(STACK_SEGMENT_LEVELS) {
+            self.on_fresh_stack(f)
+        } else {
+            f(self)
+        };
+        self.depth -= 1;
+        r
+    }
+
+    #[cold]
+    fn on_fresh_stack<R: Send>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> PResult<R> + Send,
+    ) -> PResult<R> {
+        let span = self.peek_span();
+        std::thread::scope(|scope| {
+            let spawned = std::thread::Builder::new()
+                .name("viscas-parse".into())
+                .stack_size(STACK_SEGMENT_BYTES)
+                .spawn_scoped(scope, || f(self));
+            match spawned {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                Err(_) => Err(ParseError::new(
+                    span,
+                    "expression nested too deeply (out of stack space)",
+                )),
+            }
+        })
+    }
+
     fn node(&self, kind: ExprKind, start: usize) -> Expr {
         Expr::new(kind, Span::new(start, self.prev_end))
     }
@@ -309,9 +375,38 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
-        let stmt = self.with_ctx(STMT_CTX, |p| p.parse_stmt_inner())?;
+        let stmt = self.with_ctx(STMT_CTX, |p| p.nested(|p| p.parse_stmt_inner()))?;
         self.expect_terminator()?;
         Ok(stmt)
+    }
+
+    /// Trailing `{cond, ...}{...}` groups of a statement.
+    fn parse_restrictions(&mut self) -> PResult<Vec<Expr>> {
+        let mut conds = Vec::new();
+        while self.at(&T::LBrace) {
+            self.parse_brace_conds(&mut conds)?;
+        }
+        Ok(conds)
+    }
+
+    fn parse_brace_conds(&mut self, conds: &mut Vec<Expr>) -> PResult<()> {
+        let open = self.bump();
+        self.with_ctx(GROUP_CTX, |p| {
+            if p.at(&T::RBrace) {
+                return Err(ParseError::new(
+                    open.span.to(p.peek_span()),
+                    "empty restriction `{}`",
+                ));
+            }
+            loop {
+                conds.push(p.parse_expr()?);
+                if !p.eat(&T::Comma) {
+                    break;
+                }
+            }
+            p.expect(T::RBrace)?;
+            Ok(())
+        })
     }
 
     fn parse_stmt_inner(&mut self) -> PResult<Stmt> {
@@ -374,21 +469,47 @@ impl Parser {
             }
             _ => {
                 let lhs = self.parse_expr()?;
-                let make: fn(Expr, Expr) -> StmtKind = match self.peek() {
-                    T::Assign => |lhs, rhs| StmtKind::Equation { lhs, rhs },
-                    T::Tilde => |lhs, rhs| StmtKind::Regression { lhs, rhs },
-                    T::Arrow => |target, value| StmtKind::Action { target, value },
-                    _ => {
-                        return Ok(Stmt {
-                            span: lhs.span,
-                            kind: StmtKind::Expr(lhs),
-                        });
+                match self.peek() {
+                    T::Assign | T::Tilde => {
+                        let is_eq = self.bump().kind == T::Assign;
+                        self.skip_newlines();
+                        let rhs = self.parse_expr()?;
+                        let restrictions = self.parse_restrictions()?;
+                        if is_eq {
+                            StmtKind::Equation {
+                                lhs,
+                                rhs,
+                                restrictions,
+                            }
+                        } else {
+                            StmtKind::Regression {
+                                lhs,
+                                rhs,
+                                restrictions,
+                            }
+                        }
                     }
-                };
-                self.bump();
-                self.skip_newlines();
-                let rhs = self.parse_expr()?;
-                make(lhs, rhs)
+                    T::Arrow => {
+                        self.bump();
+                        self.skip_newlines();
+                        let mut actions = vec![(lhs, self.parse_expr()?)];
+                        while self.eat(&T::Comma) {
+                            self.skip_newlines();
+                            let target = self.parse_expr()?;
+                            self.expect(T::Arrow)?;
+                            self.skip_newlines();
+                            actions.push((target, self.parse_expr()?));
+                        }
+                        StmtKind::Action { actions }
+                    }
+                    _ => {
+                        let restrictions = self.parse_restrictions()?;
+                        StmtKind::Expr {
+                            expr: lhs,
+                            restrictions,
+                        }
+                    }
+                }
             }
         };
         Ok(Stmt {
@@ -416,7 +537,7 @@ impl Parser {
         self.skip_newlines();
         let otherwise = if self.eat(&T::Keyword(Keyword::Else)) {
             if self.at(&T::Keyword(Keyword::If)) {
-                Some(ElseBranch::If(Box::new(self.parse_if()?)))
+                Some(ElseBranch::If(Box::new(self.nested(|p| p.parse_if())?)))
             } else {
                 Some(ElseBranch::Block(self.parse_block()?))
             }
@@ -456,77 +577,81 @@ impl Parser {
     // ------------------------------------------------------------------
 
     pub(crate) fn parse_expr(&mut self) -> PResult<Expr> {
-        let e = self.parse_to()?;
-        if !(self.ctx.allow_restrict && self.at(&T::LBrace)) {
-            return Ok(e);
-        }
-        let mut conds = Vec::new();
-        while self.ctx.allow_restrict && self.at(&T::LBrace) {
-            let open = self.bump();
-            self.with_ctx(GROUP_CTX, |p| -> PResult<()> {
-                if p.at(&T::RBrace) {
-                    return Err(ParseError::new(
-                        open.span.to(p.peek_span()),
-                        "empty restriction `{}`",
-                    ));
-                }
-                loop {
-                    conds.push(p.parse_expr()?);
-                    if !p.eat(&T::Comma) {
-                        break;
-                    }
-                }
-                p.expect(T::RBrace)?;
-                Ok(())
-            })?;
-        }
-        let start = e.span.start;
-        Ok(self.node(
-            ExprKind::Restrict {
-                expr: Box::new(e),
-                conds,
-            },
-            start,
-        ))
+        self.nested(|p| {
+            let e = p.parse_to()?;
+            if !(p.ctx.allow_restrict && p.at(&T::LBrace)) {
+                return Ok(e);
+            }
+            let mut conds = Vec::new();
+            while p.at(&T::LBrace) {
+                p.parse_brace_conds(&mut conds)?;
+            }
+            let start = e.span.start;
+            Ok(p.node(
+                ExprKind::Restrict {
+                    expr: Box::new(e),
+                    conds,
+                },
+                start,
+            ))
+        })
     }
 
-    fn binary_left(
-        &mut self,
-        next: fn(&mut Self) -> PResult<Expr>,
-        op_of: fn(&T) -> Option<BinOp>,
-    ) -> PResult<Expr> {
-        let mut lhs = next(self)?;
-        while let Some(op) = op_of(self.peek()) {
+    fn chain_too_long(&self, op: &str) -> ParseError {
+        ParseError::new(
+            self.peek_span(),
+            format!("too many chained `{op}` operators (limit {MAX_DEPTH})"),
+        )
+    }
+
+    fn parse_to(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_or()?;
+        let mut count = 0;
+        while self.at(&T::Keyword(Keyword::To)) {
+            count += 1;
+            if count > MAX_DEPTH {
+                return Err(self.chain_too_long("to"));
+            }
             self.bump();
             self.skip_newlines();
-            let rhs = next(self)?;
-            lhs = binary(op, lhs, rhs);
+            let rhs = self.parse_or()?;
+            lhs = binary(BinOp::To, lhs, rhs);
         }
         Ok(lhs)
     }
 
-    fn parse_to(&mut self) -> PResult<Expr> {
-        self.binary_left(Self::parse_or, |t| {
-            matches!(t, T::Keyword(Keyword::To)).then_some(BinOp::To)
-        })
+    /// `next (kw next)*` collected into a flat list.
+    fn parse_nary(
+        &mut self,
+        kw: Keyword,
+        next: fn(&mut Self) -> PResult<Expr>,
+        make: fn(Vec<Expr>) -> ExprKind,
+    ) -> PResult<Expr> {
+        let first = next(self)?;
+        if !self.at(&T::Keyword(kw)) {
+            return Ok(first);
+        }
+        let start = first.span.start;
+        let mut items = vec![first];
+        while self.eat(&T::Keyword(kw)) {
+            self.skip_newlines();
+            items.push(next(self)?);
+        }
+        Ok(self.node(make(items), start))
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
-        self.binary_left(Self::parse_and, |t| {
-            matches!(t, T::Keyword(Keyword::Or)).then_some(BinOp::Or)
-        })
+        self.parse_nary(Keyword::Or, Self::parse_and, ExprKind::Or)
     }
 
     fn parse_and(&mut self) -> PResult<Expr> {
-        self.binary_left(Self::parse_not, |t| {
-            matches!(t, T::Keyword(Keyword::And)).then_some(BinOp::And)
-        })
+        self.parse_nary(Keyword::And, Self::parse_not, ExprKind::And)
     }
 
     fn parse_not(&mut self) -> PResult<Expr> {
         if self.at(&T::Keyword(Keyword::Not)) {
             let start = self.bump().span.start;
-            let e = self.parse_not()?;
+            let e = self.nested(|p| p.parse_not())?;
             return Ok(self.node(
                 ExprKind::Unary {
                     op: UnaryOp::Not,
@@ -570,43 +695,133 @@ impl Parser {
     }
 
     fn parse_additive(&mut self) -> PResult<Expr> {
-        self.binary_left(Self::parse_multiplicative, |t| match t {
-            T::Plus => Some(BinOp::Add),
-            T::Minus => Some(BinOp::Sub),
-            _ => None,
-        })
-    }
-
-    fn parse_multiplicative(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_unary()?;
+        let first = self.parse_multiplicative()?;
+        let mut terms = vec![Term {
+            op: AddOp::Add,
+            expr: first,
+        }];
         loop {
             let op = match self.peek() {
-                T::Star => BinOp::Mul,
-                T::Slash => BinOp::Div,
-                T::Keyword(Keyword::Mod) => BinOp::Mod,
-                _ if self.starts_implicit_operand() => {
-                    let rhs = self.parse_power()?;
-                    lhs = binary(BinOp::Mul, lhs, rhs);
-                    continue;
-                }
+                T::Plus => AddOp::Add,
+                T::Minus => AddOp::Sub,
                 _ => break,
             };
             self.bump();
             self.skip_newlines();
-            let rhs = self.parse_unary()?;
-            lhs = binary(op, lhs, rhs);
+            let expr = self.parse_multiplicative()?;
+            terms.push(Term { op, expr });
         }
-        Ok(lhs)
+        Ok(collapse_add(terms))
+    }
+
+    /// Products: `*`, `/`, `mod` and implicit multiplication, all at one
+    /// precedence level, left to right. The right operand of `/` absorbs
+    /// following implicit factors (`1/2x` = `1/(2x)`).
+    fn parse_multiplicative(&mut self) -> PResult<Expr> {
+        let first = self.parse_unary()?;
+        let mut factors = vec![Factor {
+            op: MulOp::Mul,
+            expr: first,
+        }];
+        let mut mods = 0;
+        loop {
+            match self.peek() {
+                T::Star => {
+                    self.bump();
+                    self.skip_newlines();
+                    let expr = self.parse_unary()?;
+                    factors.push(Factor {
+                        op: MulOp::Mul,
+                        expr,
+                    });
+                }
+                T::Slash => {
+                    self.bump();
+                    self.skip_newlines();
+                    let expr = self.parse_implicit_product()?;
+                    factors.push(Factor {
+                        op: MulOp::Div,
+                        expr,
+                    });
+                }
+                T::Keyword(Keyword::Mod) => {
+                    mods += 1;
+                    if mods > MAX_DEPTH {
+                        return Err(self.chain_too_long("mod"));
+                    }
+                    self.bump();
+                    self.skip_newlines();
+                    let rhs = self.parse_unary()?;
+                    let lhs = collapse_mul(std::mem::take(&mut factors));
+                    factors.push(Factor {
+                        op: MulOp::Mul,
+                        expr: binary(BinOp::Mod, lhs, rhs),
+                    });
+                }
+                _ if self.starts_implicit_operand() => {
+                    let expr = self.parse_power()?;
+                    factors.push(Factor {
+                        op: MulOp::Mul,
+                        expr,
+                    });
+                }
+                _ => break,
+            }
+        }
+        Ok(collapse_mul(factors))
+    }
+
+    /// A signed power term followed by implicitly multiplied power terms;
+    /// stops at explicit operators. With `stop_at_fn`, also stops before a
+    /// prefix function name (`sin x cos x`).
+    fn parse_juxtaposed(&mut self, stop_at_fn: bool) -> PResult<Expr> {
+        let first = self.parse_unary()?;
+        let mut factors = vec![Factor {
+            op: MulOp::Mul,
+            expr: first,
+        }];
+        while self.starts_implicit_operand()
+            && !(stop_at_fn && matches!(self.peek(), T::Ident(n) if is_prefix_function(n)))
+        {
+            let expr = self.parse_power()?;
+            factors.push(Factor {
+                op: MulOp::Mul,
+                expr,
+            });
+        }
+        Ok(collapse_mul(factors))
+    }
+
+    /// Right operand of `/`.
+    fn parse_implicit_product(&mut self) -> PResult<Expr> {
+        self.parse_juxtaposed(false)
+    }
+
+    /// Argument of a paren-less prefix function or `√`.
+    fn parse_fn_arg(&mut self) -> PResult<Expr> {
+        self.nested(|p| {
+            if p.at(&T::LBrace) {
+                return Err(p.brace_group_error());
+            }
+            p.parse_juxtaposed(true)
+        })
+    }
+
+    fn brace_group_error(&self) -> ParseError {
+        ParseError::new(
+            self.peek_span(),
+            "braces do not group here; use parentheses, e.g. `x^(2)` or `sqrt(x)`",
+        )
     }
 
     /// Can the next token start an implicitly multiplied operand?
     fn starts_implicit_operand(&self) -> bool {
         let after_number = matches!(self.prev_kind(), Some(T::Number { .. }));
-        let in_integral = self.ctx.in_integral;
         match self.peek() {
             T::Number { .. } => !after_number,
-            T::Ident(name) => !(in_integral && differential_var(name).is_some()),
+            T::Ident(name) => !(self.ctx.in_integral && differential_var(name).is_some()),
             T::LParen | T::Sqrt | T::Cbrt | T::Integral | T::Sum | T::Product => true,
+            T::Bar => !self.ctx.in_abs,
             T::LBracket => after_number,
             _ => false,
         }
@@ -619,7 +834,7 @@ impl Parser {
             _ => return self.parse_power(),
         };
         let start = self.bump().span.start;
-        let e = self.parse_unary()?;
+        let e = self.nested(|p| p.parse_unary())?;
         Ok(self.node(
             ExprKind::Unary {
                 op,
@@ -641,20 +856,23 @@ impl Parser {
 
     /// Right operand of `^`: allows a leading sign (`2^-3`), right-assoc.
     fn parse_exponent(&mut self) -> PResult<Expr> {
-        let op = match self.peek() {
-            T::Minus => UnaryOp::Neg,
-            T::Plus => UnaryOp::Pos,
-            _ => return self.parse_power(),
-        };
-        let start = self.bump().span.start;
-        let e = self.parse_exponent()?;
-        Ok(self.node(
-            ExprKind::Unary {
-                op,
-                expr: Box::new(e),
-            },
-            start,
-        ))
+        self.nested(|p| {
+            let op = match p.peek() {
+                T::Minus => UnaryOp::Neg,
+                T::Plus => UnaryOp::Pos,
+                T::LBrace => return Err(p.brace_group_error()),
+                _ => return p.parse_power(),
+            };
+            let start = p.bump().span.start;
+            let e = p.parse_exponent()?;
+            Ok(p.node(
+                ExprKind::Unary {
+                    op,
+                    expr: Box::new(e),
+                },
+                start,
+            ))
+        })
     }
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
@@ -674,18 +892,19 @@ impl Parser {
                 }
                 T::LBracket if !matches!(self.prev_kind(), Some(T::Number { .. })) => {
                     let open = self.bump();
-                    let inner = self.with_ctx(GROUP_CTX, |p| p.parse_bracket_body(open.span))?;
-                    let index = match inner.kind {
-                        ExprKind::List(mut items) if items.len() == 1 => items.pop().unwrap(),
+                    let inner = self
+                        .with_ctx(GROUP_CTX, |p| p.nested(|p| p.parse_bracket_body(open.span)))?;
+                    let indices = match inner.kind {
                         ExprKind::List(items) if items.is_empty() => {
                             return Err(ParseError::new(inner.span, "empty index `[]`"));
                         }
-                        kind => Expr::new(kind, inner.span),
+                        ExprKind::List(items) => items,
+                        kind => vec![Expr::new(kind, inner.span)],
                     };
                     e = self.node(
                         ExprKind::Index {
                             expr: Box::new(e),
-                            index: Box::new(index),
+                            indices,
                         },
                         start,
                     );
@@ -853,7 +1072,7 @@ impl Parser {
                     }
                     p.expect(T::RParen)?;
                     if items.len() == 1 {
-                        let mut e = items.pop().unwrap();
+                        let mut e = items.pop().expect("one element");
                         e.span = Span::new(start, p.prev_end);
                         Ok(e)
                     } else {
@@ -866,10 +1085,33 @@ impl Parser {
                 self.with_ctx(GROUP_CTX, |p| p.parse_bracket_body(tok.span))
             }
             T::LBrace => self.parse_piecewise(tok.span),
+            T::Bar => {
+                self.bump();
+                let ctx = Ctx {
+                    in_abs: true,
+                    ..GROUP_CTX
+                };
+                let inner = self.with_ctx(ctx, |p| -> PResult<Expr> {
+                    let e = p.parse_expr()?;
+                    if !p.at(&T::Bar) {
+                        return Err(p.unexpected("`|` closing the absolute value"));
+                    }
+                    p.bump();
+                    Ok(e)
+                })?;
+                let callee = Expr::new(ExprKind::Ident("abs".into()), tok.span);
+                Ok(self.node(
+                    ExprKind::Call {
+                        callee: Box::new(callee),
+                        args: vec![inner],
+                    },
+                    start,
+                ))
+            }
             T::Sqrt | T::Cbrt => {
                 self.bump();
                 let name = if tok.kind == T::Sqrt { "sqrt" } else { "cbrt" };
-                let arg = self.parse_exponent()?;
+                let arg = self.parse_fn_arg()?;
                 let callee = Expr::new(ExprKind::Ident(name.into()), tok.span);
                 Ok(self.node(
                     ExprKind::Call {
@@ -879,9 +1121,9 @@ impl Parser {
                     start,
                 ))
             }
-            T::Integral => self.parse_integral(),
-            T::Sum => self.parse_bigop(BigOpKind::Sum),
-            T::Product => self.parse_bigop(BigOpKind::Product),
+            T::Integral => self.nested(|p| p.parse_integral()),
+            T::Sum => self.nested(|p| p.parse_bigop(BigOpKind::Sum)),
+            T::Product => self.nested(|p| p.parse_bigop(BigOpKind::Product)),
             T::Eof => Err(ParseError::new(
                 tok.span,
                 "unexpected end of input, expected an expression",
@@ -902,12 +1144,12 @@ impl Parser {
             ));
         }
         if name == "d"
-            && let Some((var, order, len)) = self.derivative_header()
+            && let Some((var, order, len)) = self.derivative_header()?
         {
             for _ in 0..len {
                 self.bump();
             }
-            let body = self.parse_multiplicative()?;
+            let body = self.nested(|p| p.parse_multiplicative())?;
             return Ok(self.node(
                 ExprKind::Derivative {
                     var,
@@ -927,12 +1169,13 @@ impl Parser {
             } else {
                 BigOpKind::Product
             };
-            return self.parse_bigop(op);
+            return self.nested(|p| p.parse_bigop(op));
         }
         if name == "int" && matches!(self.look(1), T::LParen) {
-            let (one_comma, after) = self.paren_shape(1);
-            if one_comma && can_start_operand(self.look(after)) {
-                return self.parse_integral();
+            let open = self.skip_from(self.cur() + 1);
+            let (one_comma, after) = self.paren_shape(open);
+            if one_comma && can_start_operand(&self.tokens[after].kind) {
+                return self.nested(|p| p.parse_integral());
             }
         }
         self.bump();
@@ -956,8 +1199,7 @@ impl Parser {
                 _ => None,
             };
             let arg = if self.at(&T::LParen) {
-                let args = self.parse_call_args()?;
-                Some(args)
+                Some(self.parse_call_args()?)
             } else if self.starts_implicit_operand() {
                 Some(vec![self.parse_fn_arg()?])
             } else {
@@ -987,7 +1229,10 @@ impl Parser {
                 }
             });
         }
-        if !self.at(&T::LParen) && self.starts_implicit_operand() {
+        // Paren-less application: `sin x`, `sin 2x`, `sin -x`.
+        if !self.at(&T::LParen)
+            && (self.starts_implicit_operand() || matches!(self.peek(), T::Minus | T::Plus))
+        {
             let arg = self.parse_fn_arg()?;
             return Ok(self.node(
                 ExprKind::Call {
@@ -1000,23 +1245,9 @@ impl Parser {
         Ok(ident)
     }
 
-    /// Argument of a paren-less prefix function: a juxtaposition of power
-    /// terms, stopping before explicit operators and before the next prefix
-    /// function name (`sin x cos x` = `sin(x) * cos(x)`).
-    fn parse_fn_arg(&mut self) -> PResult<Expr> {
-        let mut arg = self.parse_power()?;
-        while self.starts_implicit_operand()
-            && !matches!(self.peek(), T::Ident(n) if is_prefix_function(n))
-        {
-            let rhs = self.parse_power()?;
-            arg = binary(BinOp::Mul, arg, rhs);
-        }
-        Ok(arg)
-    }
-
     /// Matches `d/dx` or `d^n/dx^n` at the current position (which holds the
     /// `d`) when an operand follows. Returns `(var, order, token count)`.
-    fn derivative_header(&self) -> Option<(String, u32, usize)> {
+    fn derivative_header(&self) -> PResult<Option<(String, u32, usize)>> {
         let diff = |t: &T| match t {
             T::Ident(n) => differential_var(n).map(str::to_string),
             _ => None,
@@ -1029,38 +1260,49 @@ impl Parser {
             _ => None,
         };
         let (var, order, len) = if matches!(self.look(1), T::Slash) {
-            (diff(self.look(2))?, 1, 3)
+            match diff(self.look(2)) {
+                Some(v) => (v, 1, 3),
+                None => return Ok(None),
+            }
         } else if matches!(self.look(1), T::Caret)
             && matches!(self.look(3), T::Slash)
             && matches!(self.look(5), T::Caret)
         {
-            let n = int(self.look(2))?;
-            let var = diff(self.look(4))?;
-            if int(self.look(6))? != n || n == 0 {
-                return None;
+            let (Some(n), Some(var), Some(m)) =
+                (int(self.look(2)), diff(self.look(4)), int(self.look(6)))
+            else {
+                return Ok(None);
+            };
+            if n != m || n == 0 {
+                return Err(ParseError::new(
+                    self.peek_span(),
+                    format!(
+                        "derivative order mismatch: `d^{n}/d{var}^{m}` (orders must match and be positive)"
+                    ),
+                ));
             }
             (var, n, 7)
         } else {
-            return None;
+            return Ok(None);
         };
-        can_start_operand(self.look(len)).then_some((var, order, len))
+        Ok(can_start_derivative_body(self.look(len)).then_some((var, order, len)))
     }
 
-    /// Starting at lookahead `n` (a `(`), scan to the matching `)`.
-    /// Returns (whether it holds exactly one top-level comma, lookahead
-    /// index just past the `)`).
-    fn paren_shape(&self, n: usize) -> (bool, usize) {
+    /// Scan from token index `open` (a `(`) to the matching `)`. Returns
+    /// whether it holds exactly one top-level comma, and the index of the
+    /// first significant token after the `)`.
+    fn paren_shape(&self, open: usize) -> (bool, usize) {
         let mut depth = 0usize;
         let mut commas = 0;
-        let mut i = n;
+        let mut i = open;
         loop {
-            match self.look(i) {
+            match self.tokens[i].kind {
                 T::Eof => return (false, i),
                 T::LParen | T::LBracket | T::LBrace => depth += 1,
                 T::RParen | T::RBracket | T::RBrace => {
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
-                        return (commas == 1, i + 1);
+                        return (commas == 1, self.skip_from(i + 1));
                     }
                 }
                 T::Comma if depth == 1 => commas += 1,
@@ -1072,7 +1314,7 @@ impl Parser {
 
     fn parse_integral(&mut self) -> PResult<Expr> {
         let start = self.bump().span.start;
-        let bounds = if self.at(&T::LParen) && self.paren_shape(0).0 {
+        let bounds = if self.at(&T::LParen) && self.paren_shape(self.cur()).0 {
             self.bump();
             Some(self.with_ctx(GROUP_CTX, |p| -> PResult<_> {
                 let lo = p.parse_expr()?;
@@ -1091,11 +1333,13 @@ impl Parser {
         let body = self.with_ctx(ctx, |p| p.parse_additive())?;
         let var = match self.peek() {
             T::Ident(n) if differential_var(n).is_some() => {
-                let v = differential_var(n).unwrap().to_string();
+                let v = differential_var(n).unwrap_or_default().to_string();
                 self.bump();
                 v
             }
-            _ => return Err(self.unexpected("differential (e.g. `dx`) closing the integral")),
+            _ => {
+                return Err(self.unexpected("differential (e.g. `dx`) closing the integral"));
+            }
         };
         Ok(self.node(
             ExprKind::Integral {
@@ -1188,6 +1432,25 @@ fn binary(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
     )
 }
 
+fn collapse_add(mut terms: Vec<Term>) -> Expr {
+    if terms.len() == 1 {
+        return terms.pop().expect("one term").expr;
+    }
+    let span = terms[0].expr.span.to(terms[terms.len() - 1].expr.span);
+    Expr::new(ExprKind::Add(terms), span)
+}
+
+fn collapse_mul(mut factors: Vec<Factor>) -> Expr {
+    if factors.len() == 1 {
+        return factors.pop().expect("one factor").expr;
+    }
+    let span = factors[0]
+        .expr
+        .span
+        .to(factors[factors.len() - 1].expr.span);
+    Expr::new(ExprKind::Mul(factors), span)
+}
+
 fn is_callable(e: &Expr) -> bool {
     matches!(
         e.kind,
@@ -1197,6 +1460,13 @@ fn is_callable(e: &Expr) -> bool {
 
 /// Tokens that can begin an operand (used for lookahead decisions).
 fn can_start_operand(t: &T) -> bool {
+    can_start_derivative_body(t) || matches!(t, T::LBrace | T::Minus | T::Plus)
+}
+
+/// Tokens that may follow `d/dx` for it to be a derivative. Signs and `{`
+/// are excluded so `d/dx + 1` stays a division and `d/dx {…}` a restriction;
+/// write `d/dx (-x)` instead.
+fn can_start_derivative_body(t: &T) -> bool {
     matches!(
         t,
         T::Number { .. }
@@ -1204,9 +1474,7 @@ fn can_start_operand(t: &T) -> bool {
             | T::Str(_)
             | T::LParen
             | T::LBracket
-            | T::LBrace
-            | T::Minus
-            | T::Plus
+            | T::Bar
             | T::Sqrt
             | T::Cbrt
             | T::Integral
