@@ -42,7 +42,8 @@ fn as_float(n: &Number, bits: u64) -> Cow<'_, BigFloat> {
         Number::Float(f) => Cow::Borrowed(f),
         Number::Integer(i) => Cow::Owned(BigFloat::from_bigint(i, bits)),
         Number::Rational(r) => Cow::Owned(BigFloat::from_ratio(r.numer(), r.denom(), bits)),
-        _ => unreachable!("float-compatible operand expected"),
+        Number::F64(x) => Cow::Owned(f64_big(*x)),
+        Number::Complex(_) => unreachable!("real operand expected"),
     }
 }
 
@@ -61,7 +62,16 @@ fn real_pair<'a>(a: &'a Number, b: &'a Number) -> RealPair<'a> {
             };
             RealPair::Float(as_float(a, bits), as_float(b, bits))
         }
-        3 => RealPair::F64(a.to_f64(), b.to_f64()),
+        3 => {
+            let (x, y) = (a.to_f64(), b.to_f64());
+            if x.is_finite() && y.is_finite() {
+                RealPair::F64(x, y)
+            } else {
+                // An exact or Float operand outside the f64 range: compute
+                // with 53-bit floats instead of producing inf/NaN.
+                RealPair::Float(as_float(a, 53), as_float(b, 53))
+            }
+        }
         _ => unreachable!("real operands expected"),
     }
 }
@@ -247,6 +257,12 @@ impl Number {
         if self.is_real() && other.is_real() {
             return real_div(self, other);
         }
+        if has_f64_part(self) || has_f64_part(other) {
+            // Avoid under/overflow of c² + d² in f64: divide with 53-bit
+            // floats (unbounded exponent range), then convert back.
+            let q = f64_parts_to_big(self).checked_div(&f64_parts_to_big(other))?;
+            return Ok(q.into_f64_kind());
+        }
         match other {
             Number::Complex(c) => {
                 // (a+bi)/(c+di) = (a+bi)(c-di) / (c²+d²)
@@ -276,17 +292,11 @@ impl Number {
             (Integer(_) | Rational(_), Integer(_) | Rational(_)) => {
                 as_rat(self).as_ref().cmp(as_rat(other).as_ref())
             }
-            _ => {
-                let fa = self.to_bigfloat(Precision::DEFAULT);
-                let fb = other.to_bigfloat(Precision::DEFAULT);
-                match (self, other) {
-                    (Integer(_) | Rational(_), _) => {
-                        fb.expect("real").cmp_rational(&as_rat(self)).reverse()
-                    }
-                    (_, Integer(_) | Rational(_)) => fa.expect("real").cmp_rational(&as_rat(other)),
-                    _ => fa.expect("real").cmp_value(&fb.expect("real")),
-                }
+            (Integer(_) | Rational(_), _) => {
+                as_float(other, 53).cmp_rational(&as_rat(self)).reverse()
             }
+            (_, Integer(_) | Rational(_)) => as_float(self, 53).cmp_rational(&as_rat(other)),
+            _ => as_float(self, 53).cmp_value(&as_float(other, 53)),
         })
     }
 
@@ -343,33 +353,58 @@ impl Number {
         self.round_with(|r| r.trunc().to_integer(), BigFloat::trunc, f64::trunc)
     }
 
-    /// Absolute value (modulus for complex numbers, exact when possible).
+    /// Absolute value (modulus for complex numbers, exact when possible,
+    /// otherwise at the default precision or that of the parts).
     pub fn abs(&self) -> Number {
+        self.abs_prec(Precision::DEFAULT)
+    }
+
+    /// Absolute value; the modulus of a complex number is computed at `prec`
+    /// (or the precision of its float parts, if larger).
+    pub fn abs_prec(&self, prec: Precision) -> Number {
         match self {
             Number::Integer(n) => Number::Integer(n.abs()),
             Number::Rational(r) => Number::Rational(r.abs()),
             Number::Float(f) => Number::Float(f.abs()),
             Number::F64(x) => Number::F64(x.abs()),
+            Number::Complex(_) if has_f64_part(self) => {
+                // hypot without f64 under/overflow
+                f64_parts_to_big(self).abs_prec(prec).into_f64_kind()
+            }
             Number::Complex(c) => {
+                // Float squares cannot underflow (unbounded exponent).
                 let sq = &c.re * &c.re + &c.im * &c.im;
-                sq.sqrt(self.working_prec(Precision::DEFAULT))
-                    .expect("non-negative")
+                sq.sqrt(self.working_prec(prec))
+                    .expect("square root of a non-negative real")
             }
         }
     }
 
-    /// Sign: -1, 0 or 1 for reals (exact integer); `z/|z|` for complex numbers.
-    pub fn sign(&self) -> Number {
+    /// Sign: -1, 0 or 1 for reals (exact integer, `F64` for `F64`); `z/|z|`
+    /// for complex numbers (at the default precision).
+    pub fn sign(&self) -> NumResult<Number> {
+        self.sign_prec(Precision::DEFAULT)
+    }
+
+    /// Sign, with `z/|z|` for complex numbers computed at `prec`.
+    pub fn sign_prec(&self, prec: Precision) -> NumResult<Number> {
         match self.signum_i32() {
-            Some(s) => match self {
+            Some(s) => Ok(match self {
                 Number::F64(_) => Number::F64(s as f64),
                 _ => Number::from(s),
-            },
-            None => self.checked_div(&self.abs()).expect("non-zero"),
+            }),
+            None => {
+                let m = self.abs_prec(prec);
+                if m.is_zero() {
+                    return Err(NumberError::Domain("sign of a vanishing complex number"));
+                }
+                self.checked_div(&m)
+            }
         }
     }
 
-    /// Mathematical modulo: `a - b·floor(a/b)`, result has the sign of `b`.
+    /// Mathematical modulo: `a - b·floor(a/b)`, result has the sign of `b`
+    /// (and `|result| < |b|`).
     pub fn modulo(&self, b: &Number) -> NumResult<Number> {
         if self.is_complex() || b.is_complex() {
             return Err(NumberError::NotReal);
@@ -381,12 +416,28 @@ impl Number {
             (Number::Integer(x), Number::Integer(y)) => Ok(Number::Integer(x.mod_floor(y))),
             (Number::F64(_), _) | (_, Number::F64(_)) => {
                 let (x, y) = (self.to_f64(), b.to_f64());
-                Ok(Number::F64(x - y * (x / y).floor()))
+                if x.is_finite() && y.is_finite() {
+                    // `%` is exact in IEEE arithmetic; fix the sign afterwards.
+                    let mut r = x % y;
+                    if r != 0.0 && (r < 0.0) != (y < 0.0) {
+                        r += y;
+                    }
+                    if r.abs() >= y.abs() {
+                        r = 0.0;
+                    }
+                    return Ok(Number::F64(r));
+                }
+                let r = f64_parts_to_big(self).modulo(&f64_parts_to_big(b))?;
+                Ok(r.into_f64_kind())
             }
-            _ => {
+            (
+                Number::Integer(_) | Number::Rational(_),
+                Number::Integer(_) | Number::Rational(_),
+            ) => {
                 let q = self.checked_div(b)?.floor()?;
                 Ok(self - &(b * &q))
             }
+            _ => float_modulo(self, b),
         }
     }
 
@@ -408,47 +459,45 @@ impl Number {
         Ok(Number::from_ratio(BigRational::new(num, den)))
     }
 
-    /// The exact integer value, or [`NumberError::NotInteger`].
-    pub fn expect_integer(&self) -> NumResult<&BigInt> {
-        self.as_integer().ok_or(match self {
-            Number::Complex(_) => NumberError::NotReal,
-            _ => NumberError::NotInteger,
-        })
+    /// `x!`: exact for non-negative integers (including integral floats such
+    /// as `5.0`), `Γ(x + 1)` numerically for other reals.
+    /// Negative integers are a domain error.
+    pub fn factorial(&self, prec: Precision) -> NumResult<Number> {
+        match self.integer_value() {
+            Ok(n) => super::theory::factorial(&n).map(Number::Integer),
+            Err(NumberError::NotInteger) => (self + &Number::one()).gamma(prec),
+            Err(e) => Err(e),
+        }
     }
 
-    /// `n!` for an exact non-negative integer.
-    pub fn factorial(&self) -> NumResult<Number> {
-        super::theory::factorial(self.expect_integer()?).map(Number::Integer)
-    }
-
-    /// Binomial coefficient `nCr(self, k)` for exact integers.
+    /// Binomial coefficient `nCr(self, k)` for integers.
     pub fn ncr(&self, k: &Number) -> NumResult<Number> {
-        super::theory::n_choose_k(self.expect_integer()?, k.expect_integer()?).map(Number::Integer)
+        super::theory::n_choose_k(&self.integer_value()?, &k.integer_value()?).map(Number::Integer)
     }
 
-    /// Number of permutations `nPr(self, k)` for exact integers.
+    /// Number of permutations `nPr(self, k)` for integers.
     pub fn npr(&self, k: &Number) -> NumResult<Number> {
-        super::theory::n_permute_k(self.expect_integer()?, k.expect_integer()?).map(Number::Integer)
+        super::theory::n_permute_k(&self.integer_value()?, &k.integer_value()?).map(Number::Integer)
     }
 
-    /// Integer square root `floor(√n)` for an exact non-negative integer.
+    /// Integer square root `floor(√n)` for a non-negative integer.
     pub fn isqrt(&self) -> NumResult<Number> {
-        let n = self.expect_integer()?;
+        let n = self.integer_value()?;
         if n.is_negative() {
             return Err(NumberError::Domain("isqrt of a negative number"));
         }
         Ok(Number::Integer(n.sqrt()))
     }
 
-    /// Primality test for exact integers (negative numbers and 0, 1 are not prime).
+    /// Primality test for integers (negative numbers and 0, 1 are not prime).
     pub fn is_prime(&self) -> NumResult<bool> {
-        Ok(super::theory::is_prime(self.expect_integer()?))
+        super::theory::is_prime(&self.integer_value()?)
     }
 
-    /// Prime factorization `[(p, k), ...]` of an exact non-zero integer
+    /// Prime factorization `[(p, k), ...]` of a non-zero integer
     /// (ascending; `-1` first for negative numbers).
     pub fn factorize(&self) -> NumResult<Vec<(BigInt, u32)>> {
-        super::theory::factorize(self.expect_integer()?)
+        super::theory::factorize(&self.integer_value()?)
     }
 
     /// `self^n` for an exact integer exponent (exact for exact bases).
@@ -482,7 +531,7 @@ impl Number {
                 let bits = r.numer().bits().max(r.denom().bits()) as f64;
                 let e_f = num_traits::ToPrimitive::to_f64(e).unwrap_or(f64::INFINITY);
                 if bits * e_f > super::theory::MAX_EXACT_BITS as f64 {
-                    return Err(NumberError::Overflow);
+                    return Err(NumberError::Limit);
                 }
                 let e = num_traits::ToPrimitive::to_u64(e).expect("bounded");
                 let num = num_traits::pow::pow(r.numer().clone(), e as usize);
@@ -500,14 +549,29 @@ impl Number {
                 }
                 return f64_big(*x).powi(n).map(Number::Float);
             }
-            Number::Complex(_) => {
+            Number::Complex(c) => {
+                let bits = e.bits();
+                if self.is_exact() {
+                    let size = |x: &Number| {
+                        let r = x.to_rational().expect("exact part");
+                        r.numer().bits().max(r.denom().bits())
+                    };
+                    let part_bits = size(&c.re).max(size(&c.im)) + 1;
+                    let e_f = num_traits::ToPrimitive::to_f64(e).unwrap_or(f64::INFINITY);
+                    if part_bits as f64 * e_f > super::theory::MAX_EXACT_BITS as f64 {
+                        return Err(NumberError::Limit);
+                    }
+                } else if bits > 20 {
+                    // Polar form: avoids millions of multiplications and
+                    // exponent blow-up; overflow is reported by `exp`.
+                    let prec = self.working_prec(Precision::DEFAULT);
+                    let n = Number::Integer(n.clone());
+                    return (&n * &self.ln(prec)?).exp(prec);
+                }
                 let mut result = Number::one();
                 let mut base = self.clone();
-                let bits = e.bits();
-                if bits > 64 {
-                    return Err(NumberError::Overflow);
-                }
                 for i in 0..bits {
+                    super::check_interrupt()?;
                     if e.bit(i) {
                         result = &result * &base;
                     }
@@ -524,6 +588,64 @@ impl Number {
             Ok(result)
         }
     }
+}
+
+/// `true` if the number is an `F64` or a complex number with an `F64` part.
+fn has_f64_part(n: &Number) -> bool {
+    match n {
+        Number::F64(_) => true,
+        Number::Complex(c) => has_f64_part(&c.re) || has_f64_part(&c.im),
+        _ => false,
+    }
+}
+
+/// Replaces `F64` parts by exact-valued 53-bit floats.
+fn f64_parts_to_big(n: &Number) -> Number {
+    match n {
+        Number::F64(x) => Number::Float(f64_big(*x)),
+        Number::Complex(c) => Number::complex(f64_parts_to_big(&c.re), f64_parts_to_big(&c.im)),
+        other => other.clone(),
+    }
+}
+
+/// Exponent range within which float modulo is computed exactly via rationals.
+const EXACT_MOD_EXP: i64 = 1 << 14;
+
+/// Modulo with at least one `Float` operand (no `F64`).
+fn float_modulo(a: &Number, b: &Number) -> NumResult<Number> {
+    let bits = |n: &Number| match n {
+        Number::Float(f) => f.prec(),
+        _ => 0,
+    };
+    let prec = bits(a).max(bits(b));
+    let small = |n: &Number| match n {
+        Number::Float(f) => f.is_zero() || f.exponent().abs() < EXACT_MOD_EXP,
+        _ => true,
+    };
+    if small(a) && small(b) {
+        // Floats are dyadic rationals: compute the exact remainder, round once.
+        let exact = |n: &Number| match n {
+            Number::Float(f) => f.to_rational(),
+            other => other.to_rational().expect("exact real"),
+        };
+        let (x, y) = (exact(a), exact(b));
+        let r = &x - &y * (&x / &y).floor();
+        return Ok(Number::Float(BigFloat::from_ratio(
+            r.numer(),
+            r.denom(),
+            prec,
+        )));
+    }
+    let q = a.checked_div(b)?.floor()?;
+    let mut r = a - &(b * &q);
+    // Rounding in the quotient can leave r slightly outside [0, b): fix up.
+    if !r.is_zero() && r.is_negative() != b.is_negative() {
+        r = &r + b;
+    }
+    if r.abs().cmp_real(&b.abs())? != Ordering::Less {
+        r = &r - b;
+    }
+    Ok(r)
 }
 
 fn exact_pair(a: &Number, b: &Number) -> NumResult<(BigRational, BigRational)> {

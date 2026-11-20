@@ -14,9 +14,17 @@ pub(super) fn exp(re: &Number, im: &Number, prec: Precision) -> NumResult<Number
 
 /// `ln z = ln|z| + i·arg z` with `arg z` in `(-π, π]`.
 pub(super) fn ln(re: &Number, im: &Number, prec: Precision) -> NumResult<Number> {
-    let m2 = re * re + im * im;
-    let half = Number::rational(1, 2).expect("non-zero");
-    let ln_abs = &m2.ln(prec)? * &half;
+    let ln_abs = if re.is_exact() && im.is_exact() {
+        // Exact |z|² keeps ln|z| exact when |z| = 1 (e.g. ln i = iπ/2).
+        let m2 = re * re + im * im;
+        let half = Number::rational(1, 2).expect("non-zero");
+        &m2.ln(prec)? * &half
+    } else {
+        // |z| without squaring in f64 (no under/overflow).
+        Number::complex(re.clone(), im.clone())
+            .abs_prec(prec)
+            .ln(prec)?
+    };
     let arg = Number::atan2(im, re, prec)?;
     Ok(Number::complex(ln_abs, arg))
 }
@@ -47,7 +55,7 @@ pub(super) fn sqrt(re: &Number, im: &Number, prec: Precision) -> NumResult<Numbe
         return Ok(v);
     }
     let half = Number::rational(1, 2).expect("non-zero");
-    let r = Number::complex(re.clone(), im.clone()).abs();
+    let r = Number::complex(re.clone(), im.clone()).abs_prec(prec);
     let two = Number::from(2);
     if re.cmp_real(&Number::zero())? != Ordering::Less {
         let u = (&(&r + re) * &half).sqrt(prec)?;

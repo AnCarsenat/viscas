@@ -8,7 +8,10 @@ use super::{BigFloat, NumResult, Number, NumberError, Precision};
 
 /// Decimal exponents beyond this magnitude produce a [`Number::Float`] instead
 /// of a (huge) exact rational.
-const MAX_EXACT_EXPONENT: i64 = 4096;
+const MAX_EXACT_EXPONENT: u64 = 4096;
+
+/// Literals with more digits than this are refused with [`NumberError::Limit`].
+pub const MAX_LITERAL_DIGITS: usize = 100_000;
 
 /// Parses a numeric literal.
 ///
@@ -35,14 +38,21 @@ pub fn parse_literal(text: &str) -> NumResult<Number> {
     let value = if imag && s.is_empty() {
         Number::one()
     } else {
-        parse_real(s).ok_or_else(err)?
+        parse_real(s)?.ok_or_else(err)?
     };
     let value = if neg { -value } else { value };
     Ok(if imag { value.imaginary() } else { value })
 }
 
-/// Parses an unsigned real literal (no `i` suffix).
-fn parse_real(s: &str) -> Option<Number> {
+/// Parses an unsigned real literal (no `i` suffix); `Ok(None)` on bad syntax.
+fn parse_real(s: &str) -> NumResult<Option<Number>> {
+    if s.len() > MAX_LITERAL_DIGITS + 32 {
+        return Err(NumberError::Limit);
+    }
+    Ok(parse_real_inner(s))
+}
+
+fn parse_real_inner(s: &str) -> Option<Number> {
     let (mantissa, exponent) = match s.find(['e', 'E']) {
         Some(pos) => (&s[..pos], Some(&s[pos + 1..])),
         None => (s, None),
@@ -87,7 +97,7 @@ fn parse_real(s: &str) -> Option<Number> {
     if mantissa.is_zero() {
         return Some(Number::zero());
     }
-    if exp10.abs() <= MAX_EXACT_EXPONENT {
+    if exp10.unsigned_abs() <= MAX_EXACT_EXPONENT {
         let pow = num_traits::pow::pow(BigInt::from(10), exp10.unsigned_abs() as usize);
         let r = if exp10 >= 0 {
             BigRational::from_integer(mantissa * pow)

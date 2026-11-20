@@ -494,10 +494,10 @@ fn floor_ceil_round_floats() {
 #[test]
 fn abs_and_sign() {
     assert_eq!(rat(-3, 4).abs(), rat(3, 4));
-    assert_eq!(int(-9).sign(), int(-1));
-    assert_eq!(int(0).sign(), int(0));
-    assert_eq!(rat(2, 7).sign(), int(1));
-    assert_eq!(Number::complex(int(0), int(3)).sign(), Number::i());
+    assert_eq!(int(-9).sign().unwrap(), int(-1));
+    assert_eq!(int(0).sign().unwrap(), int(0));
+    assert_eq!(rat(2, 7).sign().unwrap(), int(1));
+    assert_eq!(Number::complex(int(0), int(3)).sign().unwrap(), Number::i());
 }
 
 #[test]
@@ -514,7 +514,7 @@ fn math_modulo_sign_of_divisor() {
 
 #[test]
 fn float_modulo() {
-    let pi = Number::pi(P50);
+    let pi = Number::pi(P50).unwrap();
     let m = (&pi * &int(3)).modulo(&pi).unwrap();
     assert!(
         m.abs().cmp_real(&n("1e-45")).unwrap() == Ordering::Less || {
@@ -544,14 +544,14 @@ fn gcd_lcm_rationals() {
 
 #[test]
 fn factorial_small() {
-    assert_eq!(int(0).factorial().unwrap(), int(1));
-    assert_eq!(int(1).factorial().unwrap(), int(1));
-    assert_eq!(int(10).factorial().unwrap(), int(3_628_800));
+    assert_eq!(int(0).factorial(P50).unwrap(), int(1));
+    assert_eq!(int(1).factorial(P50).unwrap(), int(1));
+    assert_eq!(int(10).factorial(P50).unwrap(), int(3_628_800));
 }
 
 #[test]
 fn factorial_100() {
-    let v = int(100).factorial().unwrap();
+    let v = int(100).factorial(P50).unwrap();
     assert_eq!(
         v.to_string(),
         "93326215443944152681699238856266700490715968264381621468592963895217599993229915608941463976156518286253697920827223758251185210916864000000000000000000000000"
@@ -561,15 +561,17 @@ fn factorial_100() {
 
 #[test]
 fn factorial_large_digit_count() {
-    let v = int(1000).factorial().unwrap();
+    let v = int(1000).factorial(P50).unwrap();
     assert_eq!(v.to_string().len(), 2568);
 }
 
 #[test]
 fn factorial_errors() {
-    assert!(matches!(int(-1).factorial(), Err(NumberError::Domain(_))));
-    assert_eq!(rat(1, 2).factorial(), Err(NumberError::NotInteger));
-    assert_eq!(n("10000000000").factorial(), Err(NumberError::Overflow));
+    assert!(matches!(
+        int(-1).factorial(P50),
+        Err(NumberError::Domain(_))
+    ));
+    assert_eq!(n("10000000000").factorial(P50), Err(NumberError::Limit));
 }
 
 #[test]
@@ -717,7 +719,7 @@ fn factorize_zero_errors() {
 
 #[test]
 fn pi_50_digits() {
-    let pi = Number::pi(P50);
+    let pi = Number::pi(P50).unwrap();
     assert_eq!(
         pi.to_decimal_string(50),
         "3.1415926535897932384626433832795028841971693993751"
@@ -726,13 +728,13 @@ fn pi_50_digits() {
 
 #[test]
 fn pi_200_digits() {
-    assert_close(&Number::pi(p(110)), PI, 110);
+    assert_close(&Number::pi(p(110)).unwrap(), PI, 110);
 }
 
 #[test]
 fn e_constant() {
-    assert_close(&Number::e(P50), E, 49);
-    assert_close(&Number::e(p(110)), E, 110);
+    assert_close(&Number::e(P50).unwrap(), E, 49);
+    assert_close(&Number::e(p(110)).unwrap(), E, 110);
 }
 
 #[test]
@@ -917,7 +919,7 @@ fn sin_tiny_argument() {
 #[test]
 fn sin_pi_is_tiny_but_accurate() {
     // sin(π_50) = π - π_50 to first order: relative accuracy must survive.
-    let pi = Number::pi(P50);
+    let pi = Number::pi(P50).unwrap();
     let s = pi.sin(P50).unwrap();
     let exact_pi = n(PI);
     let expected = (&exact_pi - &pi).to_decimal_string(30);
@@ -926,7 +928,7 @@ fn sin_pi_is_tiny_but_accurate() {
 
 #[test]
 fn cos_half_pi_relative_accuracy() {
-    let hp = Number::pi(P50).checked_div(&int(2)).unwrap();
+    let hp = Number::pi(P50).unwrap().checked_div(&int(2)).unwrap();
     let c = hp.cos(P50).unwrap();
     let expected = (&(n(PI) * rat(1, 2)) - &hp).to_decimal_string(30);
     assert_close(&c, &expected, 25);
@@ -1118,7 +1120,7 @@ fn inverse_roundtrips() {
 #[test]
 fn complex_exp_euler() {
     // e^(iπ) = -1
-    let v = (Number::i() * Number::pi(P50)).exp(P50).unwrap();
+    let v = (Number::i() * Number::pi(P50).unwrap()).exp(P50).unwrap();
     assert_close(&v.re(), "-1", 48);
     assert!(v.im().abs().cmp_real(&n("1e-48")).unwrap() == Ordering::Less);
 }
@@ -1276,7 +1278,7 @@ fn to_f64_conversions() {
     assert_eq!(rat(1, 4).to_f64(), 0.25);
     assert_eq!(rat(1, 3).to_f64(), 1.0 / 3.0);
     assert_eq!(n("0.1").to_f64(), 0.1);
-    assert_eq!(Number::pi(P50).to_f64(), std::f64::consts::PI);
+    assert_eq!(Number::pi(P50).unwrap().to_f64(), std::f64::consts::PI);
     assert_eq!(int(-5).to_f64(), -5.0);
     assert!(Number::i().to_f64().is_nan());
     assert_eq!((int(1) + n("2i")).to_complex_f64(), (1.0, 2.0));
@@ -1379,11 +1381,13 @@ fn bigfloat_floor_variants() {
 #[test]
 fn bigfloat_constants_display() {
     assert_eq!(
-        BigFloat::pi(Precision::digits(30).bits()).to_string(),
+        BigFloat::pi(Precision::digits(30).bits())
+            .unwrap()
+            .to_string(),
         "3.14159265358979323846264338328"
     );
     assert_eq!(
-        Number::Float(BigFloat::e(Precision::digits(25).bits())).to_decimal_string(20),
+        Number::Float(BigFloat::e(Precision::digits(25).bits()).unwrap()).to_decimal_string(20),
         "2.7182818284590452354"
     );
 }
@@ -1421,4 +1425,351 @@ fn error_display() {
         NumberError::Parse("x".into()).to_string(),
         "invalid number literal: x"
     );
+}
+
+// ---------------------------------------------------------------- review regressions
+
+const SQRT_PI: &str =
+    "1.7724538509055160272981674833411451827975494561223871282138077898529112845910322";
+
+/// Every `F64` must be finite (invariant), recursively for complex parts.
+fn assert_finite_f64(v: &Number) {
+    match v {
+        Number::F64(x) => assert!(x.is_finite(), "non-finite F64 {x}"),
+        Number::Complex(c) => {
+            assert_finite_f64(c.re());
+            assert_finite_f64(c.im());
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn regression_f64_with_out_of_range_operand() {
+    // #1: 10^400 + F64(1.0) used to panic (to_f64 = inf).
+    let big = n("1e400");
+    for v in [
+        &big + &Number::F64(1.0),
+        &big - &Number::F64(1.0),
+        &big * &Number::F64(2.0),
+        big.checked_div(&Number::F64(2.0)).unwrap(),
+        Number::F64(1.0).checked_div(&big).unwrap(),
+    ] {
+        assert_finite_f64(&v);
+        let _ = v.to_string();
+    }
+    assert_eq!((&big * &Number::F64(2.0)).to_decimal_string(3), "2e400");
+    assert_eq!(
+        big.cmp_real(&Number::F64(1e308)).unwrap(),
+        Ordering::Greater
+    );
+}
+
+#[test]
+fn regression_f64_pow_overflow() {
+    // #2: F64^F64 overflow used to panic in the BigFloat fallback.
+    let v = Number::F64(10.0).pow(&Number::F64(400.5), P50).unwrap();
+    assert_finite_f64(&v);
+    assert!(matches!(v, Number::Float(_)));
+    assert_eq!(v.to_decimal_string(4), "3.162e400");
+}
+
+#[test]
+fn regression_f64_results_stay_finite() {
+    // #3: modulo and negative-base powers produced inf / -inf F64 values.
+    let m = Number::F64(1e300).modulo(&Number::F64(1e-10)).unwrap();
+    assert_finite_f64(&m);
+    assert!(m.cmp_real(&int(0)).unwrap() != Ordering::Less);
+    assert!(m.cmp_real(&Number::F64(1e-10)).unwrap() == Ordering::Less);
+    let p = Number::F64(-10.0).pow(&Number::F64(400.0), P50).unwrap();
+    assert_finite_f64(&p);
+    assert_eq!(p.to_decimal_string(3), "1e400");
+    let q = Number::F64(-10.0).pow(&Number::F64(401.0), P50).unwrap();
+    assert_eq!(q.to_decimal_string(3), "-1e401");
+    let r = Number::F64(1e-300)
+        .checked_div(&Number::F64(1e300))
+        .unwrap();
+    assert_finite_f64(&r);
+}
+
+#[test]
+fn regression_sign_of_complex_never_panics() {
+    // #4: sign of a complex whose modulus underflowed used to panic.
+    let z = Number::complex(Number::F64(1e-200), Number::F64(1e-200));
+    let s = z.sign().unwrap();
+    assert_close(&s.re(), "0.70710678118654752", 14);
+    assert_close(&s.im(), "0.70710678118654752", 14);
+}
+
+#[test]
+fn regression_complex_modulus_no_underflow() {
+    // #5: |z|, z/w and ln z squared f64 parts.
+    let z = Number::complex(Number::F64(3e-200), Number::F64(4e-200));
+    assert_close(&z.abs(), "5e-200", 14);
+    let big = Number::complex(Number::F64(3e200), Number::F64(4e200));
+    assert_close(&big.abs(), "5e200", 14);
+    let q = Number::F64(1.0).checked_div(&z).unwrap();
+    assert_close(&q.re(), "1.2e199", 14);
+    assert_close(&q.im(), "-1.6e199", 14);
+    let l = z.ln(P50).unwrap();
+    assert_close(
+        &l.re(),
+        "-458.907580686375036428997531603646653880694696",
+        13,
+    );
+}
+
+#[test]
+fn regression_parse_extreme_exponent() {
+    // #6: exp10.abs() overflowed for i64::MIN.
+    assert!(parse_literal("1e-9223372036854775808").is_err());
+    assert!(parse_literal("1e9223372036854775807").is_err());
+}
+
+#[test]
+fn regression_complex_precision_threaded() {
+    // #7: complex abs/sqrt/sign ignored the requested precision.
+    let z = Number::complex(int(1), int(1));
+    assert_close(&z.abs_prec(p(100)), SQRT2, 99);
+    let r = Number::complex(int(1), int(2)).sqrt(p(100)).unwrap();
+    assert_close(
+        &r.re(),
+        "1.27201964951406896425242246173749149171560804184009624861664038253929757553606801183038421",
+        85,
+    );
+    let s = z.sign_prec(p(100)).unwrap();
+    assert_close(&(s.re() * int(2)), SQRT2, 99);
+}
+
+#[test]
+fn regression_round_extreme_floats() {
+    // #8: round() materialized 2^|exponent| bits.
+    assert_eq!(n("1e-100000").round().unwrap(), int(0));
+    assert_eq!((-n("1e-100000")).round().unwrap(), int(0));
+    let x = BigFloat::from_i64(1, 10).mul_pow2(-(1 << 40));
+    assert_eq!(x.round().unwrap(), BigInt::from(0));
+    assert_eq!(
+        BigFloat::from_i64(3, 10).mul_pow2(-1).round().unwrap(),
+        BigInt::from(2)
+    );
+}
+
+#[test]
+fn regression_complex_power_bounded() {
+    // #9: complex integer powers had no size bound.
+    let z = Number::complex(int(1), int(1));
+    assert_eq!(z.pow_exact(&n("100000000000")).unwrap(), None);
+    let v = z.pow(&n("100000000000"), P50).unwrap();
+    assert!(!v.is_exact());
+    let w = Number::complex(Number::F64(0.6), Number::F64(0.8));
+    let u = w.pow(&n("1000000000000"), P50).unwrap();
+    assert_finite_f64(&u);
+    assert_close(&u.abs(), "1", 3);
+}
+
+#[test]
+fn regression_ncr_npr_limits() {
+    // #10
+    assert_eq!(n("1e30").ncr(&n("1e20")), Err(NumberError::Limit));
+    assert_eq!(n("1e30").npr(&n("1e10")), Err(NumberError::Limit));
+    assert_eq!(
+        n("1e30").ncr(&int(2)).unwrap(),
+        n("499999999999999999999999999999500000000000000000000000000000")
+    );
+}
+
+#[test]
+fn regression_prime_and_factor_limits() {
+    // #11
+    let huge = int(2).pow(&int(5000), P50).unwrap() + int(1);
+    assert_eq!(huge.is_prime(), Err(NumberError::Limit));
+    assert_eq!(huge.factorize(), Err(NumberError::Limit));
+    // Product of two 32-bit primes: Pollard-Brent within its iteration budget.
+    assert_eq!(
+        factors("18446743979220271189"),
+        f(&[("4294967279", 1), ("4294967291", 1)])
+    );
+}
+
+#[test]
+fn regression_trig_argument_cap() {
+    // #12
+    assert_eq!(n("1e30000").sin(P50), Err(NumberError::Overflow));
+    assert!(n("1e3000").sin(P50).is_ok());
+}
+
+#[test]
+fn regression_bigfloat_pow_huge_exponent() {
+    // #13: no ln at millions of bits for absurd exponents.
+    let two = BigFloat::from_i64(2, 64);
+    let third = BigFloat::from_ratio(&1.into(), &3.into(), 64);
+    let y = BigFloat::from_i64(1, 64).mul_pow2(1_000_000).add(&third);
+    assert_eq!(two.pow(&y), Err(NumberError::Overflow));
+    let half = BigFloat::from_ratio(&1.into(), &2.into(), 64);
+    assert!(half.pow(&y).unwrap().is_zero());
+    assert_eq!(BigFloat::one(64).pow(&y).unwrap(), BigFloat::one(64));
+}
+
+#[test]
+fn regression_cmp_rational_magnitude_tie() {
+    // #15: equal magnitudes with huge exponents compared as Equal.
+    let Number::Float(f) = n("1e5000") else {
+        panic!("expected a float");
+    };
+    let r = f.to_rational();
+    let bigger = &r + &BigRational::from_integer(1.into());
+    let smaller = &r - &BigRational::from_integer(1.into());
+    assert_eq!(f.cmp_rational(&r), Ordering::Equal);
+    assert_eq!(f.cmp_rational(&bigger), Ordering::Less);
+    assert_eq!(f.cmp_rational(&smaller), Ordering::Greater);
+    assert_eq!(f.neg().cmp_rational(&-&bigger), Ordering::Greater);
+}
+
+#[test]
+fn regression_float_modulo_sign() {
+    // #16
+    let a = n("-7.5").to_float(P50);
+    assert_eq!(a.modulo(&int(2)).unwrap(), rat(1, 2));
+    assert_eq!(n("7.5").to_float(P50).modulo(&int(-2)).unwrap(), rat(-1, 2));
+    let pi = Number::pi(P50).unwrap();
+    let m = (-&pi).modulo(&int(1)).unwrap();
+    assert!(m.cmp_real(&int(0)).unwrap() != Ordering::Less);
+    assert!(m.cmp_real(&int(1)).unwrap() == Ordering::Less);
+    assert_close(
+        &m,
+        "0.85840734641020676153735661672049711580283060062489",
+        45,
+    );
+}
+
+#[test]
+fn regression_format_extreme_exponent() {
+    // #17: formatting near the exponent limit must not panic.
+    let x = BigFloat::from_i64(3, 64).mul_pow2(1 << 59);
+    let s = Number::Float(x).to_decimal_string(5);
+    assert!(s.contains('e'), "{s}");
+}
+
+#[test]
+fn regression_precision_clamped() {
+    // #18
+    assert_eq!(Precision::digits(u32::MAX).get(), Precision::MAX_DIGITS);
+    assert_eq!(
+        Precision::from_bits(u64::MAX),
+        Precision::digits(Precision::MAX_DIGITS)
+    );
+    let Number::Float(b) = int(1).to_float(Precision::from_bits(100)) else {
+        panic!("expected a float");
+    };
+    assert_eq!(b.prec(), 100);
+    assert_eq!(
+        Number::Float(b).working_prec(Precision::digits(1)).bits(),
+        100
+    );
+}
+
+#[test]
+fn regression_literal_digit_cap() {
+    // #19
+    let long = "1".repeat(200_000);
+    assert_eq!(parse_literal(&long), Err(NumberError::Limit));
+    assert!(parse_literal(&"7".repeat(1000)).is_ok());
+}
+
+#[test]
+fn interrupt_flag_cancels() {
+    // #20
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let flag = Arc::new(AtomicBool::new(true));
+    {
+        let _guard = install_interrupt(flag.clone());
+        assert_eq!(int(5000).factorial(P50), Err(NumberError::Interrupted));
+        assert_eq!(int(3).ln(p(1000)), Err(NumberError::Interrupted));
+        assert_eq!(
+            n("618970019642690137449562111").is_prime(),
+            Err(NumberError::Interrupted)
+        );
+        assert_eq!(
+            factors_result("1208925819535464337504999"),
+            Err(NumberError::Interrupted)
+        );
+    }
+    // Guard dropped: computations run again.
+    assert!(int(3).ln(P50).is_ok());
+    assert_eq!(check_interrupt(), Ok(()));
+}
+
+fn factors_result(v: &str) -> NumResult<Vec<(BigInt, u32)>> {
+    n(v).factorize()
+}
+
+#[test]
+fn integral_floats_accepted_as_integers() {
+    assert_eq!(Number::F64(5.0).factorial(P50).unwrap(), int(120));
+    assert_eq!(
+        int(5).to_float(P50).ncr(&Number::F64(2.0)).unwrap(),
+        int(10)
+    );
+    assert_eq!(Number::F64(7.0).is_prime(), Ok(true));
+    assert_eq!(Number::F64(16.0).isqrt().unwrap(), int(4));
+    assert_eq!(Number::F64(2.5).ncr(&int(1)), Err(NumberError::NotInteger));
+}
+
+#[test]
+fn gamma_and_non_integer_factorial() {
+    assert_close(&rat(1, 2).gamma(P50).unwrap(), SQRT_PI, 48);
+    assert_close(
+        &rat(1, 2).factorial(P50).unwrap(),
+        "0.8862269254527580136490837416705725913987747280611935641069038949264556422955161",
+        48,
+    );
+    let minus_two_sqrt_pi = (n(SQRT_PI) * int(-2)).to_decimal_string(70);
+    assert_close(&rat(-1, 2).gamma(P50).unwrap(), &minus_two_sqrt_pi, 47);
+    // Γ(1/3)·Γ(2/3) = 2π/√3
+    let prod = rat(1, 3).gamma(P50).unwrap() * rat(2, 3).gamma(P50).unwrap();
+    assert_close(
+        &prod,
+        "3.6275987284684357011881565152843114645681324961854811511397698707762463622527078",
+        47,
+    );
+    assert_eq!(int(6).gamma(P50).unwrap(), int(120));
+    assert_close(
+        &n("10.5").to_float(p(80)).gamma(P50).unwrap(),
+        "1133278.38894878556733457416558889247556029830827515977660872341452948339005600",
+        77,
+    );
+    assert!(matches!(int(0).gamma(P50), Err(NumberError::Domain(_))));
+    assert!(matches!(int(-3).gamma(P50), Err(NumberError::Domain(_))));
+    assert!(matches!(
+        Number::F64(-2.0).gamma(P50),
+        Err(NumberError::Domain(_))
+    ));
+}
+
+#[test]
+fn gamma_f64_path() {
+    let g = Number::F64(0.1).gamma(P50).unwrap();
+    assert!(matches!(g, Number::F64(x) if (x - 9.513507698668732).abs() < 1e-12));
+    let h = Number::F64(-2.5).gamma(P50).unwrap();
+    assert!(matches!(h, Number::F64(x) if (x + 0.9453087204829417).abs() < 1e-13));
+    let big = Number::F64(170.5).gamma(P50).unwrap();
+    assert!(matches!(big, Number::F64(x) if (x / 5.56209241456e305 - 1.0).abs() < 1e-10));
+    let over = Number::F64(200.5).gamma(P50).unwrap();
+    assert!(matches!(over, Number::Float(_)));
+    assert_eq!(
+        Number::F64(2.5)
+            .factorial(P50)
+            .unwrap()
+            .to_decimal_string(9),
+        "3.32335097"
+    );
+}
+
+#[test]
+fn inexact_zero_imaginary_collapses() {
+    let z = Number::complex(Number::F64(1.5), Number::F64(0.0));
+    assert!(matches!(z, Number::F64(x) if x == 1.5));
+    let w = Number::complex(int(1), int(0).to_float(P50));
+    assert!(w.is_real());
 }

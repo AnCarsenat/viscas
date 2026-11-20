@@ -24,13 +24,13 @@ type BigFn = fn(&BigFloat) -> NumResult<BigFloat>;
 
 impl Number {
     /// π as a float of precision `prec`.
-    pub fn pi(prec: Precision) -> Number {
-        Number::Float(BigFloat::pi(prec.bits()))
+    pub fn pi(prec: Precision) -> NumResult<Number> {
+        BigFloat::pi(prec.bits()).map(Number::Float)
     }
 
     /// Euler's number e as a float of precision `prec`.
-    pub fn e(prec: Precision) -> Number {
-        Number::Float(BigFloat::e(prec.bits()))
+    pub fn e(prec: Precision) -> NumResult<Number> {
+        BigFloat::e(prec.bits()).map(Number::Float)
     }
 
     /// Applies a real function: `big` for exact/`Float`, `small` for `F64`.
@@ -139,7 +139,7 @@ impl Number {
                 let re = (-x).ln(prec)?;
                 let pi = match x {
                     Number::F64(_) => Number::F64(std::f64::consts::PI),
-                    _ => Number::pi(x.working_prec(prec)),
+                    _ => Number::pi(x.working_prec(prec))?,
                 };
                 Ok(Number::complex(re, pi))
             }
@@ -327,7 +327,7 @@ impl Number {
         match e {
             Number::Integer(n) => match self.powi(n) {
                 Ok(v) => Ok(Some(v)),
-                Err(NumberError::Overflow) => Ok(None),
+                Err(NumberError::Limit) => Ok(None),
                 Err(err) => Err(err),
             },
             Number::Rational(r) => {
@@ -359,7 +359,7 @@ impl Number {
                 };
                 let value = match Number::from_ratio(root).powi(p) {
                     Ok(v) => v,
-                    Err(NumberError::Overflow) => return Ok(None),
+                    Err(NumberError::Limit) => return Ok(None),
                     Err(err) => return Err(err),
                 };
                 if i_power {
@@ -385,7 +385,7 @@ impl Number {
         if let Number::Integer(n) = e {
             match self.powi(n) {
                 Ok(v) => return Ok(v),
-                Err(NumberError::Overflow) if self.is_exact() => {
+                Err(NumberError::Limit) if self.is_exact() => {
                     return self.to_float(prec).powi(n);
                 }
                 Err(err) => return Err(err),
@@ -415,13 +415,14 @@ impl Number {
                 let bits = prec.bits();
                 let amp = e.to_f64().abs().log2().ceil();
                 let extra = if amp.is_finite() {
-                    amp.max(0.0) as u64
+                    amp.clamp(0.0, 128.0) as u64
                 } else {
                     0
                 };
                 let wide = bits + extra + 8;
                 let to_big = |v: &Number, extra_in: u64| match v {
                     Number::Float(f) => f.clone(),
+                    Number::F64(x) => BigFloat::from_f64(*x, 53).expect("finite"),
                     exact => exact.exact_to_bigfloat(wide + extra_in),
                 };
                 let x = to_big(self, self.near_one_extra(bits)).with_prec(wide);
@@ -429,14 +430,14 @@ impl Number {
                 return Ok(Number::Float(x.pow(&y)?.with_prec(bits)));
             }
             if e.is_integral() {
-                let n = e.floor()?;
-                let n = match &n {
-                    Number::Integer(n) => n.clone(),
-                    other => BigInt::from(other.to_f64() as i64),
+                // Negative base, integral inexact exponent: real result.
+                let n = e.integer_value()?;
+                let v = match self.powi(&n) {
+                    Err(NumberError::Limit) if self.is_exact() => self.to_float(prec).powi(&n)?,
+                    other => other?,
                 };
-                let v = self.powi(&n)?;
-                return Ok(match e {
-                    Number::F64(_) => Number::F64(v.to_f64()),
+                return Ok(match (self, e) {
+                    (Number::F64(_), _) | (_, Number::F64(_)) => v.into_f64_kind(),
                     _ => v.to_float(prec),
                 });
             }
@@ -446,7 +447,7 @@ impl Number {
     }
 
     /// Real `n`-th root: like `self^(1/n)`, but odd roots of negative reals
-    /// are real (`nthroot(-8, 3) = -2`, as in Desmos).
+    /// are real (`nthroot(-8, 3) = -2`).
     pub fn nth_root(&self, n: &Number, prec: Precision) -> NumResult<Number> {
         if n.is_zero() {
             return Err(NumberError::Domain("0-th root"));

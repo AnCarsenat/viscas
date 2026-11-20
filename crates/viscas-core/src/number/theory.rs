@@ -4,39 +4,59 @@ use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
-use super::{NumResult, NumberError};
+use super::{NumResult, NumberError, check_interrupt};
 
 /// Exact results larger than this many bits are refused with
-/// [`NumberError::Overflow`] (≈ 20 million decimal digits).
+/// [`NumberError::Limit`] (≈ 20 million decimal digits).
 pub(crate) const MAX_EXACT_BITS: u64 = 1 << 26;
 
 /// Largest argument accepted by [`factorial`].
 pub const MAX_FACTORIAL: u64 = 200_000;
 
+/// Largest input (in bits) accepted by [`is_prime`] (≈ 1233 decimal digits).
+pub const MAX_PRIME_BITS: u64 = 4096;
+
+/// Largest input (in bits) accepted by [`factorize`].
+pub const MAX_FACTOR_BITS: u64 = 1024;
+
+/// Total Pollard-rho polynomial evaluations allowed per factorization.
+const RHO_BUDGET: u64 = 1 << 26;
+
 /// Product of the integers in `lo..=hi` by binary splitting.
-fn range_product(lo: u64, hi: u64) -> BigUint {
+fn range_product(lo: u64, hi: u64) -> NumResult<BigUint> {
     if lo > hi {
-        return BigUint::one();
+        return Ok(BigUint::one());
     }
     if hi - lo < 16 {
+        check_interrupt()?;
         let mut p = BigUint::one();
         for k in lo..=hi {
             p *= k;
         }
-        return p;
+        return Ok(p);
     }
     let mid = lo + (hi - lo) / 2;
-    range_product(lo, mid) * range_product(mid + 1, hi)
+    Ok(range_product(lo, mid)? * range_product(mid + 1, hi)?)
 }
 
-/// `n!` for `0 <= n <= MAX_FACTORIAL`.
+/// `n!` for `0 <= n <= MAX_FACTORIAL` (larger arguments: [`NumberError::Limit`]).
 pub fn factorial(n: &BigInt) -> NumResult<BigInt> {
     if n.is_negative() {
         return Err(NumberError::Domain("factorial of a negative integer"));
     }
     let n = n.to_u64().filter(|&n| n <= MAX_FACTORIAL);
-    let n = n.ok_or(NumberError::Overflow)?;
-    Ok(BigInt::from(range_product(2, n)))
+    let n = n.ok_or(NumberError::Limit)?;
+    Ok(BigInt::from(range_product(2, n)?))
+}
+
+/// Upper bound on the bits of a product of `k` factors of at most `n_bits`
+/// bits, refused with [`NumberError::Limit`] when too large.
+fn check_product_size(k: &BigInt, n_bits: u64) -> NumResult<u64> {
+    let k = k.to_u64().ok_or(NumberError::Limit)?;
+    if (k as f64) * (n_bits.max(1) as f64) > MAX_EXACT_BITS as f64 {
+        return Err(NumberError::Limit);
+    }
+    Ok(k)
 }
 
 /// Binomial coefficient `C(n, k)` for integers. Extended to negative `n` by
@@ -54,12 +74,16 @@ pub fn n_choose_k(n: &BigInt, k: &BigInt) -> NumResult<BigInt> {
         return Ok(BigInt::zero());
     }
     let k = std::cmp::min(k.clone(), n - k);
-    let k = k.to_u64().ok_or(NumberError::Overflow)?;
-    if k > MAX_FACTORIAL * 4 {
-        return Err(NumberError::Overflow);
-    }
+    // C(n, k) < 2^n and C(n, k) <= n^k.
+    let k = match n.to_u64() {
+        Some(small) if small <= MAX_EXACT_BITS => k.to_u64().expect("k <= n"),
+        _ => check_product_size(&k, n.bits())?,
+    };
     let mut acc = BigInt::one();
     for i in 0..k {
+        if i % 256 == 0 {
+            check_interrupt()?;
+        }
         acc = acc * (n - i) / (i + 1);
     }
     Ok(acc)
@@ -73,12 +97,12 @@ pub fn n_permute_k(n: &BigInt, k: &BigInt) -> NumResult<BigInt> {
     if k > n {
         return Ok(BigInt::zero());
     }
-    let k = k.to_u64().ok_or(NumberError::Overflow)?;
-    if k > MAX_FACTORIAL * 4 {
-        return Err(NumberError::Overflow);
-    }
+    let k = check_product_size(k, n.bits())?;
     let mut acc = BigInt::one();
     for i in 0..k {
+        if i % 256 == 0 {
+            check_interrupt()?;
+        }
         acc *= n - i;
     }
     Ok(acc)
@@ -135,22 +159,23 @@ fn is_prime_u64(n: u64) -> bool {
     true
 }
 
-fn miller_rabin_big(n: &BigUint, a: &BigUint) -> bool {
+fn miller_rabin_big(n: &BigUint, a: &BigUint) -> NumResult<bool> {
+    check_interrupt()?;
     let one = BigUint::one();
     let n1 = n - &one;
     let s = n1.trailing_zeros().unwrap_or(0);
     let d = &n1 >> s;
     let mut x = a.modpow(&d, n);
     if x == one || x == n1 {
-        return true;
+        return Ok(true);
     }
     for _ in 1..s {
         x = (&x * &x) % n;
         if x == n1 {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Primality test.
@@ -158,37 +183,48 @@ fn miller_rabin_big(n: &BigUint, a: &BigUint) -> bool {
 /// Deterministic for `n < 3.3·10²⁴` (which covers every `u64`), using the first
 /// 13 primes as Miller–Rabin bases. Larger numbers additionally get 24
 /// pseudo-random bases, so a composite passes with probability below 4⁻³⁷.
-pub fn is_prime(n: &BigInt) -> bool {
+/// Inputs above [`MAX_PRIME_BITS`] bits are refused with [`NumberError::Limit`].
+pub fn is_prime(n: &BigInt) -> NumResult<bool> {
     if n.is_negative() {
-        return false;
+        return Ok(false);
     }
     if let Some(small) = n.to_u64() {
-        return is_prime_u64(small);
+        return Ok(is_prime_u64(small));
+    }
+    if n.bits() > MAX_PRIME_BITS {
+        return Err(NumberError::Limit);
     }
     let n = n.magnitude();
     for p in trial_primes() {
         if (n % p).is_zero() {
-            return false;
+            return Ok(false);
         }
     }
     let bound: BigUint = DETERMINISTIC_BOUND.parse().expect("valid constant");
     for &a in &SMALL_PRIMES {
-        if !miller_rabin_big(n, &BigUint::from(a)) {
-            return false;
+        if !miller_rabin_big(n, &BigUint::from(a))? {
+            return Ok(false);
         }
     }
     if n < &bound {
-        return true;
+        return Ok(true);
     }
     let mut rng = SplitMix64(0x5eed_cafe_f00d_d00d ^ n.bits());
     let n3 = n - 3u32;
     for _ in 0..24 {
         let a = random_below(&mut rng, &n3) + 2u32;
-        if !miller_rabin_big(n, &a) {
-            return false;
+        if !miller_rabin_big(n, &a)? {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
+}
+
+/// Charges `cost` rho iterations against the budget and polls the interrupt flag.
+fn spend(budget: &mut u64, cost: u64) -> NumResult<()> {
+    check_interrupt()?;
+    *budget = budget.checked_sub(cost).ok_or(NumberError::Limit)?;
+    Ok(())
 }
 
 /// Small deterministic PRNG (SplitMix64) for Miller–Rabin bases and Pollard rho.
@@ -220,10 +256,10 @@ fn trial_primes() -> impl Iterator<Item = u32> {
 
 /// Pollard–Brent rho on `u64`; returns a non-trivial factor of an odd
 /// composite `n` that is not a perfect square.
-fn rho_u64(n: u64, rng: &mut SplitMix64) -> u64 {
+fn rho_u64(n: u64, rng: &mut SplitMix64, budget: &mut u64) -> NumResult<u64> {
     const BATCH: u64 = 128;
     if n.is_multiple_of(2) {
-        return 2;
+        return Ok(2);
     }
     let f = |x: u64, c: u64| ((x as u128 * x as u128 + c as u128) % n as u128) as u64;
     loop {
@@ -234,6 +270,7 @@ fn rho_u64(n: u64, rng: &mut SplitMix64) -> u64 {
         let mut ys;
         loop {
             x = y;
+            spend(budget, r)?;
             for _ in 0..r {
                 y = f(y, c);
             }
@@ -241,6 +278,7 @@ fn rho_u64(n: u64, rng: &mut SplitMix64) -> u64 {
             ys = y;
             while k < r && g == 1 {
                 ys = y;
+                spend(budget, BATCH.min(r - k))?;
                 for _ in 0..BATCH.min(r - k) {
                     y = f(y, c);
                     q = mul_mod(q, x.abs_diff(y), n);
@@ -255,6 +293,7 @@ fn rho_u64(n: u64, rng: &mut SplitMix64) -> u64 {
         }
         if g == n {
             loop {
+                spend(budget, 1)?;
                 ys = f(ys, c);
                 g = x.abs_diff(ys).gcd(&n);
                 if g > 1 {
@@ -263,13 +302,13 @@ fn rho_u64(n: u64, rng: &mut SplitMix64) -> u64 {
             }
         }
         if g != n {
-            return g;
+            return Ok(g);
         }
     }
 }
 
 /// Pollard rho (Floyd, batched gcd) on big integers.
-fn rho_big(n: &BigUint, rng: &mut SplitMix64) -> BigUint {
+fn rho_big(n: &BigUint, rng: &mut SplitMix64, budget: &mut u64) -> NumResult<BigUint> {
     let one = BigUint::one();
     loop {
         let c = random_below(rng, n) + 1u32;
@@ -280,6 +319,7 @@ fn rho_big(n: &BigUint, rng: &mut SplitMix64) -> BigUint {
         while g.is_one() {
             let mut q = one.clone();
             let mut saved = (x.clone(), y.clone());
+            spend(budget, 64)?;
             for _ in 0..64 {
                 x = f(&x);
                 y = f(&f(&y));
@@ -307,32 +347,36 @@ fn rho_big(n: &BigUint, rng: &mut SplitMix64) -> BigUint {
             }
         }
         if !g.is_one() && g != *n {
-            return g;
+            return Ok(g);
         }
     }
 }
 
-fn factor_into(n: BigUint, rng: &mut SplitMix64, out: &mut Vec<BigUint>) {
+fn factor_into(
+    n: BigUint,
+    rng: &mut SplitMix64,
+    budget: &mut u64,
+    out: &mut Vec<BigUint>,
+) -> NumResult<()> {
     if n.is_one() {
-        return;
+        return Ok(());
     }
-    if is_prime(&BigInt::from(n.clone())) {
+    if is_prime(&BigInt::from(n.clone()))? {
         out.push(n);
-        return;
+        return Ok(());
     }
     let root = n.sqrt();
     if &root * &root == n {
-        factor_into(root.clone(), rng, out);
-        factor_into(root, rng, out);
-        return;
+        factor_into(root.clone(), rng, budget, out)?;
+        return factor_into(root, rng, budget, out);
     }
     let d = match n.to_u64() {
-        Some(small) => BigUint::from(rho_u64(small, rng)),
-        None => rho_big(&n, rng),
+        Some(small) => BigUint::from(rho_u64(small, rng, budget)?),
+        None => rho_big(&n, rng, budget)?,
     };
     let rest = &n / &d;
-    factor_into(d, rng, out);
-    factor_into(rest, rng, out);
+    factor_into(d, rng, budget, out)?;
+    factor_into(rest, rng, budget, out)
 }
 
 /// Prime factorization of a non-zero integer as ascending `(prime, exponent)`
@@ -340,10 +384,14 @@ fn factor_into(n: BigUint, rng: &mut SplitMix64, out: &mut Vec<BigUint>) {
 ///
 /// Trial division by primes below 1000, then Pollard rho (Brent variant for
 /// `u64`). Practical for numbers whose second-largest prime factor has up to
-/// ~20 digits.
+/// ~20 digits. Inputs above [`MAX_FACTOR_BITS`] bits, or factorizations that
+/// exhaust the iteration budget, fail with [`NumberError::Limit`].
 pub fn factorize(n: &BigInt) -> NumResult<Vec<(BigInt, u32)>> {
     if n.is_zero() {
         return Err(NumberError::Domain("factorization of 0"));
+    }
+    if n.bits() > MAX_FACTOR_BITS {
+        return Err(NumberError::Limit);
     }
     let mut result: Vec<(BigInt, u32)> = Vec::new();
     if n.is_negative() {
@@ -362,7 +410,8 @@ pub fn factorize(n: &BigInt) -> NumResult<Vec<(BigInt, u32)>> {
     }
     let mut primes = Vec::new();
     let mut rng = SplitMix64(0x0123_4567_89ab_cdef);
-    factor_into(m, &mut rng, &mut primes);
+    let mut budget = RHO_BUDGET;
+    factor_into(m, &mut rng, &mut budget, &mut primes)?;
     primes.sort();
     for p in primes {
         let p = BigInt::from(p);

@@ -353,6 +353,7 @@ impl BigFloat {
         let mut base = self.with_prec(wp);
         let bits = mag_n.bits();
         for i in 0..bits {
+            super::check_interrupt()?;
             if mag_n.bit(i) {
                 result = result.mul_prec(&base, wp);
             }
@@ -400,18 +401,39 @@ impl BigFloat {
 
     /// Exact comparison with a rational.
     pub fn cmp_rational(&self, r: &BigRational) -> Ordering {
-        if self.exp.abs() < MAX_INT_BITS {
-            return self.to_rational().cmp(r);
-        }
-        // Astronomically large or small float: magnitudes decide.
         let sr = sign_rat(r);
         let sa = sign(self);
         if sa != sr || sa == 0 {
             return sa.cmp(&sr);
         }
-        let mr = r.numer().bits() as i64 - r.denom().bits() as i64;
-        let order = self.magnitude().cmp(&mr);
-        if sa > 0 { order } else { order.reverse() }
+        let abs_order = self.cmp_abs_rational(r);
+        if sa > 0 {
+            abs_order
+        } else {
+            abs_order.reverse()
+        }
+    }
+
+    /// Exact comparison of `|self|` with `|r|` (both non-zero). Magnitudes
+    /// decide cheaply when they differ; otherwise the integers compared have
+    /// a size proportional to the inputs.
+    fn cmp_abs_rational(&self, r: &BigRational) -> Ordering {
+        let (p, q) = (r.numer().magnitude(), r.denom().magnitude());
+        // log2|r| lies in (bp - bq - 1, bp - bq + 1); log2|self| in [m - 1, m).
+        let lr = p.bits() as i64 - q.bits() as i64;
+        let m = self.magnitude();
+        if m > lr + 1 {
+            return Ordering::Greater;
+        }
+        if m < lr {
+            return Ordering::Less;
+        }
+        // |self| = man·2^exp versus p/q  <=>  man·q·2^exp versus p
+        if self.exp >= 0 {
+            ((&self.man * q) << self.exp as usize).cmp(p)
+        } else {
+            (&self.man * q).cmp(&(p << (-self.exp) as usize))
+        }
     }
 
     /// Largest integer `<= self`. Errors if the integer would be enormous.
@@ -440,6 +462,14 @@ impl BigFloat {
 
     /// Nearest integer, halves rounded away from zero.
     pub fn round(&self) -> NumResult<BigInt> {
+        if self.is_integral() {
+            return self.floor();
+        }
+        if self.magnitude() <= -1 {
+            // |x| < 1/2 (tiny exponents would otherwise be materialized).
+            return Ok(BigInt::zero());
+        }
+        // Here exp < 0 and |x| >= 1/2, so -exp < mantissa bits: alignment is cheap.
         let half = Self::from_parts(false, BigUint::one(), -1, 2);
         let r = self.abs().add_prec(&half, u64::MAX).floor()?;
         Ok(if self.neg { -r } else { r })

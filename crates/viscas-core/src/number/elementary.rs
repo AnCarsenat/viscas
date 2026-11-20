@@ -16,7 +16,7 @@ const GUARD: u64 = 32;
 
 /// Arguments of trigonometric functions are limited to `|x| < 2^MAX_TRIG_MAG`
 /// (argument reduction needs that many extra bits of π).
-const MAX_TRIG_MAG: i64 = 1 << 20;
+const MAX_TRIG_MAG: i64 = 1 << 16;
 
 /// Cached fixed-point constant: `(bits, value · 2^bits)`.
 type Cache = Mutex<Option<(u64, BigInt)>>;
@@ -24,27 +24,28 @@ type Cache = Mutex<Option<(u64, BigInt)>>;
 static PI_CACHE: Cache = Mutex::new(None);
 static LN2_CACHE: Cache = Mutex::new(None);
 
-fn cached(cache: &Cache, wp: u64, compute: fn(u64) -> BigInt) -> BigInt {
+fn cached(cache: &Cache, wp: u64, compute: fn(u64) -> NumResult<BigInt>) -> NumResult<BigInt> {
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((bits, value)) = guard.as_ref()
         && *bits >= wp
     {
-        return value >> (bits - wp) as usize;
+        return Ok(value >> (bits - wp) as usize);
     }
     let bits = wp.max(256) + 16;
-    let value = compute(bits);
+    let value = compute(bits)?;
     let out = &value >> (bits - wp) as usize;
     *guard = Some((bits, value));
-    out
+    Ok(out)
 }
 
 /// `acot(n) · 2^wp` by its Taylor series.
-fn acot_fixed(n: u64, wp: u64) -> BigInt {
+fn acot_fixed(n: u64, wp: u64) -> NumResult<BigInt> {
     let n2 = BigInt::from(n * n);
     let mut term = (BigInt::one() << wp as usize) / n;
     let mut sum = term.clone();
     let mut k: u64 = 1;
     loop {
+        super::check_interrupt()?;
         term /= &n2;
         if term.is_zero() {
             break;
@@ -57,23 +58,24 @@ fn acot_fixed(n: u64, wp: u64) -> BigInt {
         }
         k += 1;
     }
-    sum
+    Ok(sum)
 }
 
-fn compute_pi(wp: u64) -> BigInt {
+fn compute_pi(wp: u64) -> NumResult<BigInt> {
     // Machin: π = 16·acot(5) − 4·acot(239)
     let w = wp + 16;
-    let pi = (acot_fixed(5, w) << 4usize) - (acot_fixed(239, w) << 2usize);
-    pi >> 16usize
+    let pi = (acot_fixed(5, w)? << 4usize) - (acot_fixed(239, w)? << 2usize);
+    Ok(pi >> 16usize)
 }
 
-fn compute_ln2(wp: u64) -> BigInt {
+fn compute_ln2(wp: u64) -> NumResult<BigInt> {
     // ln 2 = 2·atanh(1/3) = 2·Σ 1/((2k+1)·3^(2k+1))
     let w = wp + 16;
     let mut term = (BigInt::one() << w as usize) / 3u32;
     let mut sum = term.clone();
     let mut k: u64 = 1;
     loop {
+        super::check_interrupt()?;
         term /= 9u32;
         if term.is_zero() {
             break;
@@ -81,16 +83,16 @@ fn compute_ln2(wp: u64) -> BigInt {
         sum += &term / (2 * k + 1);
         k += 1;
     }
-    (sum << 1usize) >> 16usize
+    Ok((sum << 1usize) >> 16usize)
 }
 
 /// `π · 2^wp`.
-pub(crate) fn pi_fixed(wp: u64) -> BigInt {
+pub(crate) fn pi_fixed(wp: u64) -> NumResult<BigInt> {
     cached(&PI_CACHE, wp, compute_pi)
 }
 
 /// `ln 2 · 2^wp`.
-pub(crate) fn ln2_fixed(wp: u64) -> BigInt {
+pub(crate) fn ln2_fixed(wp: u64) -> NumResult<BigInt> {
     cached(&LN2_CACHE, wp, compute_ln2)
 }
 
@@ -113,12 +115,13 @@ fn fsqrt(a: &BigInt, wp: u64) -> BigInt {
 }
 
 /// `exp(r)` for a small fixed-point `r` (|r| < 1).
-fn exp_series(r: &BigInt, wp: u64) -> BigInt {
+fn exp_series(r: &BigInt, wp: u64) -> NumResult<BigInt> {
     let one = BigInt::one() << wp as usize;
     let mut sum = one.clone();
     let mut term = one;
     let mut k: u32 = 1;
     loop {
+        super::check_interrupt()?;
         term = fmul(&term, r, wp) / k;
         if term.is_zero() {
             break;
@@ -126,17 +129,18 @@ fn exp_series(r: &BigInt, wp: u64) -> BigInt {
         sum += &term;
         k += 1;
     }
-    sum
+    Ok(sum)
 }
 
 /// `(sin r, cos r)` for a fixed-point `|r| <= π/4`.
-fn sin_cos_series(r: &BigInt, wp: u64) -> (BigInt, BigInt) {
+fn sin_cos_series(r: &BigInt, wp: u64) -> NumResult<(BigInt, BigInt)> {
     let one = BigInt::one() << wp as usize;
     let r2 = fmul(r, r, wp);
     let mut sin = r.clone();
     let mut term = r.clone();
     let mut k: u64 = 1;
     loop {
+        super::check_interrupt()?;
         term = -fmul(&term, &r2, wp) / ((2 * k) * (2 * k + 1));
         if term.is_zero() {
             break;
@@ -148,6 +152,7 @@ fn sin_cos_series(r: &BigInt, wp: u64) -> (BigInt, BigInt) {
     let mut term = one;
     let mut k: u64 = 1;
     loop {
+        super::check_interrupt()?;
         term = -fmul(&term, &r2, wp) / ((2 * k - 1) * (2 * k));
         if term.is_zero() {
             break;
@@ -155,16 +160,17 @@ fn sin_cos_series(r: &BigInt, wp: u64) -> (BigInt, BigInt) {
         cos += &term;
         k += 1;
     }
-    (sin, cos)
+    Ok((sin, cos))
 }
 
 /// `atanh(t)` for a fixed-point `|t| <= 1/2`.
-fn atanh_series(t: &BigInt, wp: u64) -> BigInt {
+fn atanh_series(t: &BigInt, wp: u64) -> NumResult<BigInt> {
     let t2 = fmul(t, t, wp);
     let mut sum = t.clone();
     let mut term = t.clone();
     let mut k: u64 = 1;
     loop {
+        super::check_interrupt()?;
         term = fmul(&term, &t2, wp);
         if term.is_zero() {
             break;
@@ -172,11 +178,11 @@ fn atanh_series(t: &BigInt, wp: u64) -> BigInt {
         sum += &term / (2 * k + 1);
         k += 1;
     }
-    sum
+    Ok(sum)
 }
 
 /// `atan(t)` for a fixed-point `|t| <= 1`.
-fn atan_fixed(t: &BigInt, wp: u64) -> BigInt {
+fn atan_fixed(t: &BigInt, wp: u64) -> NumResult<BigInt> {
     let one = BigInt::one() << wp as usize;
     // Halve the angle a few times: atan(t) = 2·atan(t / (1 + √(1 + t²))).
     const HALVINGS: usize = 4;
@@ -190,6 +196,7 @@ fn atan_fixed(t: &BigInt, wp: u64) -> BigInt {
     let mut term = t;
     let mut k: u64 = 1;
     loop {
+        super::check_interrupt()?;
         term = -fmul(&term, &t2, wp);
         if term.is_zero() {
             break;
@@ -197,7 +204,7 @@ fn atan_fixed(t: &BigInt, wp: u64) -> BigInt {
         sum += &term / (2 * k + 1);
         k += 1;
     }
-    sum << HALVINGS
+    Ok(sum << HALVINGS)
 }
 
 /// Extra bits needed for relative accuracy when `f(x) ≈ x` near zero.
@@ -211,20 +218,20 @@ fn small_extra(x: &BigFloat) -> u64 {
 
 impl BigFloat {
     /// π to `prec` bits.
-    pub fn pi(prec: u64) -> Self {
+    pub fn pi(prec: u64) -> NumResult<Self> {
         let wp = prec + GUARD;
-        BigFloat::from_fixed(pi_fixed(wp), wp, prec)
+        Ok(BigFloat::from_fixed(pi_fixed(wp)?, wp, prec))
     }
 
     /// ln 2 to `prec` bits.
-    pub fn ln2(prec: u64) -> Self {
+    pub fn ln2(prec: u64) -> NumResult<Self> {
         let wp = prec + GUARD;
-        BigFloat::from_fixed(ln2_fixed(wp), wp, prec)
+        Ok(BigFloat::from_fixed(ln2_fixed(wp)?, wp, prec))
     }
 
     /// Euler's number e to `prec` bits.
-    pub fn e(prec: u64) -> Self {
-        BigFloat::one(prec).exp().expect("exp(1) is finite")
+    pub fn e(prec: u64) -> NumResult<Self> {
+        BigFloat::one(prec).exp()
     }
 
     /// `e^self`. Overflows for huge arguments; underflows to zero.
@@ -245,12 +252,12 @@ impl BigFloat {
         let wp = prec + GUARD + halvings;
         let w = wp + mag.max(0) as u64 + 8;
         let x = self.to_fixed(w);
-        let l = ln2_fixed(w);
+        let l = ln2_fixed(w)?;
         // n = round(x / ln 2)
         let n = (&x * 2u32 + &l).div_floor(&(&l * 2u32));
         let r = x - &n * &l;
         let r = r >> halvings as usize;
-        let mut s = exp_series(&r, w);
+        let mut s = exp_series(&r, w)?;
         for _ in 0..halvings {
             s = fmul(&s, &s, w);
         }
@@ -292,9 +299,9 @@ impl BigFloat {
         let one_fx = BigInt::one() << wp as usize;
         let mf = m.to_fixed(wp);
         let t = fdiv(&(&mf - &one_fx), &(&mf + &one_fx), wp);
-        let mut sum = atanh_series(&t, wp) << 1usize;
+        let mut sum = atanh_series(&t, wp)? << 1usize;
         if e != 0 {
-            let l = ln2_fixed(wp + 64);
+            let l = ln2_fixed(wp + 64)?;
             sum += (l * e) >> 64usize;
         }
         Ok(BigFloat::from_fixed(sum, wp, prec))
@@ -335,7 +342,7 @@ impl BigFloat {
         let mut wp = prec + GUARD + small_extra(self) + mag.max(0) as u64;
         for _ in 0..8 {
             let x = self.to_fixed(wp);
-            let half_pi = pi_fixed(wp) >> 1usize;
+            let half_pi = pi_fixed(wp)? >> 1usize;
             let n = (&x * 2u32 + &half_pi).div_floor(&(&half_pi * 2u32));
             let r = &x - &n * &half_pi;
             let have = r.bits() as i64 - n.bits() as i64;
@@ -343,7 +350,7 @@ impl BigFloat {
                 wp += (need as i64 - have) as u64 + 16;
                 continue;
             }
-            let (s, c) = sin_cos_series(&r, wp);
+            let (s, c) = sin_cos_series(&r, wp)?;
             let quadrant = n.mod_floor(&BigInt::from(4)).to_u8().expect("0..4");
             let (s, c) = match quadrant {
                 0 => (s, c),
@@ -387,12 +394,12 @@ impl BigFloat {
         let big = self.abs().cmp_value(&one) == std::cmp::Ordering::Greater;
         let r = if big {
             let inv = one.div_prec(&self.abs(), wp).expect("non-zero");
-            let a = atan_fixed(&inv.to_fixed(wp), wp);
-            let half_pi = pi_fixed(wp) >> 1usize;
+            let a = atan_fixed(&inv.to_fixed(wp), wp)?;
+            let half_pi = pi_fixed(wp)? >> 1usize;
             let v = half_pi - a;
             if self.is_negative() { -v } else { v }
         } else {
-            atan_fixed(&self.to_fixed(wp), wp)
+            atan_fixed(&self.to_fixed(wp), wp)?
         };
         Ok(BigFloat::from_fixed(r, wp, prec))
     }
@@ -405,7 +412,7 @@ impl BigFloat {
             if y.is_zero() {
                 return Ok(BigFloat::zero(prec));
             }
-            let hp = BigFloat::pi(prec).mul_pow2(-1);
+            let hp = BigFloat::pi(prec)?.mul_pow2(-1);
             return Ok(if y.is_negative() { hp.neg() } else { hp });
         }
         let q = y
@@ -415,7 +422,7 @@ impl BigFloat {
         if !x.is_negative() {
             return Ok(a.with_prec(prec));
         }
-        let pi = BigFloat::pi(a.prec());
+        let pi = BigFloat::pi(a.prec())?;
         let r = if y.is_negative() {
             a.sub(&pi)
         } else {
@@ -432,7 +439,7 @@ impl BigFloat {
         match self.abs().cmp_value(&one) {
             std::cmp::Ordering::Greater => Err(NumberError::Domain("asin outside [-1, 1]")),
             std::cmp::Ordering::Equal => {
-                let hp = BigFloat::pi(prec).mul_pow2(-1);
+                let hp = BigFloat::pi(prec)?.mul_pow2(-1);
                 Ok(if self.is_negative() { hp.neg() } else { hp })
             }
             std::cmp::Ordering::Less => {
@@ -459,7 +466,7 @@ impl BigFloat {
         let exact = 2 * wp + 64;
         let den = one.add_prec(self, exact);
         if den.is_zero() {
-            return Ok(BigFloat::pi(prec));
+            return BigFloat::pi(prec);
         }
         let num = one.add_prec(&self.neg(), exact);
         let extra = small_extra(&num);
@@ -578,10 +585,31 @@ impl BigFloat {
             let n = y.floor()?;
             return self.with_prec(prec).powi(&n);
         }
-        // Bits of the exponent y·ln(x) that are lost to the integer part.
+        // log2|ln x| (up to a small constant), to bound |y·ln x| cheaply.
         let mag_x = self.magnitude();
-        let ln_mag = 64 - mag_x.unsigned_abs().leading_zeros() as i64 + 1;
-        let extra = (y.magnitude() + ln_mag).max(0) as u64;
+        let one = BigFloat::one(2);
+        let ln_mag = if (0..=1).contains(&mag_x) {
+            let d = self.add_prec(&one.neg(), prec + 4);
+            if d.is_zero() {
+                return Ok(BigFloat::one(prec)); // 1^y
+            }
+            d.magnitude() + 1
+        } else {
+            64 - mag_x.unsigned_abs().leading_zeros() as i64 + 1
+        };
+        let t_mag = y.magnitude().saturating_add(ln_mag);
+        if t_mag > 64 {
+            // |y·ln x| > 2^62: e^t is far outside the exponent range.
+            let grows = (mag_x > 0 && self.cmp_value(&one) == std::cmp::Ordering::Greater)
+                != y.is_negative();
+            return if grows {
+                Err(NumberError::Overflow)
+            } else {
+                Ok(BigFloat::zero(prec))
+            };
+        }
+        // Bits of the exponent y·ln(x) that are lost to the integer part.
+        let extra = t_mag.max(0) as u64;
         let wp = prec + GUARD + extra;
         let l = self.with_prec(wp).ln()?;
         let t = l.mul_prec(y, wp);

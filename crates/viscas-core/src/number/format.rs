@@ -110,9 +110,12 @@ pub(crate) fn format_bigfloat(x: &BigFloat, digits: usize) -> String {
     let scaled = |k: i64| {
         let wp = (digits as f64 * std::f64::consts::LOG2_10) as u64 + 64 + 64
             - k.unsigned_abs().leading_zeros() as u64;
-        let ten = BigFloat::from_i64(10, wp);
-        let scale = ten.powi(&BigInt::from(k)).expect("bounded exponent");
-        ax.mul_prec(&scale, wp).round().expect("bounded")
+        // 10^k = 5^k · 2^k keeps the powi exponent range small; the scaled
+        // value has about `digits` digits, so rounding it is cheap.
+        let five = BigFloat::from_i64(5, wp);
+        five.powi(&BigInt::from(k))
+            .and_then(|scale| ax.mul_prec(&scale, wp).mul_pow2(k).round())
+            .unwrap_or_else(|_| BigInt::zero())
     };
     let (s, d) = significant(scaled, est, digits);
     layout(x.is_negative(), &s, d, digits)
@@ -153,11 +156,12 @@ impl Number {
     /// zeros trimmed; scientific notation for very large or small values).
     /// Exact integers are shown in full when they fit in `digits` digits.
     pub fn to_decimal_string(&self, digits: usize) -> String {
-        let digits = digits.max(1);
+        let digits = digits.clamp(1, super::Precision::MAX_DIGITS as usize);
         match self {
             Number::Integer(n) => {
-                let s = n.abs().to_string();
-                if s.len() <= digits.min(SCI_HIGH) {
+                // 70 bits > 21 digits: skip the decimal conversion for big values.
+                let short = n.bits() <= 70 && n.abs().to_string().len() <= digits.min(SCI_HIGH);
+                if short {
                     n.to_string()
                 } else {
                     format_rational(&BigRational::from_integer(n.clone()), digits)
@@ -165,10 +169,11 @@ impl Number {
             }
             Number::Rational(r) => format_rational(r, digits),
             Number::Float(f) => format_bigfloat(f, digits),
-            Number::F64(x) => {
-                let f = BigFloat::from_f64(*x, 53).expect("finite");
-                format_bigfloat(&f, digits.min(17))
-            }
+            Number::F64(x) => match BigFloat::from_f64(*x, 53) {
+                Some(f) => format_bigfloat(&f, digits.min(17)),
+                // Unreachable by the finiteness invariant, but never panic.
+                None => x.to_string(),
+            },
             Number::Complex(c) => {
                 format_complex(c.re(), c.im(), false, |p| p.to_decimal_string(digits))
             }

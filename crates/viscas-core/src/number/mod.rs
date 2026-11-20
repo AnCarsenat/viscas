@@ -19,13 +19,34 @@
 //! literal or an operation is inherently inexact (`sin`, `ln`, irrational
 //! powers, ...). Values are always kept in canonical form: a rational with
 //! denominator one becomes an integer and a complex number whose imaginary part
-//! is an exact zero becomes real.
+//! is zero (exact or not) becomes real.
+//!
+//! `F64` is contagious on purpose: it is the plotting fast-path type, and the
+//! evaluator only produces it in plot mode, where it is never mixed with exact
+//! values it would degrade. An `F64` is always finite: operations whose `f64`
+//! result would overflow fall back to a 53-bit [`BigFloat`] instead.
 //!
 //! Operations that can fail (division by zero, domain errors, comparing complex
 //! numbers, ...) return [`NumberError`]. Operations whose result may not be
 //! exactly representable come in two flavours: an `*_exact` variant returning
 //! `Option` (so the CAS can keep the expression symbolic, e.g. `2^(1/2)`) and a
 //! numeric variant taking a [`Precision`].
+//!
+//! # Cost limits and cancellation
+//!
+//! Requests that would be unreasonably expensive (astronomically large exact
+//! results, primality of huge numbers, factorizations that exhaust their
+//! iteration budget, ...) fail with [`NumberError::Limit`], which is distinct
+//! from [`NumberError::Overflow`] (a value that cannot be represented at all).
+//! Long-running loops (series, factorization, primality, big products) poll a
+//! per-thread interrupt flag installed with [`install_interrupt`] and return
+//! [`NumberError::Interrupted`] once it is set, so a UI worker can cancel them.
+//!
+//! # Equality and hashing
+//!
+//! `PartialEq` compares numeric values across kinds (`1 == 1.0 == 2/2`).
+//! `Number` deliberately does not implement `Hash`; any future implementation
+//! must hash the canonical numeric value so that it agrees with `PartialEq`.
 //!
 //! # Crate choice
 //!
@@ -45,6 +66,8 @@ mod elementary;
 mod float;
 mod format;
 mod functions;
+mod gamma;
+mod interrupt;
 mod parse;
 mod theory;
 
@@ -57,6 +80,7 @@ pub use num_bigint::BigInt;
 pub use num_rational::BigRational;
 
 pub use float::BigFloat;
+pub use interrupt::{InterruptGuard, check_interrupt, install_interrupt};
 pub use parse::parse_literal;
 pub use theory::{factorial, factorize, is_prime, n_choose_k, n_permute_k};
 
@@ -73,8 +97,12 @@ pub enum NumberError {
     NotReal,
     /// An exact integer was required (`gcd`, `factorial`, ...).
     NotInteger,
-    /// Result too large to represent.
+    /// Result too large (or too small) to represent at all.
     Overflow,
+    /// Refused because it would be too expensive to compute (time or memory).
+    Limit,
+    /// Cancelled through the interrupt flag (see [`install_interrupt`]).
+    Interrupted,
     /// Malformed numeric literal.
     Parse(String),
 }
@@ -87,6 +115,8 @@ impl fmt::Display for NumberError {
             NumberError::NotReal => write!(f, "expected a real number"),
             NumberError::NotInteger => write!(f, "expected an integer"),
             NumberError::Overflow => write!(f, "number too large"),
+            NumberError::Limit => write!(f, "computation too expensive"),
+            NumberError::Interrupted => write!(f, "computation interrupted"),
             NumberError::Parse(text) => write!(f, "invalid number literal: {text}"),
         }
     }
@@ -97,32 +127,47 @@ impl std::error::Error for NumberError {}
 /// Result alias for numeric operations.
 pub type NumResult<T> = Result<T, NumberError>;
 
-/// Working precision for arbitrary-precision floats, in significant decimal digits.
+/// Working precision for arbitrary-precision floats.
+///
+/// Stored in bits so that converting from a float's precision and back is
+/// lossless; constructed from (and reported as) significant decimal digits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Precision(u32);
+pub struct Precision {
+    bits: u64,
+}
 
 impl Precision {
     /// Default precision: 50 significant digits.
-    pub const DEFAULT: Precision = Precision(50);
+    pub const DEFAULT: Precision = Precision { bits: 167 };
 
-    /// Precision of `digits` significant decimal digits (at least 1).
+    /// Largest supported precision, in decimal digits.
+    pub const MAX_DIGITS: u32 = 100_000;
+
+    /// Precision of `digits` significant decimal digits, clamped to
+    /// `1..=MAX_DIGITS`.
     pub fn digits(digits: u32) -> Self {
-        Precision(digits.max(1))
+        let d = digits.clamp(1, Self::MAX_DIGITS);
+        Precision {
+            bits: ((d as f64) * std::f64::consts::LOG2_10).ceil() as u64,
+        }
     }
 
-    /// Precision able to hold `bits` binary digits.
+    /// Precision of exactly `bits` binary digits, clamped to the supported range.
     pub fn from_bits(bits: u64) -> Self {
-        Precision::digits(((bits as f64) * std::f64::consts::LOG10_2).floor() as u32)
+        let max = Precision::digits(Self::MAX_DIGITS).bits;
+        Precision {
+            bits: bits.clamp(4, max),
+        }
     }
 
-    /// Number of significant decimal digits.
+    /// Number of significant decimal digits (rounded down, at least 1).
     pub fn get(self) -> u32 {
-        self.0
+        (((self.bits as f64) * std::f64::consts::LOG10_2).floor() as u32).max(1)
     }
 
-    /// Number of mantissa bits needed for this many decimal digits.
+    /// Number of mantissa bits.
     pub fn bits(self) -> u64 {
-        ((self.0 as f64) * std::f64::consts::LOG2_10).ceil() as u64
+        self.bits
     }
 }
 
@@ -135,7 +180,7 @@ impl Default for Precision {
 /// A complex number whose parts are real [`Number`]s.
 ///
 /// Invariant (maintained by [`Number::complex`]): both parts are real and the
-/// imaginary part is not an exact zero.
+/// imaginary part is not zero.
 #[derive(Clone, Debug)]
 pub struct Complex {
     re: Number,
@@ -222,12 +267,12 @@ impl Number {
 
     /// Builds `re + im·i`. Parts may themselves be complex (the result is then
     /// computed arithmetically). Collapses to a real number if the imaginary
-    /// part is an exact zero.
+    /// part is zero (exact or inexact).
     pub fn complex(re: Number, im: Number) -> Number {
         if re.is_complex() || im.is_complex() {
             return re + im * Number::i();
         }
-        if im.is_exact_zero() {
+        if im.is_zero() {
             re
         } else {
             Number::Complex(Box::new(Complex { re, im }))
@@ -393,6 +438,40 @@ impl Number {
         match self {
             Number::Complex(c) => (c.re.to_f64(), c.im.to_f64()),
             other => (other.to_f64(), 0.0),
+        }
+    }
+
+    /// Converts a value computed for an `F64` operation back to the `F64` kind:
+    /// `F64` if the value is finite as an `f64`, otherwise a 53-bit
+    /// [`Number::Float`] (keeps the "F64 is always finite" invariant).
+    pub(crate) fn into_f64_kind(self) -> Number {
+        match self {
+            Number::Complex(c) => Number::complex(c.re.into_f64_kind(), c.im.into_f64_kind()),
+            Number::F64(_) => self,
+            other => {
+                let x = other.to_f64();
+                // Out of range (inf) or underflowed to zero: keep a 53-bit float.
+                if x.is_finite() && (x != 0.0 || other.is_zero()) {
+                    Number::F64(x)
+                } else {
+                    let big = other.to_bigfloat(Precision::from_bits(53)).expect("real");
+                    Number::Float(big.with_prec(53))
+                }
+            }
+        }
+    }
+
+    /// The integer value of an exact integer or of an exactly integral
+    /// `Float`/`F64` (`5.0` is accepted where an integer is required).
+    pub fn integer_value(&self) -> NumResult<BigInt> {
+        match self {
+            Number::Integer(n) => Ok(n.clone()),
+            Number::Float(f) if f.is_integral() => f.floor(),
+            Number::F64(x) if x.fract() == 0.0 => {
+                Ok(BigFloat::from_f64(*x, 64).expect("finite").floor()?)
+            }
+            Number::Complex(_) => Err(NumberError::NotReal),
+            _ => Err(NumberError::NotInteger),
         }
     }
 
