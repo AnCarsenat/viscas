@@ -13,8 +13,12 @@
 //!   propagation consumed by an evaluator through [`NodeEvaluator`].
 //! - [`document`]: the versioned, human-readable `.viscas` format (RON).
 
+pub mod analysis;
+pub mod graph;
 pub mod names;
 pub mod node;
+pub use analysis::{Analysis, Letter, Parsed, ParsedSource, Reference, analyze};
+pub use graph::{DepGraph, Diagnostic, DiagnosticKind, Resolution};
 pub use names::{
     Builtins, DefaultBuiltins, definition_line, is_valid_identifier, parse_definition, unique_name,
 };
