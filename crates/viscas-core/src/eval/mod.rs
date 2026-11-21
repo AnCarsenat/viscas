@@ -95,18 +95,32 @@
 //!
 //! # Statements
 //!
-//! At top level ([`exec_statement`], [`Session`]): `a = 3` and
-//! `f(x, y) = ...` define globals (variables are evaluated now; function
-//! bodies are kept and resolve global names at call time). Equations with
-//! a plot variable on one side (`y = …`, `x = …`, `r = …`) and other
-//! equations/inequalities are relations ([`Outcome::Relation`]). See
+//! Definitions use `:=` (see [`DefinitionOp`](crate::syntax::DefinitionOp)):
+//!
+//! | statement | meaning (default `ColonEq`) |
+//! |-----------|-----------------------------|
+//! | `a := 3`, `P := (1, 2)` | define a global variable (evaluated now) |
+//! | `f(x, y) := ...` | define a global function (body resolves globals at call time) |
+//! | `y = x^2`, `x = y^2`, `r = θ` | explicit / polar relation |
+//! | `x^2 + y^2 = 4`, `xy = 1` | implicit relation |
+//! | `a = 3`, `t^2 = 2` | equation without plot coordinates ([`StatementKind::Equation`], future solve target) |
+//! | `x^2 + y^2 < 4` | inequality |
+//!
+//! At top level ([`exec_statement`], [`Session`]) every `=` statement is a
+//! relation ([`Outcome::Relation`]); [`Session::eval`] reports it as having
+//! no value. With `DefinitionOp::Eq` (set [`Session::parse`] or use
+//! [`crate::syntax::parse_statement_with`]) `name = ...` / `f(x) = ...`
+//! define as before, except for `x`, `y`, `r` and prefix functions. See
 //! [`StatementKind`] for the classification rules.
 //!
-//! In scripts (`run_program`, blocks): `let x = v` binds a local; `x = v`
-//! assigns a visible local, otherwise defines a global; `fn f(a) { ... }`
-//! defines a closure (global at script top level); `if`/`else`, `for x in
-//! list`, `while`, `return`. A block evaluates to its last statement.
-//! Closures capture visible locals by value and can call themselves.
+//! In scripts (`run_program`, blocks): `let x = v` declares a local and
+//! `x = v` **reassigns a visible `let` variable** (any other `=` is an
+//! equation and an error in a script); `g := v` / `h(x) := ...` define
+//! globals (a visible `let` of the same name is reassigned instead);
+//! `fn f(a) { ... }` defines a closure (global at script top level);
+//! `if`/`else`, `for x in list`, `while`, `return`. A block evaluates to
+//! its last statement. Closures capture visible locals by value and can
+//! call themselves.
 //!
 //! # Budgets and cancellation
 //!
