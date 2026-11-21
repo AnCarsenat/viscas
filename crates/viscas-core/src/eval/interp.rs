@@ -1110,6 +1110,13 @@ impl<'a> Evaluator<'a> {
             } => self
                 .assign_equation(lhs, rhs, restrictions, span)
                 .map(Flow::Value),
+            StmtKind::Definition {
+                lhs,
+                rhs,
+                restrictions,
+            } => self
+                .exec_definition(lhs, rhs, restrictions)
+                .map(|(_, v)| Flow::Value(v)),
             StmtKind::Regression { .. } => Err(EvalError::unsupported(
                 "regression (`~`) is not implemented yet",
                 span,
@@ -1237,14 +1244,16 @@ impl<'a> Evaluator<'a> {
         })))
     }
 
-    /// `name = value` / `f(x, y) = body` in script context.
-    fn assign_equation(
+    /// `name := value` / `f(x, y) := body`: defines a global. A visible
+    /// `let` variable of the same name is reassigned instead (so scripts
+    /// written with `=` definitions keep working in `DefinitionOp::Eq`).
+    #[inline(never)]
+    pub(crate) fn exec_definition(
         &mut self,
         lhs: &Expr,
         rhs: &Expr,
         restrictions: &[Expr],
-        span: Span,
-    ) -> EvalResult<Value> {
+    ) -> EvalResult<(String, Value)> {
         let body = with_restrictions(rhs, restrictions);
         match &*lhs.kind {
             ExprKind::Ident(name) => {
@@ -1253,7 +1262,7 @@ impl<'a> Evaluator<'a> {
                 if !self.set_local(name, v.clone()) {
                     self.define_global(name, v.clone(), lhs.span)?;
                 }
-                Ok(v)
+                Ok((name.to_string(), v))
             }
             ExprKind::Call { callee, args } => {
                 let (name, params) = function_signature(callee, args).ok_or_else(|| {
@@ -1264,19 +1273,47 @@ impl<'a> Evaluator<'a> {
                     )
                 })?;
                 let f = self.make_fn(&name, &params, FnBody::Expr(body));
-                if self.has_local_scope() {
-                    self.bind_local(&name, f.clone());
-                } else {
-                    self.define_global(&name, f.clone(), lhs.span)?;
-                }
-                Ok(f)
+                self.define_global(&name, f.clone(), lhs.span)?;
+                Ok((name, f))
             }
             _ => Err(EvalError::new(
                 ErrorKind::Definition,
-                "only `name = value` and `f(x) = ...` can be executed; this is an equation",
-                span,
+                "the left side of a definition must be a name or `f(x, ...)`",
+                lhs.span,
             )),
         }
+    }
+
+    /// `x = value` in a script: reassigns a visible `let` variable. Any
+    /// other `=` is an equation, which a script cannot execute.
+    #[inline(never)]
+    fn assign_equation(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        restrictions: &[Expr],
+        span: Span,
+    ) -> EvalResult<Value> {
+        if let ExprKind::Ident(name) = &*lhs.kind {
+            let name = canonical_name(name);
+            if self.lookup_local(name).is_some() {
+                let v = self.eval(&with_restrictions(rhs, restrictions))?;
+                self.set_local(name, v.clone());
+                return Ok(v);
+            }
+            return Err(EvalError::new(
+                ErrorKind::Definition,
+                format!(
+                    "`{name} = ...` is an equation: use `{name} := ...` to define a global, or `let {name} = ...` for a local"
+                ),
+                span,
+            ));
+        }
+        Err(EvalError::new(
+            ErrorKind::Definition,
+            "this is an equation; only `let` variables can be assigned with `=` (define with `:=`)",
+            span,
+        ))
     }
 
     /// `a -> a + 1, b -> 0`: all values are computed first, then assigned.

@@ -17,7 +17,8 @@ pub const PLOT_VARS: &[&str] = &["x", "y", "r", "θ", "t"];
 /// What a statement is, for the plot layer and the scene.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StatementKind {
-    /// `a = 3`, `P = (1, 2)`, `f(x) = x^2`, `g(x, y) = ...`.
+    /// `a := 3`, `P := (1, 2)`, `f(x) := x^2`, `g(x, y) := ...` (or the
+    /// `=` forms with [`DefinitionOp::Eq`](crate::syntax::DefinitionOp::Eq)).
     Definition { name: String, params: Vec<String> },
     /// `y = f(x)` (also `f(x) = y` written the other way, and a bare
     /// expression in `x` such as `x^2`). [`StatementInfo::expr`] is `f`.
@@ -26,9 +27,12 @@ pub enum StatementKind {
     ExplicitX,
     /// `r = f(θ)`. [`StatementInfo::expr`] is `f`.
     Polar,
-    /// Any other equation; [`StatementInfo::expr`] is `lhs - rhs` (plot its
-    /// zero set).
+    /// Any other equation in `x`/`y`; [`StatementInfo::expr`] is
+    /// `lhs - rhs` (plot its zero set).
     Implicit,
+    /// An equation without plot coordinates (`a = 3`, `t^2 = 2`): a future
+    /// solve target. [`StatementInfo::expr`] is `lhs - rhs`.
+    Equation,
     /// A comparison involving plot variables (`x^2 + y^2 < 4`,
     /// `y <= sin x`). [`StatementInfo::expr`] is the comparison.
     Inequality { ops: Vec<CmpOp> },
@@ -88,8 +92,26 @@ pub fn classify(stmt: &Stmt, env: &Env) -> StatementInfo {
             rhs,
             restrictions,
         } => {
-            let (kind, expr, bound) = classify_equation(lhs, rhs, env);
-            info(kind, Some(expr), restrictions, &bound)
+            let (kind, expr) = classify_equation(lhs, rhs, env);
+            info(kind, Some(expr), restrictions, &[])
+        }
+        StmtKind::Definition {
+            lhs,
+            rhs,
+            restrictions,
+        } => {
+            let (name, params) = match &*lhs.kind {
+                ExprKind::Call { callee, args } => {
+                    function_signature(callee, args).unwrap_or_default()
+                }
+                ExprKind::Ident(n) => (canonical_name(n).to_string(), vec![]),
+                _ => Default::default(),
+            };
+            let kind = StatementKind::Definition {
+                name,
+                params: params.clone(),
+            };
+            info(kind, Some(rhs.clone()), restrictions, &params)
         }
         StmtKind::Expr { expr, restrictions } => {
             let free = free_vars(expr, env);
@@ -122,8 +144,8 @@ pub fn classify(stmt: &Stmt, env: &Env) -> StatementInfo {
     }
 }
 
-/// `(kind, expr, names bound by the definition)`.
-fn classify_equation(lhs: &Expr, rhs: &Expr, env: &Env) -> (StatementKind, Expr, Vec<String>) {
+/// `(kind, expr)` of an equation `lhs = rhs` (never a definition).
+fn classify_equation(lhs: &Expr, rhs: &Expr, env: &Env) -> (StatementKind, Expr) {
     let ident = |e: &Expr| match &*e.kind {
         ExprKind::Ident(n) => Some(canonical_name(n).to_string()),
         _ => None,
@@ -140,45 +162,23 @@ fn classify_equation(lhs: &Expr, rhs: &Expr, env: &Env) -> (StatementKind, Expr,
             _ => None,
         }
     };
-    if let Some(name) = ident(lhs) {
-        if let Some(kind) = explicit(&name, rhs) {
-            return (kind, rhs.clone(), vec![]);
-        }
-        // `xy = 1` with unknown `xy` is the implicit curve x·y = 1.
-        let splits_into_coords = name.chars().count() > 1 && {
-            let fv = free_vars(lhs, env);
-            fv.iter().any(|v| v == "x" || v == "y")
-        };
-        if !matches!(name.as_str(), "x" | "y" | "r") && !splits_into_coords {
-            return (
-                StatementKind::Definition {
-                    name,
-                    params: vec![],
-                },
-                rhs.clone(),
-                vec![],
-            );
-        }
+    if let Some(name) = ident(lhs)
+        && let Some(kind) = explicit(&name, rhs)
+    {
+        return (kind, rhs.clone());
     }
     if let Some(name) = ident(rhs)
         && let Some(kind) = explicit(&name, lhs)
     {
-        return (kind, lhs.clone(), vec![]);
+        return (kind, lhs.clone());
     }
-    if let ExprKind::Call { callee, args } = &*lhs.kind
-        && let Some((name, params)) = function_signature(callee, args)
-        && !is_builtin_name(&name)
-    {
-        return (
-            StatementKind::Definition {
-                name,
-                params: params.clone(),
-            },
-            rhs.clone(),
-            params,
-        );
+    let diff = sub(lhs, rhs);
+    let fv = free_vars(&diff, env);
+    if fv.iter().any(|v| v == "x" || v == "y") {
+        (StatementKind::Implicit, diff)
+    } else {
+        (StatementKind::Equation, diff)
     }
-    (StatementKind::Implicit, sub(lhs, rhs), vec![])
 }
 
 /// `lhs - rhs`.
@@ -380,7 +380,7 @@ pub fn exec_statement(stmt: &Stmt, env: &mut Env, opts: &EvalOptions) -> EvalRes
     match (&info.kind, &stmt.kind) {
         (
             StatementKind::Definition { name, params },
-            StmtKind::Equation {
+            StmtKind::Definition {
                 rhs, restrictions, ..
             },
         ) => {
@@ -404,6 +404,7 @@ pub fn exec_statement(stmt: &Stmt, env: &mut Env, opts: &EvalOptions) -> EvalRes
             | StatementKind::ExplicitX
             | StatementKind::Polar
             | StatementKind::Implicit
+            | StatementKind::Equation
             | StatementKind::Inequality { .. }
             | StatementKind::Parametric { .. },
             _,
@@ -462,7 +463,8 @@ fn approx_value(
 }
 
 /// Runs a script: statements execute in a fresh local scope (`let` is
-/// local; `name = value` and `fn` define globals). Returns the value of the
+/// local and reassigned with `x = v`; `name := value` and `fn` define
+/// globals). Returns the value of the
 /// last statement (or of `return`).
 pub fn run_program(program: &Program, env: &mut Env, opts: &EvalOptions) -> EvalResult<Value> {
     let mut ev = Evaluator::new(env, opts);
@@ -497,6 +499,8 @@ fn run_top(ev: &mut Evaluator<'_>, stmts: &[Stmt]) -> EvalResult<Value> {
 pub struct Session {
     pub env: Env,
     pub opts: EvalOptions,
+    /// Parser options (definition operator `:=` vs `=`).
+    pub parse: crate::syntax::ParseOptions,
 }
 
 impl Session {
@@ -517,7 +521,7 @@ impl Session {
                     return Err(EvalError::new(
                         ErrorKind::Other,
                         format!(
-                            "this is a relation ({:?}); it can be plotted but has no value",
+                            "this is a relation ({:?}), not a definition; it has no value (define with `:=`)",
                             info.kind
                         ),
                         Span::default(),
@@ -531,7 +535,8 @@ impl Session {
     /// Parses and executes every statement of `src`, top-level semantics.
     /// Multi-line scripts with `let` share one scope.
     pub fn run(&mut self, src: &str) -> EvalResult<Vec<Outcome>> {
-        let program = crate::syntax::parse_program(src).map_err(|e| EvalError::from_parse(&e))?;
+        let program = crate::syntax::parse_program_with(src, &self.parse)
+            .map_err(|e| EvalError::from_parse(&e))?;
         let scripted = program.stmts.iter().any(|s| {
             matches!(
                 s.kind,

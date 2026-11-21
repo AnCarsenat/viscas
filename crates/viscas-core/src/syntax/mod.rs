@@ -14,6 +14,7 @@
 //!             | 'if' head block ('else' (if-stmt | block))?
 //!             | 'for' IDENT 'in' head block | 'while' head block
 //!             | 'fn' IDENT '(' params ')' block | 'return' expr?
+//!             | head ':=' expr restrictions          definition
 //!             | expr ('=' expr | '~' expr)? restrictions
 //!             | expr '->' expr (',' expr '->' expr)*
 //! restrictions := ('{' expr (',' expr)* '}')*
@@ -39,7 +40,16 @@
 //! - `cmpop` is `< <= > >= == !=` (and unicode `≤ ≥ ≠`). A single `=` is an
 //!   equality comparison only inside brackets, braces, call arguments and
 //!   `if`/`while` heads; at statement level it produces
-//!   [`StmtKind::Equation`] (definition vs. equation is decided later).
+//!   [`StmtKind::Equation`].
+//! - Definitions use `:=` (also `≔`): `a := 3`, `f(x, y) := x y`
+//!   ([`StmtKind::Definition`]); the left side must be a name or `f(...)`
+//!   with distinct parameter names. With the default
+//!   [`DefinitionOp::ColonEq`] a statement-level `=` is *always* an
+//!   equation/relation (`x = 3` is a vertical line, `a = 3` an equation in
+//!   `a`). [`ParseOptions`] with [`DefinitionOp::Eq`] restores `=`
+//!   definitions for `name = ...` / `f(x) = ...` (except `x`, `y`, `r` and
+//!   prefix functions). In scripts, `let x = 3` declares a local and
+//!   `x = 4` reassigns it; `:=` defines a global.
 //! - Inequalities such as `x^2 + y^2 < 4` are plain expression statements.
 //! - Restrictions: `{...}` groups at the end of an expression, equation or
 //!   regression statement are stored on the statement and apply to the whole
@@ -199,11 +209,31 @@ fn finish<T>(value: Option<T>, mut errors: Vec<ParseError>) -> Result<T, Vec<Par
     }
 }
 
+/// Which operator defines variables and functions at statement level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DefinitionOp {
+    /// `a := 3`, `f(x) := x^2` define; `=` is always an equation/relation
+    /// (`x = 3` is a vertical line, `a = 3` an equation in `a`). Default.
+    #[default]
+    ColonEq,
+    /// Legacy/alternative: `name = ...` and `f(x, ...) = ...` also define
+    /// (unless the name is `x`, `y`, `r` or a prefix function such as
+    /// `sin`), so `a = 3` defines `a` while `y = x^2` stays a relation.
+    /// `:=` still defines.
+    Eq,
+}
+
+/// Parser configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ParseOptions {
+    pub definition_op: DefinitionOp,
+}
+
 /// Parse a single expression (surrounding newlines allowed). A top-level
 /// `=` is an error here; use [`parse_statement`] for definitions/equations.
 pub fn parse_expr(src: &str) -> Result<Expr, Vec<ParseError>> {
     let (tokens, mut errors) = lexer::lex(src);
-    let mut p = parser::Parser::new(tokens);
+    let mut p = parser::Parser::new(tokens, ParseOptions::default());
     let r = p.expr_entry();
     errors.append(&mut p.errors);
     let value = r.map_err(|e| errors.push(e)).ok();
@@ -212,8 +242,13 @@ pub fn parse_expr(src: &str) -> Result<Expr, Vec<ParseError>> {
 
 /// Parse exactly one statement (an expression-list line or console input).
 pub fn parse_statement(src: &str) -> Result<Stmt, Vec<ParseError>> {
+    parse_statement_with(src, &ParseOptions::default())
+}
+
+/// [`parse_statement`] with explicit options.
+pub fn parse_statement_with(src: &str, opts: &ParseOptions) -> Result<Stmt, Vec<ParseError>> {
     let (tokens, mut errors) = lexer::lex(src);
-    let mut p = parser::Parser::new(tokens);
+    let mut p = parser::Parser::new(tokens, *opts);
     let r = p.statement_entry();
     errors.append(&mut p.errors);
     let value = r.map_err(|e| errors.push(e)).ok();
@@ -222,15 +257,25 @@ pub fn parse_statement(src: &str) -> Result<Stmt, Vec<ParseError>> {
 
 /// Parse a script. All errors are reported (statement-level recovery).
 pub fn parse_program(src: &str) -> Result<Program, Vec<ParseError>> {
-    let (program, errors) = parse_program_partial(src);
+    parse_program_with(src, &ParseOptions::default())
+}
+
+/// [`parse_program`] with explicit options.
+pub fn parse_program_with(src: &str, opts: &ParseOptions) -> Result<Program, Vec<ParseError>> {
+    let (program, errors) = parse_program_partial_with(src, opts);
     finish(Some(program), errors)
 }
 
 /// Parse a script, returning the statements that parsed successfully along
 /// with every error encountered.
 pub fn parse_program_partial(src: &str) -> (Program, Vec<ParseError>) {
+    parse_program_partial_with(src, &ParseOptions::default())
+}
+
+/// [`parse_program_partial`] with explicit options.
+pub fn parse_program_partial_with(src: &str, opts: &ParseOptions) -> (Program, Vec<ParseError>) {
     let (tokens, mut errors) = lexer::lex(src);
-    let mut p = parser::Parser::new(tokens);
+    let mut p = parser::Parser::new(tokens, *opts);
     let program = p.program();
     errors.append(&mut p.errors);
     errors.sort_by_key(|e| (e.span.start, e.span.end));

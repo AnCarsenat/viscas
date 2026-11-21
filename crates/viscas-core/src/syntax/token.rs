@@ -116,6 +116,8 @@ pub enum TokenKind {
     DotDot,
     /// `=`
     Assign,
+    /// `:=` or `≔` (definition)
+    ColonEq,
     /// `==`
     EqEq,
     /// `!=` or `≠`
@@ -172,6 +174,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Dot => "`.`",
             TokenKind::DotDot => "`..`",
             TokenKind::Assign => "`=`",
+            TokenKind::ColonEq => "`:=`",
             TokenKind::EqEq => "`==`",
             TokenKind::NotEq => "`!=`",
             TokenKind::Lt => "`<`",

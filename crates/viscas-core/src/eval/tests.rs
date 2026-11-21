@@ -168,7 +168,7 @@ fn implicit_multiplication() {
 #[test]
 fn implicit_mult_with_space_and_number() {
     let mut s = session();
-    ev_with(&mut s, "a = 4");
+    ev_with(&mut s, "a := 4");
     assert_eq!(ev_with(&mut s, "a 2"), "8");
     assert_eq!(ev_with(&mut s, "(a)(a)"), "16");
     assert_eq!(ev_with(&mut s, "-2a"), "-8");
@@ -187,8 +187,8 @@ fn split_identifier_product() {
 #[test]
 fn split_prefers_defined_multi_letter_names() {
     let mut s = session();
-    ev_with(&mut s, "ab = 10");
-    ev_with(&mut s, "c = 3");
+    ev_with(&mut s, "ab := 10");
+    ev_with(&mut s, "c := 3");
     assert_eq!(ev_with(&mut s, "abc"), "30");
 }
 
@@ -203,10 +203,10 @@ fn split_with_pi() {
 #[test]
 fn split_with_digits_and_subscript() {
     let mut s = session();
-    ev_with(&mut s, "a = 2");
-    ev_with(&mut s, "b2 = 7");
+    ev_with(&mut s, "a := 2");
+    ev_with(&mut s, "b2 := 7");
     assert_eq!(ev_with(&mut s, "ab2"), "14");
-    ev_with(&mut s, "y_1 = 5");
+    ev_with(&mut s, "y_1 := 5");
     assert_eq!(ev_with(&mut s, "ay_1"), "10");
 }
 
@@ -232,7 +232,7 @@ fn defined_name_is_not_split() {
     let mut s = session();
     ev_with(&mut s, "let x = 2");
     ev_with(&mut s, "let y = 3");
-    ev_with(&mut s, "xy = 100");
+    ev_with(&mut s, "xy := 100");
     assert_eq!(ev_with(&mut s, "xy"), "100");
 }
 
@@ -247,7 +247,7 @@ fn call_vs_multiply_number() {
 #[test]
 fn call_vs_multiply_function() {
     let mut s = session();
-    ev_with(&mut s, "f(x) = x^2");
+    ev_with(&mut s, "f(x) := x^2");
     assert_eq!(ev_with(&mut s, "f(3)"), "9");
     assert_eq!(ev_with(&mut s, "2f(3)"), "18");
 }
@@ -255,15 +255,15 @@ fn call_vs_multiply_function() {
 #[test]
 fn call_vs_multiply_tuple() {
     let mut s = session();
-    ev_with(&mut s, "k = 2");
+    ev_with(&mut s, "k := 2");
     assert_eq!(ev_with(&mut s, "k(1, 2)"), "(2, 4)");
 }
 
 #[test]
 fn split_call_applies_last_piece() {
     let mut s = session();
-    ev_with(&mut s, "a = 3");
-    ev_with(&mut s, "f(x) = x + 1");
+    ev_with(&mut s, "a := 3");
+    ev_with(&mut s, "f(x) := x + 1");
     assert_eq!(ev_with(&mut s, "af(1)"), "6");
 }
 
@@ -281,7 +281,7 @@ fn prefix_function_application() {
 #[test]
 fn ascii_alias_theta() {
     let mut s = session();
-    ev_with(&mut s, "theta = 2");
+    ev_with(&mut s, "theta := 2");
     assert_eq!(ev_with(&mut s, "θ + 1"), "3");
 }
 
@@ -302,8 +302,8 @@ error_cases! {
     units_unsupported: "5 km to m" => ErrorKind::Unsupported,
     indefinite_integral: "∫ 2 dx" => ErrorKind::Unsupported,
     infinite_sum: "∑(k = 1, ∞) 1/k^2" => ErrorKind::Unsupported,
-    redefine_builtin: "sin = 3" => ErrorKind::Definition,
-    redefine_constant: "π = 3" => ErrorKind::Definition,
+    redefine_builtin: "sin := 3" => ErrorKind::Definition,
+    redefine_constant: "π := 3" => ErrorKind::Definition,
     complex_ordering: "i < 1" => ErrorKind::NotReal,
     list_length_mismatch: "[1, 2] + [1, 2, 3]" => ErrorKind::Other,
     matrix_size_mismatch: "[[1, 2], [3, 4]] + [[1, 2, 3], [4, 5, 6]]" => ErrorKind::Other,
@@ -363,7 +363,7 @@ cases! {
 #[test]
 fn piecewise_abs_function() {
     let mut s = session();
-    ev_with(&mut s, "g(x) = {x < 0: -x, x}");
+    ev_with(&mut s, "g(x) := {x < 0: -x, x}");
     assert_eq!(ev_with(&mut s, "g(-3)"), "3");
     assert_eq!(ev_with(&mut s, "g(4)"), "4");
     assert_eq!(ev_with(&mut s, "g([-1, 2])"), "[1, 2]");
@@ -372,7 +372,7 @@ fn piecewise_abs_function() {
 #[test]
 fn restricted_function_definition() {
     let mut s = session();
-    ev_with(&mut s, "h(x) = x^2 {0 < x < 2}");
+    ev_with(&mut s, "h(x) := x^2 {0 < x < 2}");
     assert_eq!(ev_with(&mut s, "h(1)"), "1");
     assert_eq!(ev_with(&mut s, "h(3)"), "undefined");
 }
@@ -416,7 +416,7 @@ cases! {
 #[test]
 fn list_filter_by_variable() {
     let mut s = session();
-    ev_with(&mut s, "L = [5, 1, 4, 2]");
+    ev_with(&mut s, "L := [5, 1, 4, 2]");
     assert_eq!(ev_with(&mut s, "L[L > 3]"), "[5, 4]");
     assert_eq!(ev_with(&mut s, "L[2]"), "1");
     assert_eq!(ev_with(&mut s, "len(L)"), "4");
@@ -452,8 +452,8 @@ cases! {
 #[test]
 fn point_members_of_variable() {
     let mut s = session();
-    ev_with(&mut s, "P = (1, 2)");
-    ev_with(&mut s, "Q = (4, 6)");
+    ev_with(&mut s, "P := (1, 2)");
+    ev_with(&mut s, "Q := (4, 6)");
     assert_eq!(ev_with(&mut s, "Q - P"), "(3, 4)");
     assert_eq!(ev_with(&mut s, "sqrt((Q.x - P.x)^2 + (Q.y - P.y)^2)"), "5");
 }
@@ -613,7 +613,7 @@ fn radian_mode_is_default() {
 #[test]
 fn function_definition_and_call() {
     let mut s = session();
-    ev_with(&mut s, "f(x) = x^2 + 1");
+    ev_with(&mut s, "f(x) := x^2 + 1");
     assert_eq!(ev_with(&mut s, "f(2)"), "5");
     assert_eq!(ev_with(&mut s, "f(1/2)"), "5/4");
     assert_eq!(ev_with(&mut s, "f([1, 2])"), "[2, 5]");
@@ -622,7 +622,7 @@ fn function_definition_and_call() {
 #[test]
 fn multi_arg_function() {
     let mut s = session();
-    ev_with(&mut s, "g(x, y) = x^2 + y^2");
+    ev_with(&mut s, "g(x, y) := x^2 + y^2");
     assert_eq!(ev_with(&mut s, "g(3, 4)"), "25");
     let e = s.eval("g(1)").unwrap_err();
     assert_eq!(e.kind, ErrorKind::Arity);
@@ -631,18 +631,18 @@ fn multi_arg_function() {
 #[test]
 fn functions_see_global_redefinitions() {
     let mut s = session();
-    ev_with(&mut s, "a = 2");
-    ev_with(&mut s, "f(x) = a x");
+    ev_with(&mut s, "a := 2");
+    ev_with(&mut s, "f(x) := a x");
     assert_eq!(ev_with(&mut s, "f(5)"), "10");
-    ev_with(&mut s, "a = 3");
+    ev_with(&mut s, "a := 3");
     assert_eq!(ev_with(&mut s, "f(5)"), "15");
 }
 
 #[test]
 fn function_composition() {
     let mut s = session();
-    ev_with(&mut s, "f(x) = x + 1");
-    ev_with(&mut s, "g(x) = 2x");
+    ev_with(&mut s, "f(x) := x + 1");
+    ev_with(&mut s, "g(x) := 2x");
     assert_eq!(ev_with(&mut s, "f(g(3))"), "7");
     assert_eq!(ev_with(&mut s, "g(f(3))"), "8");
 }
@@ -650,14 +650,14 @@ fn function_composition() {
 #[test]
 fn parameter_shadows_constant() {
     let mut s = session();
-    ev_with(&mut s, "f(e) = e + 1");
+    ev_with(&mut s, "f(e) := e + 1");
     assert_eq!(ev_with(&mut s, "f(1)"), "2");
 }
 
 #[test]
 fn function_value_display() {
     let mut s = session();
-    let v = s.eval("f(x) = x^2").unwrap();
+    let v = s.eval("f(x) := x^2").unwrap();
     assert_eq!(v.to_string(), "f(x) = x^2");
     assert_eq!(ev("sin").to_string(), "builtin sin");
 }
@@ -733,15 +733,15 @@ fn let_is_local_to_block() {
 #[test]
 fn script_assignment_defines_global() {
     let mut s = session();
-    ev_with(&mut s, "let t = 0\nfor k in [1..3] { total = k }\nt");
+    ev_with(&mut s, "let t = 0\nfor k in [1..3] { total := k }\nt");
     assert_eq!(ev_with(&mut s, "total"), "3");
 }
 
 #[test]
 fn action_updates_simultaneously() {
     let mut s = session();
-    ev_with(&mut s, "a = 1");
-    ev_with(&mut s, "b = 2");
+    ev_with(&mut s, "a := 1");
+    ev_with(&mut s, "b := 2");
     ev_with(&mut s, "a -> b, b -> a");
     assert_eq!(ev_with(&mut s, "(a, b)"), "(2, 1)");
 }
@@ -776,7 +776,7 @@ fn infinite_recursion_hits_depth_limit() {
 #[test]
 fn deep_expression_recursion_is_error_not_crash() {
     let mut s = session();
-    ev_with(&mut s, "r(n) = {n <= 0: 0, 1 + r(n - 1)}");
+    ev_with(&mut s, "r(n) := {n <= 0: 0, 1 + r(n - 1)}");
     assert_eq!(ev_with(&mut s, "r(20)"), "20");
     let e = s.eval("r(100000)").unwrap_err();
     assert_eq!(e.kind, ErrorKind::DepthLimit);
@@ -856,7 +856,7 @@ fn derivative_without_value_is_unsupported() {
 #[test]
 fn prime_derivative_user_function() {
     let mut s = session();
-    ev_with(&mut s, "f(x) = sin(x)");
+    ev_with(&mut s, "f(x) := sin(x)");
     let v = s.eval("f'(1)").unwrap().to_f64();
     assert!(close(v, 1f64.cos(), 1e-9), "{v}");
     let v = s.eval("f''(1)").unwrap().to_f64();
@@ -868,7 +868,7 @@ fn prime_derivative_user_function() {
 #[test]
 fn prime_third_order() {
     let mut s = session();
-    ev_with(&mut s, "p(x) = x^4");
+    ev_with(&mut s, "p(x) := x^4");
     let v = s.eval("p'''(1)").unwrap().to_f64();
     assert!(close(v, 24.0, 1e-3), "{v}");
 }
@@ -902,7 +902,7 @@ fn integral_infinite_bounds() {
 #[test]
 fn integral_ascii_and_user_function() {
     let mut s = session();
-    ev_with(&mut s, "f(t) = 2t");
+    ev_with(&mut s, "f(t) := 2t");
     let v = s.eval("int(0, 3) f(t) dt").unwrap().to_f64();
     assert!(close(v, 9.0, 1e-12), "{v}");
 }
@@ -961,7 +961,7 @@ fn classify_src(src: &str, env: &Env) -> StatementInfo {
 #[test]
 fn classify_definitions() {
     let env = Env::new();
-    let i = classify_src("a = 3", &env);
+    let i = classify_src("a := 3", &env);
     assert_eq!(
         i.kind,
         StatementKind::Definition {
@@ -969,7 +969,7 @@ fn classify_definitions() {
             params: vec![]
         }
     );
-    let i = classify_src("f(x) = x^2 + a", &env);
+    let i = classify_src("f(x) := x^2 + a", &env);
     assert_eq!(
         i.kind,
         StatementKind::Definition {
@@ -978,7 +978,7 @@ fn classify_definitions() {
         }
     );
     assert_eq!(i.free_vars, vec!["a".to_string()]);
-    let i = classify_src("g(x, y) = x y", &env);
+    let i = classify_src("g(x, y) := x y", &env);
     assert_eq!(
         i.kind,
         StatementKind::Definition {
@@ -991,7 +991,7 @@ fn classify_definitions() {
 
 #[test]
 fn classify_point_definition() {
-    let i = classify_src("P = (1, 2)", &Env::new());
+    let i = classify_src("P := (1, 2)", &Env::new());
     assert!(matches!(i.kind, StatementKind::Definition { ref name, .. } if name == "P"));
 }
 
@@ -1102,7 +1102,7 @@ fn classify_bound_variables_not_free() {
 fn exec_statement_outcomes() {
     let mut env = Env::new();
     let opts = EvalOptions::default();
-    let st = parse_statement("a = 1/2").unwrap();
+    let st = parse_statement("a := 1/2").unwrap();
     let o = exec_statement(&st, &mut env, &opts).unwrap();
     assert!(matches!(o, Outcome::Defined { ref name, .. } if name == "a"));
     let st = parse_statement("y = a x").unwrap();
@@ -1120,7 +1120,7 @@ fn exec_statement_outcomes() {
 #[test]
 fn session_eval_relation_is_error() {
     let mut s = session();
-    assert!(s.eval("y = x^2").is_err());
+    assert!(s.eval("y := x^2").is_err());
 }
 
 // ----- resolver -------------------------------------------------------------------
@@ -1132,7 +1132,7 @@ fn resolver_supplies_names() {
         (name == "node").then(|| Value::num(Number::from(42)))
     })));
     assert_eq!(ev_with(&mut s, "node + 1"), "43");
-    ev_with(&mut s, "node2 = 1");
+    ev_with(&mut s, "node2 := 1");
     assert_eq!(ev_with(&mut s, "node2"), "1");
 }
 
@@ -1142,7 +1142,7 @@ fn resolver_used_after_globals() {
     s.env.set_resolver(Some(Arc::new(|name: &str| {
         (name == "a").then(|| Value::num(Number::from(1)))
     })));
-    ev_with(&mut s, "a = 5");
+    ev_with(&mut s, "a := 5");
     assert_eq!(ev_with(&mut s, "a"), "5");
 }
 
@@ -1183,8 +1183,8 @@ fn plot_fn_two_vars() {
 #[test]
 fn plot_fn_uses_globals_and_inlines_functions() {
     let mut s = session();
-    ev_with(&mut s, "a = 3");
-    ev_with(&mut s, "f(t) = a t + 1");
+    ev_with(&mut s, "a := 3");
+    ev_with(&mut s, "f(t) := a t + 1");
     let f = plot("f(x)^2", &["x"], &s.env);
     assert!(f.is_compiled());
     assert_eq!(f.eval1(1.0), 16.0);
@@ -1348,11 +1348,87 @@ fn value_equality_and_type_names() {
 #[test]
 fn multi_statement_console_input() {
     let mut s = session();
-    assert_eq!(ev_with(&mut s, "a = 2; b = 3; a b"), "6");
+    assert_eq!(ev_with(&mut s, "a := 2; b := 3; a b"), "6");
+}
+
+// ----- definition operator ----------------------------------------------------
+
+#[test]
+fn plain_eq_is_an_equation_by_default() {
+    let env = Env::new();
+    assert_eq!(classify_src("a = 3", &env).kind, StatementKind::Equation);
+    assert_eq!(classify_src("x = 3", &env).kind, StatementKind::ExplicitX);
+    assert_eq!(
+        classify_src("f(x) = x^2", &env).kind,
+        StatementKind::Implicit
+    );
+    let mut s = session();
+    let e = s.eval("a = 3").unwrap_err();
+    assert!(e.message.contains(":="), "{}", e.message);
+    assert!(!s.env.contains("a"));
+}
+
+#[test]
+fn colon_eq_defines() {
+    let mut s = session();
+    assert_eq!(ev_with(&mut s, "a := 3"), "3");
+    assert_eq!(ev_with(&mut s, "f(x, y) := a x + y"), "f(x, y) = a * x + y");
+    assert_eq!(ev_with(&mut s, "f(2, 1)"), "7");
+    assert_eq!(ev_with(&mut s, "b ≔ a + 1"), "4");
+}
+
+#[test]
+fn colon_eq_needs_definition_head() {
+    let e = err("a + 1 := 3");
+    assert_eq!(e.kind, ErrorKind::Parse);
+    let e = err("f(x, x) := 1");
+    assert_eq!(e.kind, ErrorKind::Parse);
+}
+
+#[test]
+fn eq_mode_keeps_equals_definitions() {
+    let mut s = session();
+    s.parse.definition_op = crate::syntax::DefinitionOp::Eq;
+    assert_eq!(ev_with(&mut s, "a = 3"), "3");
+    assert_eq!(ev_with(&mut s, "f(x) = x + a"), "f(x) = x + a");
+    assert_eq!(ev_with(&mut s, "f(1)"), "4");
+    assert!(matches!(s.run("y = x^2").unwrap()[0], Outcome::Relation(_)));
+    assert!(matches!(s.run("x = 2").unwrap()[0], Outcome::Relation(_)));
+    // `:=` still defines.
+    assert_eq!(ev_with(&mut s, "c := 5"), "5");
+    // Script blocks: `=` defines globals / reassigns lets as before.
+    ev_with(
+        &mut s,
+        "let t = 0\nfor k in [1..3] { t = t + k\n total = t }\nt",
+    );
+    assert_eq!(ev_with(&mut s, "total"), "6");
+}
+
+#[test]
+fn script_reassignment_of_let_with_equals() {
+    assert_eq!(ev("let v = 1\nv = v + 1\nv"), "2");
+    let mut s = session();
+    let e = s.eval("let v = 1\nw = 2").unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Definition);
+}
+
+#[test]
+fn script_top_level_colon_eq_defines_global() {
+    let mut s = session();
+    ev_with(&mut s, "let k = 2\ng := k * 10\nh(x) := x + k");
+    assert_eq!(ev_with(&mut s, "g"), "20");
+    assert_eq!(ev_with(&mut s, "h(1)"), "3");
+    assert!(!s.env.contains("k"));
+}
+
+#[test]
+fn definition_prints_colon_eq() {
+    let st = parse_statement("f(x) := x^2 {x > 0}").unwrap();
+    assert_eq!(st.to_string(), "f(x) := x^2 {x > 0}");
 }
 
 #[test]
 fn definition_returns_value() {
     let mut s = session();
-    assert_eq!(ev_with(&mut s, "c = 1/2 + 1/2"), "1");
+    assert_eq!(ev_with(&mut s, "c := 1/2 + 1/2"), "1");
 }

@@ -15,7 +15,7 @@
 //!   name). `∞` is a one-character identifier. `d` directly followed by a
 //!   Greek letter (`dθ`) is one identifier so differentials work.
 //! - Unicode operator aliases: `· × ⋅` → `*`, `÷` → `/`, `−` → `-`,
-//!   `≤ ≥ ≠`, `→` → `->`, `′` → `'`, `**` → `^`, `...` → `..`.
+//!   `≤ ≥ ≠`, `→` → `->`, `′` → `'`, `**` → `^`, `...` → `..`, `≔` → `:=`.
 //! - A string literal never spans lines: an unterminated string ends at the
 //!   newline, which is kept as a separate token so the next line still parses.
 
@@ -301,6 +301,11 @@ impl Lexer<'_> {
             '}' => T::RBrace,
             ',' => T::Comma,
             ';' => T::Semi,
+            ':' if next == Some('=') => {
+                self.bump();
+                T::ColonEq
+            }
+            '≔' => T::ColonEq,
             ':' => T::Colon,
             '.' if next == Some('.') => {
                 self.bump();
