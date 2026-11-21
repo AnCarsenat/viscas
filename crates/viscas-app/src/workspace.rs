@@ -1,6 +1,6 @@
 //! Workspaces: named, predefined area layouts shown as top bar tabs.
 
-use crate::layout::{Dir, EditorKind, Layout, Node};
+use crate::layout::{Dir, EditorKind, IdGen, Layout, Node};
 
 /// The built-in workspaces, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,8 +43,9 @@ impl Workspace {
         }
     }
 
-    /// The layout a fresh document starts with in this workspace.
-    pub fn default_layout(self) -> Layout {
+    /// The layout a fresh document starts with in this workspace, with
+    /// ids drawn from `ids`.
+    pub fn default_layout(self, ids: &mut IdGen) -> Layout {
         use Dir::{Horizontal as H, Vertical as V};
         use EditorKind::*;
         let leaf = Node::leaf;
@@ -78,7 +79,7 @@ impl Workspace {
                 leaf(Viewport),
             ),
         };
-        Layout::new(root)
+        Layout::new(root, ids)
     }
 }
 
@@ -97,7 +98,7 @@ mod tests {
     fn graph_layout_matches_spec() {
         use EditorKind::*;
         let editors: Vec<_> = Workspace::Graph
-            .default_layout()
+            .default_layout(&mut IdGen::default())
             .leaves()
             .into_iter()
             .map(|(_, e)| e)
@@ -108,7 +109,7 @@ mod tests {
     #[test]
     fn every_workspace_has_a_viewport() {
         for w in Workspace::ALL {
-            let leaves = w.default_layout().leaves();
+            let leaves = w.default_layout(&mut IdGen::default()).leaves();
             assert!(leaves.iter().any(|(_, e)| *e == EditorKind::Viewport));
         }
     }

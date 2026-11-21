@@ -3,6 +3,7 @@
 use gtk::gio;
 use gtk::prelude::*;
 
+use crate::ctx::AppCtx;
 use crate::{shortcuts, theme, window};
 
 pub const APP_ID: &str = "io.github.ancarsenat.Viscas";
@@ -11,10 +12,12 @@ pub const APP_ID: &str = "io.github.ancarsenat.Viscas";
 pub fn build() -> gtk::Application {
     let app = gtk::Application::builder().application_id(APP_ID).build();
     app.connect_startup(setup);
-    app.connect_activate(|app| {
+    // One context for the application, shared by every window.
+    let ctx = AppCtx::new();
+    app.connect_activate(move |app| {
         let window = app
             .active_window()
-            .unwrap_or_else(|| window::build(app).upcast());
+            .unwrap_or_else(|| window::build(app, &ctx).upcast());
         window.present();
     });
     app

@@ -3,16 +3,17 @@
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::areas::Areas;
-use crate::commands;
+use crate::areas::{AreaCommands, Areas};
+use crate::commands::WindowCommands;
+use crate::ctx::AppCtx;
 use crate::layout::{Dir, EditorKind};
 use crate::palette::Palette;
 use crate::workspace::Workspace;
 
 /// Builds and returns the main window for `app`.
-pub fn build(app: &gtk::Application) -> gtk::ApplicationWindow {
-    let areas = Areas::new(Workspace::Graph);
-    let (statusbar, area_info) = build_statusbar();
+pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
+    let areas = Areas::new(ctx, Workspace::Graph);
+    let (statusbar, selection_info, area_info) = build_statusbar();
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -32,9 +33,27 @@ pub fn build(app: &gtk::Application) -> gtk::ApplicationWindow {
         .child(&overlay)
         .build();
 
-    let palette = Palette::new(&overlay);
+    let palette = Palette::new(&overlay, ctx);
+    palette.contain_focus(&window);
     install_actions(&window, &areas, &palette);
-    palette.set_commands(commands::registry(&window));
+    ctx.add_command_provider(WindowCommands::new(&window));
+    ctx.add_command_provider(AreaCommands::new(&areas));
+
+    let update_selection = move |sel: &crate::ctx::Selection| {
+        let selected = sel.selected();
+        let text = match selected.len() {
+            0 => "Nothing selected".to_owned(),
+            1 => format!("Node #{}", selected[0]),
+            n => format!("{n} nodes selected"),
+        };
+        let text = match sel.hovered() {
+            Some(id) => format!("{text}  ·  hover #{id}"),
+            None => text,
+        };
+        selection_info.set_label(&text);
+    };
+    update_selection(ctx.selection());
+    ctx.selection().connect_changed(update_selection);
 
     let update_info = move |areas: &Areas| {
         let layout = areas.layout();
@@ -233,8 +252,8 @@ fn menubar() -> gio::Menu {
     bar
 }
 
-/// Status bar; returns it and the label showing the active area.
-fn build_statusbar() -> (gtk::Box, gtk::Label) {
+/// Status bar; returns it with the selection and active-area labels.
+fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label) {
     let bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
@@ -264,12 +283,8 @@ fn build_statusbar() -> (gtk::Box, gtk::Label) {
         false,
     ));
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    bar.append(
-        &gtk::Label::builder()
-            .label("Nothing selected")
-            .css_classes(["dim"])
-            .build(),
-    );
+    let selection_info = gtk::Label::builder().css_classes(["dim"]).build();
+    bar.append(&selection_info);
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     let area_info = gtk::Label::builder().css_classes(["faint"]).build();
     bar.append(&area_info);
@@ -301,7 +316,7 @@ fn build_statusbar() -> (gtk::Box, gtk::Label) {
             .css_classes(["mono", "faint"])
             .build(),
     );
-    (bar, area_info)
+    (bar, selection_info, area_info)
 }
 
 fn install_actions(window: &gtk::ApplicationWindow, areas: &Areas, palette: &Palette) {

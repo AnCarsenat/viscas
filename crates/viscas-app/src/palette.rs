@@ -8,6 +8,7 @@ use gtk::prelude::*;
 use gtk::{gdk, glib};
 
 use crate::commands::Command;
+use crate::ctx::AppCtx;
 use crate::fuzzy;
 
 /// Maximum number of rows shown at once.
@@ -22,10 +23,12 @@ pub struct Palette {
 }
 
 struct Inner {
+    ctx: AppCtx,
     backdrop: gtk::Box,
     card: gtk::Box,
     entry: gtk::SearchEntry,
     list: gtk::ListBox,
+    /// Commands collected from the context's providers when opening.
     commands: RefCell<Vec<Command>>,
     /// Command index of each visible row.
     shown: RefCell<Vec<usize>>,
@@ -34,8 +37,9 @@ struct Inner {
 }
 
 impl Palette {
-    /// Creates the palette and adds it on top of `overlay`.
-    pub fn new(overlay: &gtk::Overlay) -> Self {
+    /// Creates the palette and adds it on top of `overlay`. Commands come
+    /// from `ctx`'s providers, queried each time the palette opens.
+    pub fn new(overlay: &gtk::Overlay, ctx: &AppCtx) -> Self {
         let backdrop = gtk::Box::builder()
             .hexpand(true)
             .vexpand(true)
@@ -76,6 +80,7 @@ impl Palette {
 
         let palette = Self {
             inner: Rc::new(Inner {
+                ctx: ctx.clone(),
                 backdrop,
                 card,
                 entry,
@@ -87,12 +92,6 @@ impl Palette {
         };
         palette.connect_signals();
         palette
-    }
-
-    /// Replaces the commands the palette offers.
-    pub fn set_commands(&self, commands: Vec<Command>) {
-        *self.inner.commands.borrow_mut() = commands;
-        self.refilter();
     }
 
     pub fn is_open(&self) -> bool {
@@ -111,6 +110,7 @@ impl Palette {
         let i = &self.inner;
         let focus = i.card.root().and_then(|r| r.focus());
         *i.return_focus.borrow_mut() = focus.map(|w| w.downgrade());
+        *i.commands.borrow_mut() = i.ctx.commands();
         i.entry.set_text("");
         self.refilter();
         i.backdrop.set_visible(true);
@@ -125,6 +125,26 @@ impl Palette {
         if let Some(w) = i.return_focus.take().and_then(|w| w.upgrade()) {
             w.grab_focus();
         }
+    }
+
+    /// Keeps keyboard focus inside the palette while it is open: focus that
+    /// moves elsewhere in `window` (e.g. with Tab) returns to the entry.
+    pub fn contain_focus(&self, window: &gtk::ApplicationWindow) {
+        let weak = self.downgrade();
+        window.connect_focus_widget_notify(move |window| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if !inner.card.is_visible() {
+                return;
+            }
+            let card: &gtk::Widget = inner.card.upcast_ref();
+            let inside =
+                GtkWindowExt::focus(window).is_some_and(|f| f == *card || f.is_ancestor(card));
+            if !inside {
+                inner.entry.grab_focus();
+            }
+        });
     }
 
     fn downgrade(&self) -> std::rc::Weak<Inner> {
@@ -164,12 +184,26 @@ impl Palette {
                 gdk::Key::Up | gdk::Key::KP_Up => palette.move_selection(-1),
                 gdk::Key::Page_Down => palette.move_selection(8),
                 gdk::Key::Page_Up => palette.move_selection(-8),
-                gdk::Key::Escape => palette.close(),
                 _ => return glib::Propagation::Proceed,
             }
             glib::Propagation::Stop
         });
         i.entry.add_controller(keys);
+
+        // Escape closes from anywhere inside the card (entry, list, ...).
+        let escape = gtk::EventControllerKey::new();
+        escape.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = self.downgrade();
+        escape.connect_key_pressed(move |_, key, _, _| {
+            if key != gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(inner) = weak.upgrade() {
+                Palette { inner }.close();
+            }
+            glib::Propagation::Stop
+        });
+        i.card.add_controller(escape);
 
         let weak = self.downgrade();
         i.list.connect_row_activated(move |_, row| {

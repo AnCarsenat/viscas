@@ -5,6 +5,7 @@ extern crate gtk4 as gtk;
 mod app;
 mod areas;
 mod commands;
+mod ctx;
 mod editors;
 mod fuzzy;
 mod layout;

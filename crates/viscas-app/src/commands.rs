@@ -25,6 +25,33 @@ pub struct Command {
     pub run: Rc<dyn Fn()>,
 }
 
+/// A source of palette commands, queried each time the palette opens.
+pub trait CommandProvider {
+    fn commands(&self) -> Vec<Command>;
+}
+
+/// The window's static commands (app and window actions).
+pub struct WindowCommands {
+    window: glib::WeakRef<gtk::ApplicationWindow>,
+}
+
+impl WindowCommands {
+    pub fn new(window: &gtk::ApplicationWindow) -> Self {
+        Self {
+            window: window.downgrade(),
+        }
+    }
+}
+
+impl CommandProvider for WindowCommands {
+    fn commands(&self) -> Vec<Command> {
+        self.window
+            .upgrade()
+            .map(|w| registry(&w))
+            .unwrap_or_default()
+    }
+}
+
 /// Static description of a command: detailed action name, title, category.
 pub fn specs() -> Vec<(String, String, &'static str)> {
     let mut list: Vec<(String, String, &'static str)> = [
@@ -65,9 +92,9 @@ pub fn specs() -> Vec<(String, String, &'static str)> {
     list
 }
 
-/// Builds the registry for `window`: each command activates its action on
+/// Builds the commands for `window`: each command activates its action on
 /// the window (which also resolves `app.` actions).
-pub fn registry(window: &gtk::ApplicationWindow) -> Vec<Command> {
+fn registry(window: &gtk::ApplicationWindow) -> Vec<Command> {
     specs()
         .into_iter()
         .map(|(id, title, category)| {

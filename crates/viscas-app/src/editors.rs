@@ -8,6 +8,7 @@ use std::f64::consts::PI;
 use gtk::prelude::*;
 use gtk::{cairo, gio};
 
+use crate::ctx::AppCtx;
 use crate::layout::EditorKind;
 use crate::viewport::Viewport;
 
@@ -67,7 +68,9 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(kind: EditorKind) -> Self {
+    /// Creates the editor. `_ctx` gives access to the selection and
+    /// preferences once editors use them (M2).
+    pub fn new(kind: EditorKind, _ctx: &AppCtx) -> Self {
         match kind {
             EditorKind::Viewport => {
                 let viewport = Viewport::new();

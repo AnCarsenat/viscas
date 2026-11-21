@@ -1,11 +1,12 @@
 //! Area system widgets: builds a tree of `gtk::Paned` from the current
 //! workspace's [`Layout`] and keeps it in sync with the model.
 //!
-//! The model is the source of truth. Structural edits (split, close, change
-//! editor, maximize, switch workspace) edit the model and rebuild the widget
-//! tree; editor widgets are cached per area so they keep their state (e.g. a
-//! viewport's pan and zoom) across rebuilds. Divider drags only write the
-//! split ratio back into the model.
+//! The model is the source of truth. Structural edits (split, close, swap,
+//! change editor, maximize, switch workspace) edit the model and rebuild the
+//! widget tree on idle. Editor widgets are cached by area id, which is
+//! globally unique (one [`IdGen`] for all workspaces), so they keep their
+//! state (e.g. a viewport's pan and zoom) across rebuilds and swaps. Divider
+//! drags write the ratio back into the model, addressed by stable split id.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -14,12 +15,18 @@ use std::rc::{Rc, Weak};
 use gtk::glib;
 use gtk::prelude::*;
 
+use crate::commands::{Command, CommandProvider};
+use crate::ctx::AppCtx;
 use crate::editors::{self, Editor, pick_icon};
-use crate::layout::{AreaId, Branch, Dir, EditorKind, Layout, Node, Path};
+use crate::layout::{AreaId, Dir, EditorKind, IdGen, Layout, Node, SplitId};
 use crate::workspace::Workspace;
 
 /// Callback run after workspace, layout or active-area changes.
-type Listener = Box<dyn Fn(&Areas)>;
+///
+/// Listeners receive the [`Areas`] handle as argument and must not capture
+/// an `Areas` strongly themselves: `Areas` owns its listeners, so that
+/// would form a reference cycle. Capture widgets or weak handles instead.
+type Listener = Rc<dyn Fn(&Areas)>;
 
 /// Handle to the area system. Cloning is cheap.
 #[derive(Clone)]
@@ -28,10 +35,13 @@ pub struct Areas {
 }
 
 struct Inner {
+    ctx: AppCtx,
     root: gtk::Box,
     workspace: Cell<Workspace>,
+    /// Id source shared by every workspace's layout.
+    ids: RefCell<IdGen>,
     layouts: RefCell<HashMap<Workspace, Layout>>,
-    editors: RefCell<HashMap<(Workspace, AreaId), Editor>>,
+    editors: RefCell<HashMap<AreaId, Editor>>,
     /// Area widgets of the current tree, to toggle the `active` class.
     area_widgets: RefCell<HashMap<AreaId, gtk::Box>>,
     /// The area keyboard commands apply to (last hovered or clicked).
@@ -41,7 +51,7 @@ struct Inner {
 }
 
 impl Areas {
-    pub fn new(workspace: Workspace) -> Self {
+    pub fn new(ctx: &AppCtx, workspace: Workspace) -> Self {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .hexpand(true)
@@ -50,8 +60,10 @@ impl Areas {
             .build();
         let areas = Self {
             inner: Rc::new(Inner {
+                ctx: ctx.clone(),
                 root,
                 workspace: Cell::new(workspace),
+                ids: RefCell::default(),
                 layouts: RefCell::default(),
                 editors: RefCell::default(),
                 area_widgets: RefCell::default(),
@@ -77,32 +89,44 @@ impl Areas {
     }
 
     /// Calls `f` after every change of workspace, layout or active area.
+    /// See [`Listener`] for the capture rules.
     pub fn connect_changed(&self, f: impl Fn(&Areas) + 'static) {
-        self.inner.listeners.borrow_mut().push(Box::new(f));
+        self.inner.listeners.borrow_mut().push(Rc::new(f));
     }
 
     fn notify(&self) {
-        for f in self.inner.listeners.borrow().iter() {
+        // Clone first: a listener may connect listeners or edit the layout.
+        let listeners = self.inner.listeners.borrow().clone();
+        for f in listeners {
             f(self);
         }
     }
 
-    /// Runs `f` on the current workspace's layout, creating it on first use.
-    fn with_layout<R>(&self, f: impl FnOnce(&mut Layout) -> R) -> R {
+    /// Runs `f` on the current workspace's layout and the shared id source,
+    /// creating the layout on first use.
+    fn with_layout<R>(&self, f: impl FnOnce(&mut Layout, &mut IdGen) -> R) -> R {
         let ws = self.workspace();
+        let mut ids = self.inner.ids.borrow_mut();
         let mut layouts = self.inner.layouts.borrow_mut();
-        f(layouts.entry(ws).or_insert_with(|| ws.default_layout()))
+        let layout = layouts
+            .entry(ws)
+            .or_insert_with(|| ws.default_layout(&mut ids));
+        f(layout, &mut ids)
     }
 
     /// A copy of the current workspace's layout.
     pub fn layout(&self) -> Layout {
-        self.with_layout(|l| l.clone())
+        self.with_layout(|l, _| l.clone())
     }
 
-    /// The area commands apply to: the last hovered/clicked one if it is
-    /// still part of the layout, else the first viewport, else the first area.
+    /// The area commands apply to: the maximized area if there is one, else
+    /// the last hovered/clicked area if it still exists, else the first
+    /// viewport, else the first area.
     pub fn active_area(&self) -> Option<AreaId> {
-        self.with_layout(|l| {
+        self.with_layout(|l, _| {
+            if let Some(id) = l.maximized() {
+                return Some(id);
+            }
             let leaves = l.leaves();
             self.inner
                 .active
@@ -120,7 +144,7 @@ impl Areas {
 
     pub fn active_editor(&self) -> Option<EditorKind> {
         let id = self.active_area()?;
-        self.with_layout(|l| l.editor(id))
+        self.with_layout(|l, _| l.editor(id))
     }
 
     pub fn set_workspace(&self, workspace: Workspace) {
@@ -137,7 +161,7 @@ impl Areas {
         let Some(id) = id.or_else(|| self.active_area()) else {
             return;
         };
-        if let Some(new) = self.with_layout(|l| l.split(id, dir)) {
+        if let Some(new) = self.with_layout(|l, ids| l.split(id, dir, ids)) {
             self.inner.active.set(Some(new));
             self.schedule_rebuild();
         }
@@ -148,11 +172,17 @@ impl Areas {
         let Some(id) = id.or_else(|| self.active_area()) else {
             return;
         };
-        if self.with_layout(|l| l.close(id)) {
-            self.inner
-                .editors
-                .borrow_mut()
-                .remove(&(self.workspace(), id));
+        if self.with_layout(|l, _| l.close(id)) {
+            self.schedule_rebuild();
+        }
+    }
+
+    /// Swaps `id` (or the active area) with `other`.
+    pub fn swap(&self, id: Option<AreaId>, other: AreaId) {
+        let Some(id) = id.or_else(|| self.active_area()) else {
+            return;
+        };
+        if self.with_layout(|l, _| l.swap(id, other)) {
             self.schedule_rebuild();
         }
     }
@@ -162,7 +192,7 @@ impl Areas {
         let Some(id) = id.or_else(|| self.active_area()) else {
             return;
         };
-        if self.with_layout(|l| l.toggle_maximize(id)) {
+        if self.with_layout(|l, _| l.toggle_maximize(id)) {
             self.schedule_rebuild();
         }
     }
@@ -172,7 +202,7 @@ impl Areas {
         let Some(id) = id.or_else(|| self.active_area()) else {
             return;
         };
-        if self.with_layout(|l| l.editor(id) != Some(kind) && l.set_editor(id, kind)) {
+        if self.with_layout(|l, _| l.editor(id) != Some(kind) && l.set_editor(id, kind)) {
             self.schedule_rebuild();
         }
     }
@@ -201,43 +231,53 @@ impl Areas {
         self.inner.area_widgets.borrow_mut().clear();
 
         let layout = self.layout();
-        let tree = self.build_node(&layout, layout.visible_root(), Vec::new());
+        let tree = self.build_node(&layout, layout.visible_root());
         root.append(&tree);
 
-        // Drop cached editors of areas that no longer exist.
-        let ws = self.workspace();
-        self.inner
-            .editors
-            .borrow_mut()
-            .retain(|(w, id), _| *w != ws || layout.contains(*id));
+        // Drop cached editors of areas that exist in no workspace anymore.
+        let live: Vec<AreaId> = self
+            .inner
+            .layouts
+            .borrow()
+            .values()
+            .flat_map(|l| l.leaves().into_iter().map(|(id, _)| id))
+            .collect();
+        let dropped: Vec<Editor> = {
+            let mut editors = self.inner.editors.borrow_mut();
+            let dead: Vec<AreaId> = editors
+                .keys()
+                .filter(|id| !live.contains(id))
+                .copied()
+                .collect();
+            dead.iter().filter_map(|id| editors.remove(id)).collect()
+        };
+        // Widgets are disposed outside the borrow, in case disposal runs
+        // handlers that look at the cache.
+        drop(dropped);
 
         self.refresh_active_class();
         self.notify();
     }
 
-    fn build_node(&self, layout: &Layout, node: &Node, path: Path) -> gtk::Widget {
+    fn build_node(&self, layout: &Layout, node: &Node) -> gtk::Widget {
         match node {
             Node::Leaf { id, editor } => self.build_area(layout, *id, *editor),
-            Node::Split { dir, a, b, .. } => {
-                let mut path_a = path.clone();
-                path_a.push(Branch::A);
-                let mut path_b = path.clone();
-                path_b.push(Branch::B);
-                let start = self.build_node(layout, a, path_a);
-                let end = self.build_node(layout, b, path_b);
-                self.build_paned(*dir, &start, &end, path)
+            Node::Split { id, dir, a, b, .. } => {
+                let start = self.build_node(layout, a);
+                let end = self.build_node(layout, b);
+                self.build_paned(*dir, &start, &end, *id)
             }
         }
     }
 
-    /// A paned whose divider position follows the model ratio at `path`
-    /// and writes user drags back into it.
+    /// A paned whose divider follows the model ratio of split `split` and
+    /// writes user drags back into it.
     fn build_paned(
         &self,
         dir: Dir,
         start: &gtk::Widget,
         end: &gtk::Widget,
-        path: Path,
+        split: SplitId,
     ) -> gtk::Widget {
         let orientation = match dir {
             Dir::Horizontal => gtk::Orientation::Horizontal,
@@ -254,7 +294,6 @@ impl Areas {
             .wide_handle(false)
             .build();
 
-        let path = Rc::new(path);
         // Divider position we last set ourselves (so its notification is not
         // mistaken for a drag), and the max position at that time: GTK
         // reports the new position before the new max on resizes, so
@@ -265,8 +304,6 @@ impl Areas {
         let weak = self.downgrade();
         paned.connect_max_position_notify(glib::clone!(
             #[strong]
-            path,
-            #[strong]
             applied,
             #[strong]
             last_max,
@@ -276,8 +313,11 @@ impl Areas {
                 let (Some(areas), Some(span)) = (weak.upgrade(), paned_span(paned)) else {
                     return;
                 };
-                let ratio = areas.with_layout(|l| l.ratio(&path)).unwrap_or(0.5);
-                let pos = ((ratio * span).round() as i32).clamp(paned.min_position(), max);
+                let ratio = areas.with_layout(|l, _| l.ratio(split)).unwrap_or(0.5);
+                // Not `Ord::clamp`: min may exceed max on tiny allocations.
+                let pos = ((ratio * span).round() as i32)
+                    .max(paned.min_position())
+                    .min(max);
                 applied.set(Some(pos));
                 paned.set_position(pos);
             }
@@ -291,30 +331,30 @@ impl Areas {
             if pos == last || paned.max_position() != last_max.get() {
                 return;
             }
-            if let (Some(areas), Some(span)) = (weak.upgrade(), paned_span(paned)) {
-                applied.set(Some(pos));
-                areas.with_layout(|l| l.set_ratio(&path, f64::from(pos) / span));
+            let (Some(areas), Some(span)) = (weak.upgrade(), paned_span(paned)) else {
+                return;
+            };
+            // This paned is about to be replaced; its state is stale.
+            if areas.inner.rebuild_pending.get() {
+                return;
             }
+            applied.set(Some(pos));
+            areas.with_layout(|l, _| l.set_ratio(split, f64::from(pos) / span));
         });
         paned.upcast()
     }
 
     fn build_area(&self, layout: &Layout, id: AreaId, kind: EditorKind) -> gtk::Widget {
-        let ws = self.workspace();
-        let mut editors = self.inner.editors.borrow_mut();
-        let editor = editors
-            .entry((ws, id))
-            .and_modify(|e| {
-                if e.kind != kind {
-                    *e = Editor::new(kind);
-                }
-            })
-            .or_insert_with(|| Editor::new(kind));
+        // Take the editor out of the cache so no borrow is held while
+        // creating editors or building the header (which may re-enter).
+        let cached = self.inner.editors.borrow_mut().remove(&id);
+        let editor = match cached {
+            Some(e) if e.kind == kind => e,
+            _ => Editor::new(kind, &self.inner.ctx),
+        };
         detach(&editor.widget);
 
         let maximized = layout.maximized() == Some(id);
-        let only_one = layout.leaves().len() == 1;
-
         let area = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .overflow(gtk::Overflow::Hidden)
@@ -323,7 +363,7 @@ impl Areas {
         if maximized {
             area.add_css_class("maximized");
         }
-        area.append(&self.build_header(editor, id, maximized, only_one));
+        area.append(&self.build_header(layout, &editor, id, maximized));
         let body = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .hexpand(true)
@@ -341,15 +381,16 @@ impl Areas {
             .area_widgets
             .borrow_mut()
             .insert(id, area.clone());
+        self.inner.editors.borrow_mut().insert(id, editor);
         area.upcast()
     }
 
     fn build_header(
         &self,
+        layout: &Layout,
         editor: &Editor,
         id: AreaId,
         maximized: bool,
-        only_one: bool,
     ) -> gtk::Widget {
         // Left part: editor switch and editor menus; scrolls when the area
         // is narrow instead of forcing a large minimum width.
@@ -357,7 +398,7 @@ impl Areas {
             .orientation(gtk::Orientation::Horizontal)
             .spacing(2)
             .build();
-        menus.append(&self.editor_switch(editor.kind, id));
+        menus.append(&self.editor_switch(layout, editor.kind, id, maximized));
         menus.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         for widget in editor.header_content() {
             menus.append(&widget);
@@ -402,7 +443,7 @@ impl Areas {
             "Close Area (join into neighbour)",
         );
         close.add_css_class("close");
-        close.set_sensitive(!only_one);
+        close.set_sensitive(layout.leaves().len() > 1);
 
         let weak = self.downgrade();
         let act = move |f: fn(&Areas, AreaId)| {
@@ -432,8 +473,14 @@ impl Areas {
     }
 
     /// Editor-type dropdown: current editor's icon and name, opening a list
-    /// of all editors.
-    fn editor_switch(&self, current: EditorKind, id: AreaId) -> gtk::MenuButton {
+    /// of all editors and, below, the other areas to swap places with.
+    fn editor_switch(
+        &self,
+        layout: &Layout,
+        current: EditorKind,
+        id: AreaId,
+        maximized: bool,
+    ) -> gtk::MenuButton {
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(5)
@@ -456,49 +503,73 @@ impl Areas {
             .spacing(1)
             .css_classes(["editor-menu"])
             .build();
-        list.append(
-            &gtk::Label::builder()
-                .label("EDITOR TYPE")
-                .xalign(0.0)
-                .css_classes(["menu-heading"])
-                .build(),
-        );
         let popover = gtk::Popover::builder()
             .child(&list)
             .has_arrow(false)
             .position(gtk::PositionType::Bottom)
             .build();
-        for kind in EditorKind::ALL {
+        let heading = |text: &str| {
+            gtk::Label::builder()
+                .label(text)
+                .xalign(0.0)
+                .css_classes(["menu-heading"])
+                .build()
+        };
+        let weak = self.downgrade();
+        let item = |icon: &str, label: &str, tip: &str, run: Box<dyn Fn(&Areas)>| {
             let row = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
                 .spacing(8)
                 .build();
-            row.append(&gtk::Image::from_icon_name(editors::icon_name(kind)));
-            row.append(
-                &gtk::Label::builder()
-                    .label(kind.title())
-                    .xalign(0.0)
-                    .build(),
-            );
-            let button = gtk::Button::builder()
-                .child(&row)
-                .tooltip_text(kind.description())
-                .build();
-            if kind == current {
-                button.add_css_class("current");
-            }
-            let weak = self.downgrade();
+            row.append(&gtk::Image::from_icon_name(icon));
+            row.append(&gtk::Label::builder().label(label).xalign(0.0).build());
+            let button = gtk::Button::builder().child(&row).tooltip_text(tip).build();
+            let weak = weak.clone();
             button.connect_clicked(glib::clone!(
                 #[weak]
                 popover,
                 move |_| {
                     popover.popdown();
                     if let Some(areas) = weak.upgrade() {
-                        areas.set_editor(Some(id), kind);
+                        run(&areas);
                     }
                 }
             ));
+            button
+        };
+
+        list.append(&heading("EDITOR TYPE"));
+        for kind in EditorKind::ALL {
+            let button = item(
+                editors::icon_name(kind),
+                kind.title(),
+                kind.description(),
+                Box::new(move |a| a.set_editor(Some(id), kind)),
+            );
+            if kind == current {
+                button.add_css_class("current");
+            }
             list.append(&button);
+        }
+
+        // Swapping needs the other areas on screen.
+        let others: Vec<(usize, AreaId, EditorKind)> = layout
+            .leaves()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (other, _))| *other != id)
+            .map(|(pos, (other, kind))| (pos + 1, other, kind))
+            .collect();
+        if !maximized && !others.is_empty() {
+            list.append(&heading("SWAP WITH"));
+            for (pos, other, kind) in others {
+                list.append(&item(
+                    editors::icon_name(kind),
+                    &format!("{}  ·  area {pos}", kind.title()),
+                    "Exchange the places of the two areas",
+                    Box::new(move |a| a.swap(Some(id), other)),
+                ));
+            }
         }
 
         gtk::MenuButton::builder()
@@ -557,6 +628,51 @@ struct WeakAreas(Weak<Inner>);
 impl WeakAreas {
     fn upgrade(&self) -> Option<Areas> {
         self.0.upgrade().map(|inner| Areas { inner })
+    }
+}
+
+/// Palette commands that depend on the current layout: swapping the active
+/// area with each other area.
+pub struct AreaCommands(WeakAreas);
+
+impl AreaCommands {
+    pub fn new(areas: &Areas) -> Self {
+        Self(areas.downgrade())
+    }
+}
+
+impl CommandProvider for AreaCommands {
+    fn commands(&self) -> Vec<Command> {
+        let Some(areas) = self.0.upgrade() else {
+            return Vec::new();
+        };
+        let layout = areas.layout();
+        let Some(active) = areas.active_area() else {
+            return Vec::new();
+        };
+        if layout.maximized().is_some() {
+            return Vec::new();
+        }
+        layout
+            .leaves()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (id, _))| *id != active)
+            .map(|(pos, (other, kind))| {
+                let weak = areas.downgrade();
+                Command {
+                    id: format!("area.swap::{}", other.0),
+                    title: format!("Swap Area With: {} (area {})", kind.title(), pos + 1),
+                    category: "Area",
+                    shortcut: None,
+                    run: Rc::new(move || {
+                        if let Some(areas) = weak.upgrade() {
+                            areas.swap(Some(active), other);
+                        }
+                    }),
+                }
+            })
+            .collect()
     }
 }
 
