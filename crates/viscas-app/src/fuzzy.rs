@@ -48,64 +48,76 @@ pub fn fuzzy_match(query: &str, candidate: &str) -> Option<Match> {
     }
     let chars: Vec<char> = candidate.chars().collect();
     let folded: Vec<char> = chars.iter().copied().map(fold).collect();
-
-    // Try every occurrence of the first query char as a starting point and
-    // keep the best greedy match; candidates are short, so this is cheap.
-    let mut best: Option<Match> = None;
-    for start in (0..folded.len()).filter(|&i| folded[i] == query[0]) {
-        let Some(positions) = greedy(&query, &folded, &chars, start) else {
-            break; // later starts cannot succeed if this one did not
-        };
-        let score = score(&positions, &chars);
-        if best.as_ref().is_none_or(|b| score > b.score) {
-            best = Some(Match { score, positions });
-        }
-    }
-    best
+    best_alignment(&query, &folded, &chars)
 }
 
-/// Matches the rest of the query after `start`, preferring word starts over
-/// plain occurrences when the next query char appears at both.
-fn greedy(query: &[char], folded: &[char], chars: &[char], start: usize) -> Option<Vec<usize>> {
-    let mut positions = vec![start];
-    let mut from = start + 1;
-    for &q in &query[1..] {
-        let mut rest = from..folded.len();
-        let next = rest.clone().find(|&i| folded[i] == q)?;
-        // Keep consecutive runs; otherwise jump to a word start if one exists.
-        let pick = if next == from {
-            next
-        } else {
-            rest.find(|&i| folded[i] == q && is_word_start(chars, i))
-                .unwrap_or(next)
-        };
-        positions.push(pick);
-        from = pick + 1;
+/// Exhaustive best alignment by dynamic programming over (query index,
+/// candidate index): `best[i][j]` is the best score of matching
+/// `query[..=i]` with `query[i]` placed at candidate char `j`. Candidates
+/// are short (command titles), so the O(m·n²) cost is negligible, and unlike
+/// a greedy scan this never misses a valid match.
+fn best_alignment(query: &[char], folded: &[char], chars: &[char]) -> Option<Match> {
+    let (m, n) = (query.len(), folded.len());
+    if m > n {
+        return None;
     }
-    Some(positions)
-}
+    let gain = |j: usize| {
+        MATCH
+            + if is_word_start(chars, j) {
+                WORD_START
+            } else {
+                0
+            }
+    };
+    let mut best: Vec<Vec<Option<i32>>> = vec![vec![None; n]; m];
+    let mut from: Vec<Vec<usize>> = vec![vec![0; n]; m];
 
-fn score(positions: &[usize], chars: &[char]) -> i32 {
-    let mut score = 0;
-    let mut prev: Option<usize> = None;
-    for &p in positions {
-        score += MATCH;
-        if is_word_start(chars, p) {
-            score += WORD_START;
-        }
-        match prev {
-            Some(q) if p == q + 1 => score += CONSECUTIVE,
-            Some(q) => score -= GAP * i32::try_from(p - q - 1).unwrap_or(i32::MAX / 4).min(20),
-            None => {
-                if p == 0 {
-                    score += FIRST_CHAR;
+    for j in (0..n).filter(|&j| folded[j] == query[0]) {
+        let leading = i32::try_from(j)
+            .unwrap_or(i32::MAX)
+            .min(MAX_LEADING_PENALTY);
+        let first = if j == 0 { FIRST_CHAR } else { 0 };
+        best[0][j] = Some(gain(j) + first - leading);
+    }
+    for i in 1..m {
+        for j in (i..n).filter(|&j| folded[j] == query[i]) {
+            let mut cell: Option<(i32, usize)> = None;
+            let prev_row = &best[i - 1];
+            for (k, prev) in prev_row.iter().enumerate().take(j).skip(i - 1) {
+                let Some(prev) = *prev else {
+                    continue;
+                };
+                let link = if k + 1 == j {
+                    CONSECUTIVE
+                } else {
+                    -GAP * i32::try_from(j - k - 1).unwrap_or(i32::MAX).min(20)
+                };
+                let score = prev + link;
+                if cell.is_none_or(|(s, _)| score > s) {
+                    cell = Some((score, k));
                 }
-                score -= (i32::try_from(p).unwrap_or(i32::MAX)).min(MAX_LEADING_PENALTY);
+            }
+            if let Some((score, k)) = cell {
+                best[i][j] = Some(score + gain(j));
+                from[i][j] = k;
             }
         }
-        prev = Some(p);
     }
-    score
+
+    // Best end position (earliest on ties), then walk the back pointers.
+    let (mut j, score) = (0..n).filter_map(|j| best[m - 1][j].map(|s| (j, s))).fold(
+        None,
+        |acc: Option<(usize, i32)>, (j, s)| match acc {
+            Some((_, bs)) if bs >= s => acc,
+            _ => Some((j, s)),
+        },
+    )?;
+    let mut positions = vec![0; m];
+    for i in (0..m).rev() {
+        positions[i] = j;
+        j = from[i][j];
+    }
+    Some(Match { score, positions })
 }
 
 /// Filters and ranks `candidates`, best first; ties keep the input order.
@@ -154,6 +166,28 @@ mod tests {
         assert_eq!(m.positions, vec![0, 6]);
         let m = fuzzy_match("wg", "Switch Workspace: Graph").unwrap();
         assert_eq!(m.positions, vec![7, 18]);
+    }
+
+    #[test]
+    fn finds_matches_a_greedy_scan_misses() {
+        // Greedy word-start jumping would take the second "b" and fail.
+        let m = fuzzy_match("abc", "axbc b").unwrap();
+        assert_eq!(m.positions, vec![0, 2, 3]);
+        assert!(fuzzy_match("abc", "a b c").is_some());
+        assert!(fuzzy_match("aab", "ab ab").is_some());
+    }
+
+    #[test]
+    fn match_exists_iff_subsequence() {
+        let cands = ["axbc b", "Split Area", "abcabc", "cba", "a-b_c", ""];
+        let queries = ["abc", "sa", "cab", "aa", "bcb", "x"];
+        for c in cands {
+            for q in queries {
+                let mut it = c.to_lowercase().chars().collect::<Vec<_>>().into_iter();
+                let is_subseq = q.chars().all(|qc| it.any(|cc| cc == qc));
+                assert_eq!(fuzzy_match(q, c).is_some(), is_subseq, "{q:?} in {c:?}");
+            }
+        }
     }
 
     #[test]
