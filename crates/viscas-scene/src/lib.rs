@@ -14,6 +14,7 @@
 //! - [`document`]: the versioned, human-readable `.viscas` format (RON).
 
 pub mod analysis;
+pub mod document;
 pub mod eval;
 pub mod events;
 pub mod graph;
@@ -22,6 +23,9 @@ pub mod names;
 pub mod node;
 pub mod scene;
 pub use analysis::{Analysis, Letter, Parsed, ParsedSource, Reference, analyze};
+pub use document::{
+    DocNode, Document, DocumentError, FORMAT_VERSION, load_document, migrate, save_document,
+};
 pub use eval::{NodeEvaluator, NodeResult, Status};
 pub use events::{Change, SceneEvent};
 pub use graph::{DepGraph, Diagnostic, DiagnosticKind, Resolution};
