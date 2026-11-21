@@ -7,7 +7,7 @@ pub mod view;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use adw::prelude::*;
+use gtk::prelude::*;
 use gtk::{cairo, gdk, glib};
 
 use self::draw::GridLayer;
@@ -33,7 +33,9 @@ type Layers = Rc<RefCell<Vec<Box<dyn Layer>>>>;
 /// Cloning is cheap and yields a handle to the same viewport.
 #[derive(Clone)]
 pub struct Viewport {
+    root: gtk::Overlay,
     area: gtk::DrawingArea,
+    hud: gtk::Label,
     view: Rc<RefCell<View>>,
     layers: Layers,
 }
@@ -46,12 +48,24 @@ impl Viewport {
             .vexpand(true)
             .focusable(true)
             .can_focus(true)
-            .css_classes(["view", "viscas-viewport"])
+            .css_classes(["viscas-viewport"])
             .build();
         area.update_property(&[gtk::accessible::Property::Label("Graph viewport")]);
 
+        // Cursor readout in the bottom-left corner.
+        let hud = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::End)
+            .css_classes(["viewport-hud", "mono"])
+            .can_target(false)
+            .build();
+        let root = gtk::Overlay::builder().child(&area).build();
+        root.add_overlay(&hud);
+
         let viewport = Self {
+            root,
             area,
+            hud,
             view: Rc::new(RefCell::new(View::default())),
             layers: Rc::default(),
         };
@@ -59,13 +73,32 @@ impl Viewport {
         viewport.install_draw();
         viewport.install_drag();
         viewport.install_scroll();
-        viewport.redraw_on_theme_change();
+        viewport.update_hud(None);
         viewport
     }
 
     /// The widget to put in the widget tree.
     pub fn widget(&self) -> &gtk::Widget {
-        self.area.upcast_ref()
+        self.root.upcast_ref()
+    }
+
+    /// Recenters on the origin at the default zoom.
+    pub fn reset_view(&self) {
+        self.update_view(|v| {
+            let size = v.size;
+            *v = View {
+                size,
+                ..View::default()
+            };
+        });
+        self.update_hud(None);
+    }
+
+    /// Shows the world coordinates under the pointer, or the zoom level when
+    /// the pointer is outside.
+    fn update_hud(&self, pointer: Option<(f64, f64)>) {
+        let text = hud_text(&self.view.borrow(), pointer);
+        self.hud.set_label(&text);
     }
 
     /// A copy of the current view.
@@ -75,7 +108,6 @@ impl Viewport {
     }
 
     /// Modifies the view and schedules a redraw.
-    #[allow(dead_code, reason = "API for upcoming plot layers")]
     pub fn update_view(&self, f: impl FnOnce(&mut View)) {
         f(&mut self.view.borrow_mut());
         self.queue_draw();
@@ -154,20 +186,37 @@ impl Viewport {
         // Scroll events carry no position, so track the pointer separately.
         let pointer = Rc::new(Cell::new(None::<(f64, f64)>));
         let motion = gtk::EventControllerMotion::new();
+        let this = self.downgrade();
         motion.connect_motion(glib::clone!(
             #[strong]
             pointer,
-            move |_, x, y| pointer.set(Some((x, y)))
+            #[strong]
+            this,
+            move |_, x, y| {
+                pointer.set(Some((x, y)));
+                if let Some(vp) = this.upgrade() {
+                    vp.update_hud(Some((x, y)));
+                }
+            }
         ));
         motion.connect_leave(glib::clone!(
             #[strong]
             pointer,
-            move |_| pointer.set(None)
+            #[strong]
+            this,
+            move |_| {
+                pointer.set(None);
+                if let Some(vp) = this.upgrade() {
+                    vp.update_hud(None);
+                }
+            }
         ));
         area.add_controller(motion);
 
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll(glib::clone!(
+            #[strong]
+            this,
             #[strong(rename_to = view)]
             self.view,
             #[weak]
@@ -175,10 +224,15 @@ impl Viewport {
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |_, _, dy| {
-                let mut v = view.borrow_mut();
-                let (sx, sy) = pointer.get().unwrap_or((v.size.0 / 2.0, v.size.1 / 2.0));
-                let dy = dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA);
-                v.zoom_at(ZOOM_PER_STEP.powf(-dy), sx, sy);
+                {
+                    let mut v = view.borrow_mut();
+                    let (sx, sy) = pointer.get().unwrap_or((v.size.0 / 2.0, v.size.1 / 2.0));
+                    let dy = dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA);
+                    v.zoom_at(ZOOM_PER_STEP.powf(-dy), sx, sy);
+                }
+                if let Some(vp) = this.upgrade() {
+                    vp.update_hud(pointer.get());
+                }
                 area.queue_draw();
                 glib::Propagation::Stop
             }
@@ -186,29 +240,48 @@ impl Viewport {
         area.add_controller(scroll);
     }
 
-    /// Grid colors come from the theme, so redraw whenever it changes.
-    /// The handlers are disconnected when the widget is destroyed.
-    fn redraw_on_theme_change(&self) {
-        let style = adw::StyleManager::default();
-        let handlers: Vec<glib::SignalHandlerId> = ["dark", "high-contrast"]
-            .into_iter()
-            .map(|prop| {
-                let weak = self.area.downgrade();
-                style.connect_notify_local(Some(prop), move |_, _| {
-                    if let Some(area) = weak.upgrade() {
-                        area.queue_draw();
-                    }
-                })
-            })
-            .collect();
-        let handlers = RefCell::new(Some(handlers));
-        self.area.connect_destroy(move |_| {
-            if let Some(handlers) = handlers.take() {
-                let style = adw::StyleManager::default();
-                for id in handlers {
-                    style.disconnect(id);
-                }
-            }
-        });
+    fn downgrade(&self) -> WeakViewport {
+        WeakViewport {
+            root: self.root.downgrade(),
+            area: self.area.downgrade(),
+            hud: self.hud.downgrade(),
+            view: Rc::downgrade(&self.view),
+            layers: Rc::downgrade(&self.layers),
+        }
+    }
+}
+
+/// Weak handle to a [`Viewport`], for signal closures owned by its widgets.
+#[derive(Clone)]
+struct WeakViewport {
+    root: glib::WeakRef<gtk::Overlay>,
+    area: glib::WeakRef<gtk::DrawingArea>,
+    hud: glib::WeakRef<gtk::Label>,
+    view: std::rc::Weak<RefCell<View>>,
+    layers: std::rc::Weak<RefCell<Vec<Box<dyn Layer>>>>,
+}
+
+impl WeakViewport {
+    fn upgrade(&self) -> Option<Viewport> {
+        Some(Viewport {
+            root: self.root.upgrade()?,
+            area: self.area.upgrade()?,
+            hud: self.hud.upgrade()?,
+            view: self.view.upgrade()?,
+            layers: self.layers.upgrade()?,
+        })
+    }
+}
+
+/// Text of the cursor readout: world coordinates under the pointer, or the
+/// zoom level when there is no pointer.
+fn hud_text(view: &View, pointer: Option<(f64, f64)>) -> String {
+    match pointer {
+        Some((sx, sy)) => {
+            let (x, y) = view.screen_to_world(sx, sy);
+            let digits = view::label_digits(view.scale);
+            format!("x {x:>+10.digits$}   y {y:>+10.digits$}")
+        }
+        None => format!("{:.3} px/unit", view.scale),
     }
 }

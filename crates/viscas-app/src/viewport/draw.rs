@@ -1,7 +1,7 @@
 //! Cairo rendering of the Cartesian grid layer.
 
-use adw::prelude::*;
-use gtk::{cairo, gdk, pango};
+use gtk::prelude::*;
+use gtk::{cairo, pango};
 
 use super::Layer;
 use super::view::{View, format_tick, grid_steps, ticks};
@@ -13,32 +13,47 @@ const LABEL_GAP: f64 = 4.0;
 /// Margin kept between labels and the widget edge when an axis is off-screen.
 const EDGE_MARGIN: f64 = 4.0;
 
-struct Palette {
-    minor: gdk::RGBA,
-    major: gdk::RGBA,
-    axis: gdk::RGBA,
-    label: gdk::RGBA,
-}
+/// An RGBA color with components in `0..=1`.
+#[derive(Clone, Copy)]
+struct Rgba(f64, f64, f64, f64);
 
-impl Palette {
-    /// Derives all grid colors from the widget's foreground color, so the
-    /// grid follows light, dark and high-contrast styles automatically.
-    fn from_widget(widget: &gtk::Widget) -> Self {
-        let fg = widget.color();
-        let hc = adw::StyleManager::default().is_high_contrast();
-        let with_alpha = |a: f32| {
-            let mut c = fg;
-            c.set_alpha(fg.alpha() * if hc { (a * 2.0).min(1.0) } else { a });
-            c
-        };
-        Self {
-            minor: with_alpha(0.06),
-            major: with_alpha(0.15),
-            axis: with_alpha(0.6),
-            label: with_alpha(0.7),
-        }
+impl Rgba {
+    const fn hex(rgb: u32, a: f64) -> Self {
+        Self(
+            ((rgb >> 16) & 0xff) as f64 / 255.0,
+            ((rgb >> 8) & 0xff) as f64 / 255.0,
+            (rgb & 0xff) as f64 / 255.0,
+            a,
+        )
+    }
+
+    fn set(self, cr: &cairo::Context) {
+        cr.set_source_rgba(self.0, self.1, self.2, self.3);
     }
 }
+
+/// Grid colors, mirroring the palette in `resources/theme.css`: a dark
+/// canvas, barely-there minor lines, brighter major lines and neutral
+/// (accent-free) axes. The accent color is reserved for selection.
+struct Palette {
+    background: Rgba,
+    minor: Rgba,
+    major: Rgba,
+    axis: Rgba,
+    label: Rgba,
+}
+
+const DARK: Palette = Palette {
+    background: Rgba::hex(0x1a1a1a, 1.0),
+    minor: Rgba::hex(0xffffff, 0.035),
+    major: Rgba::hex(0xffffff, 0.085),
+    axis: Rgba::hex(0x8c8c8c, 0.9),
+    label: Rgba::hex(0x8a8a8a, 1.0),
+};
+
+/// Monospace font for tick labels (Pango picks the first installed family).
+const LABEL_FONT: &str =
+    "JetBrains Mono, JetBrainsMono Nerd Font, Hack, DejaVu Sans Mono, monospace 8";
 
 /// Snaps a coordinate to the center of a device pixel for crisp 1px lines.
 fn crisp(v: f64) -> f64 {
@@ -60,11 +75,13 @@ impl Layer for GridLayer {
 }
 
 fn draw_grid(widget: &gtk::Widget, cr: &cairo::Context, view: &View) {
-    let palette = Palette::from_widget(widget);
+    let palette = &DARK;
     let (w, h) = view.size;
     if w <= 0.0 || h <= 0.0 {
         return;
     }
+    palette.background.set(cr);
+    let _ = cr.paint();
     let bounds = view.bounds();
     let steps = grid_steps(view.scale, MIN_MAJOR_PX);
     let per_major = (steps.major / steps.minor).round() as i64;
@@ -72,7 +89,7 @@ fn draw_grid(widget: &gtk::Widget, cr: &cairo::Context, view: &View) {
     cr.set_line_width(1.0);
 
     // Minor lines (skipping those that coincide with major lines).
-    cr.set_source_color(&palette.minor);
+    palette.minor.set(cr);
     for (i, x) in ticks(bounds.x_min, bounds.x_max, steps.minor) {
         if i % per_major != 0 {
             let sx = crisp(view.world_to_screen(x, 0.0).0);
@@ -90,7 +107,7 @@ fn draw_grid(widget: &gtk::Widget, cr: &cairo::Context, view: &View) {
     stroke(cr);
 
     // Major lines (the axes themselves are drawn on top afterwards).
-    cr.set_source_color(&palette.major);
+    palette.major.set(cr);
     for (i, x) in ticks(bounds.x_min, bounds.x_max, steps.major) {
         if i != 0 {
             let sx = crisp(view.world_to_screen(x, 0.0).0);
@@ -109,24 +126,25 @@ fn draw_grid(widget: &gtk::Widget, cr: &cairo::Context, view: &View) {
 
     // Axes.
     let (ox, oy) = view.world_to_screen(0.0, 0.0);
-    cr.set_source_color(&palette.axis);
-    cr.set_line_width(1.5);
+    palette.axis.set(cr);
+    cr.set_line_width(1.0);
+    let (ox_px, oy_px) = (crisp(ox), crisp(oy));
     if (0.0..=w).contains(&ox) {
-        cr.move_to(ox, 0.0);
-        cr.line_to(ox, h);
+        cr.move_to(ox_px, 0.0);
+        cr.line_to(ox_px, h);
     }
     if (0.0..=h).contains(&oy) {
-        cr.move_to(0.0, oy);
-        cr.line_to(w, oy);
+        cr.move_to(0.0, oy_px);
+        cr.line_to(w, oy_px);
     }
     stroke(cr);
 
     // Tick labels, kept on screen when the axis scrolls out of view.
-    cr.set_source_color(&palette.label);
+    palette.label.set(cr);
     let attrs = pango::AttrList::new();
-    attrs.insert(pango::AttrFloat::new_scale(0.85));
     attrs.insert(pango::AttrFontFeatures::new("tnum 1"));
     let layout = widget.create_pango_layout(None);
+    layout.set_font_description(Some(&pango::FontDescription::from_string(LABEL_FONT)));
     layout.set_attributes(Some(&attrs));
     let text_size = |text: &str| {
         layout.set_text(text);

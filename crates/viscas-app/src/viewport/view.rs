@@ -198,6 +198,14 @@ pub fn format_tick(value: f64, step: f64) -> String {
     format!("{value:.decimals$}").replace('-', "\u{2212}")
 }
 
+/// Decimals needed to show world coordinates at one-pixel precision.
+pub fn label_digits(scale: f64) -> usize {
+    if !scale.is_finite() || scale <= 0.0 {
+        return 3;
+    }
+    scale.log10().ceil().clamp(0.0, 9.0) as usize
+}
+
 /// Shortens Rust's `{:e}` output (e.g. `1.0000000000000002e-5`) to a clean label.
 fn trim_exponent(s: &str) -> String {
     let (mantissa, exp) = s.split_once('e').unwrap_or((s, "0"));
@@ -353,6 +361,15 @@ mod tests {
         assert!(v.center.0.is_finite());
         v.zoom_at(1e-3, 1e9, -1e9);
         assert!(v.center.0.abs() <= MAX_CENTER && v.center.1.abs() <= MAX_CENTER);
+    }
+
+    #[test]
+    fn label_digits_follow_zoom() {
+        assert_eq!(label_digits(60.0), 2);
+        assert_eq!(label_digits(1.0), 0);
+        assert_eq!(label_digits(0.001), 0);
+        assert_eq!(label_digits(1e6), 6);
+        assert_eq!(label_digits(f64::NAN), 3);
     }
 
     #[test]

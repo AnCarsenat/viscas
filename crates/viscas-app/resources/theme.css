@@ -1,0 +1,681 @@
+/*
+ * Viscas theme — dark, dense, precise.
+ *
+ * Loaded at APPLICATION priority on top of GTK's built-in Adwaita (forced
+ * dark), so everything visible here is ours. Colors are defined once below;
+ * the viewport grid colors in src/viewport/draw.rs mirror them.
+ */
+
+/* ---------------------------------------------------------------- palette */
+
+@define-color vc_gap        #111111;  /* gutters between areas */
+@define-color vc_bg0        #181818;  /* top bar, status bar */
+@define-color vc_bg1        #1f1f1f;  /* editor bodies */
+@define-color vc_bg2        #272727;  /* area headers */
+@define-color vc_bg3        #303030;  /* widgets */
+@define-color vc_bg4        #3a3a3a;  /* widget hover */
+@define-color vc_bg5        #454545;  /* widget pressed */
+@define-color vc_border     #0b0b0b;  /* outer 1px borders */
+@define-color vc_line       #333333;  /* inner hairlines */
+@define-color vc_fg         #d2d2d2;
+@define-color vc_fg_strong  #f2f2f2;
+@define-color vc_fg_dim     #9a9a9a;
+@define-color vc_fg_faint   #5f5f5f;
+@define-color vc_accent     #f0883e;  /* the one accent: warm orange */
+@define-color vc_accent_fg  #1a1006;
+@define-color vc_ok         #7fbf6a;
+
+/* GTK's own named colors, so stock widgets follow the palette. */
+@define-color theme_bg_color          @vc_bg1;
+@define-color theme_fg_color          @vc_fg;
+@define-color theme_base_color        @vc_bg1;
+@define-color theme_text_color        @vc_fg;
+@define-color theme_selected_bg_color @vc_accent;
+@define-color theme_selected_fg_color @vc_accent_fg;
+@define-color accent_bg_color         @vc_accent;
+@define-color accent_color            @vc_accent;
+@define-color accent_fg_color         @vc_accent_fg;
+@define-color window_bg_color         @vc_bg1;
+@define-color window_fg_color         @vc_fg;
+@define-color view_bg_color           @vc_bg1;
+@define-color view_fg_color           @vc_fg;
+@define-color popover_bg_color        @vc_bg2;
+@define-color popover_fg_color        @vc_fg;
+@define-color headerbar_bg_color      @vc_bg0;
+@define-color headerbar_fg_color      @vc_fg;
+@define-color borders                 @vc_border;
+
+/* ------------------------------------------------------------------- base */
+
+window,
+window.background {
+  background-color: @vc_gap;
+  color: @vc_fg;
+  font-family: "Inter", "Cantarell", "Noto Sans", sans-serif;
+  font-size: 12px;
+}
+
+window.csd {
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px @vc_border, 0 6px 22px rgba(0, 0, 0, 0.55);
+}
+
+window.maximized,
+window.fullscreen,
+window.tiled {
+  border-radius: 0;
+}
+
+selection {
+  background-color: alpha(@vc_accent, 0.35);
+  color: @vc_fg_strong;
+}
+
+*:focus:focus-visible {
+  outline: 1px solid alpha(@vc_accent, 0.8);
+  outline-offset: -1px;
+}
+
+.mono,
+.mono label {
+  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", "Hack", "DejaVu Sans Mono", monospace;
+  font-size: 11px;
+  font-feature-settings: "tnum";
+}
+
+.dim { color: @vc_fg_dim; }
+.faint { color: @vc_fg_faint; }
+
+/* ---------------------------------------------------------------- buttons */
+
+button {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid @vc_border;
+  background: @vc_bg3;
+  background-image: none;
+  box-shadow: inset 0 1px alpha(white, 0.04);
+  color: @vc_fg;
+  font-weight: normal;
+  transition: background-color 80ms ease-out;
+}
+
+button:hover { background-color: @vc_bg4; }
+button:active,
+button:checked { background-color: @vc_bg5; }
+button:disabled { color: @vc_fg_faint; background-color: @vc_bg2; }
+
+button.flat,
+menubutton.flat > button,
+.area-header button,
+.topbar button,
+.statusbar button {
+  background: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+button.flat:hover,
+menubutton.flat > button:hover,
+.area-header button:hover,
+.topbar button:hover {
+  background-color: alpha(white, 0.07);
+}
+
+button.flat:active,
+button.flat:checked,
+.area-header button:active,
+.area-header button:checked,
+.topbar button:active,
+.topbar button:checked {
+  background-color: alpha(white, 0.11);
+}
+
+button image { -gtk-icon-size: 14px; }
+
+/* ----------------------------------------------------------------- top bar */
+
+headerbar.topbar {
+  min-height: 28px;
+  padding: 0 4px;
+  margin: 0;
+  background: @vc_bg0;
+  border-bottom: 1px solid @vc_border;
+  box-shadow: none;
+  color: @vc_fg;
+}
+
+window.csd headerbar.topbar {
+  border-radius: 6px 6px 0 0;
+}
+
+window.maximized headerbar.topbar,
+window.tiled headerbar.topbar {
+  border-radius: 0;
+}
+
+headerbar.topbar > windowhandle > box { margin: 0; }
+
+headerbar.topbar button,
+headerbar.topbar menubutton,
+headerbar.topbar windowcontrols,
+headerbar.topbar popovermenubar {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+headerbar.topbar button {
+  min-height: 20px;
+  padding: 1px 6px;
+}
+
+.app-menu > button {
+  padding: 0 6px 0 4px;
+}
+
+.app-logo {
+  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
+  font-weight: 800;
+  font-size: 13px;
+  color: @vc_accent;
+}
+
+.app-name {
+  font-weight: 600;
+  color: @vc_fg_strong;
+  letter-spacing: 0.02em;
+}
+
+popovermenubar {
+  margin-left: 2px;
+}
+
+popovermenubar > item {
+  min-height: 20px;
+  padding: 1px 8px;
+  border-radius: 3px;
+  color: @vc_fg_dim;
+}
+
+popovermenubar > item:hover,
+popovermenubar > item:selected {
+  background-color: alpha(white, 0.07);
+  color: @vc_fg;
+}
+
+/* Workspace tabs: flush segments with an accent underline when active. */
+.workspace-tabs {
+  margin: 2px 0;
+  background: @vc_gap;
+  border: 1px solid @vc_border;
+  border-radius: 4px;
+  padding: 1px;
+}
+
+.workspace-tabs button {
+  min-height: 18px;
+  padding: 0 12px;
+  border-radius: 3px;
+  color: @vc_fg_dim;
+  border: none;
+}
+
+.workspace-tabs button:hover { color: @vc_fg; }
+
+.workspace-tabs button:checked {
+  background-color: @vc_bg3;
+  color: @vc_fg_strong;
+  box-shadow: inset 0 -2px @vc_accent, inset 0 1px alpha(white, 0.05);
+}
+
+.palette-button {
+  margin-right: 6px;
+}
+
+.topbar button.palette-button {
+  min-width: 220px;
+  padding: 0 4px 0 8px;
+  background: @vc_gap;
+  border: 1px solid @vc_border;
+  color: @vc_fg_faint;
+}
+
+.topbar button.palette-button:hover {
+  background: @vc_bg2;
+  color: @vc_fg_dim;
+}
+
+.keycap {
+  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", "Hack", monospace;
+  font-size: 10px;
+  padding: 0 4px;
+  min-height: 14px;
+  border-radius: 3px;
+  border: 1px solid @vc_line;
+  background: @vc_bg2;
+  color: @vc_fg_dim;
+}
+
+windowcontrols { margin: 0 0 0 2px; }
+
+windowcontrols > button,
+windowcontrols > button.image-button {
+  min-height: 22px;
+  min-width: 26px;
+  padding: 0;
+  margin: 0 1px;
+  border-radius: 3px;
+  background: none;
+  box-shadow: none;
+  color: @vc_fg_dim;
+}
+
+windowcontrols > button > image,
+windowcontrols > button.image-button > image {
+  min-width: 14px;
+  min-height: 14px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: none;
+  box-shadow: none;
+  -gtk-icon-size: 12px;
+}
+
+windowcontrols > button:hover { background-color: alpha(white, 0.08); color: @vc_fg; }
+
+windowcontrols > button.close:hover {
+  background-color: #b5412e;
+  color: white;
+}
+
+/* ------------------------------------------------------------------ areas */
+
+.area-root {
+  background: @vc_gap;
+  padding: 2px;
+}
+
+paned > separator {
+  min-width: 3px;
+  min-height: 3px;
+  background: @vc_gap;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+paned > separator:hover {
+  background: alpha(@vc_accent, 0.35);
+}
+
+.area {
+  background: @vc_bg1;
+  border: 1px solid @vc_border;
+  border-radius: 4px;
+}
+
+.area-header {
+  min-height: 24px;
+  padding: 0 3px;
+  background: @vc_bg2;
+  border-bottom: 1px solid @vc_border;
+  border-radius: 3px 3px 0 0;
+  box-shadow: inset 0 1px alpha(white, 0.035);
+}
+
+.area.active > .area-header {
+  background: #2c2c2c;
+}
+
+.area.maximized {
+  border-color: alpha(@vc_accent, 0.6);
+}
+
+.area-header button {
+  min-height: 18px;
+  min-width: 18px;
+  padding: 0 4px;
+}
+
+.area-header .area-tool {
+  color: @vc_fg_faint;
+  padding: 0 3px;
+}
+
+.area-header .area-tool:hover { color: @vc_fg; }
+
+.area-header .area-tool.close:hover {
+  color: #ff7a66;
+}
+
+.area-header .editor-switch > button {
+  padding: 0 4px 0 3px;
+  background: @vc_bg3;
+  border: 1px solid @vc_border;
+  box-shadow: inset 0 1px alpha(white, 0.04);
+}
+
+.area-header .editor-switch > button:hover { background: @vc_bg4; }
+
+.area-header .editor-switch image.editor-icon { color: @vc_accent; }
+
+.area-header .editor-switch .editor-title {
+  font-weight: 600;
+  color: @vc_fg;
+}
+
+.area-header .editor-switch arrow,
+.area-header .editor-switch image.arrow {
+  -gtk-icon-size: 10px;
+  color: @vc_fg_faint;
+  min-width: 10px;
+}
+
+.area-header .header-menu {
+  color: @vc_fg_dim;
+}
+
+.area-header .header-menu:hover { color: @vc_fg; }
+
+.area-header .header-menu > button { padding: 0 6px; }
+.area-header .header-menu > button > box { border-spacing: 0; }
+
+/* Blender-style header menus: plain words, no disclosure arrows. */
+.area-header .header-menu arrow {
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  -gtk-icon-source: none;
+}
+
+.area-header separator {
+  min-width: 1px;
+  margin: 5px 4px;
+  background: @vc_line;
+}
+
+.area-header .header-readout {
+  color: @vc_fg_faint;
+  margin: 0 6px;
+}
+
+.area-body {
+  border-radius: 0 0 3px 3px;
+}
+
+/* Editor placeholders. */
+.placeholder {
+  background: @vc_bg1;
+}
+
+.placeholder .placeholder-icon {
+  -gtk-icon-size: 40px;
+  color: @vc_fg_faint;
+  margin-bottom: 6px;
+}
+
+.placeholder .placeholder-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: @vc_fg;
+}
+
+.placeholder .placeholder-desc {
+  color: @vc_fg_dim;
+}
+
+.placeholder .placeholder-quip {
+  color: @vc_fg_faint;
+  font-style: italic;
+  margin-top: 2px;
+}
+
+.placeholder .milestone {
+  margin-top: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid alpha(@vc_accent, 0.45);
+  color: @vc_accent;
+  background: alpha(@vc_accent, 0.08);
+}
+
+.viewport-hud {
+  margin: 6px 8px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: alpha(@vc_bg0, 0.82);
+  border: 1px solid alpha(white, 0.06);
+  color: @vc_fg_dim;
+}
+
+/* -------------------------------------------------------------- status bar */
+
+.statusbar {
+  min-height: 22px;
+  padding: 0 6px;
+  background: @vc_bg0;
+  border-top: 1px solid @vc_border;
+  color: @vc_fg_dim;
+}
+
+.statusbar separator {
+  min-width: 1px;
+  margin: 5px 6px;
+  background: @vc_line;
+}
+
+.chip {
+  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", "Hack", monospace;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  margin: 3px 2px;
+  border-radius: 3px;
+  border: 1px solid @vc_line;
+  background: @vc_bg2;
+  color: @vc_fg_dim;
+}
+
+.chip.accent {
+  border-color: alpha(@vc_accent, 0.5);
+  background: alpha(@vc_accent, 0.12);
+  color: @vc_accent;
+}
+
+.status-dot {
+  color: @vc_ok;
+  font-size: 9px;
+}
+
+/* ---------------------------------------------------------------- popovers */
+
+popover > contents,
+popover.menu > contents {
+  padding: 3px;
+  background: @vc_bg2;
+  border: 1px solid @vc_border;
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+  color: @vc_fg;
+}
+
+popover > arrow { background: none; border: none; }
+
+popover.menu modelbutton,
+.editor-menu button {
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 3px;
+  color: @vc_fg;
+}
+
+popover.menu modelbutton:hover,
+popover.menu modelbutton:selected,
+.editor-menu button:hover {
+  background-color: alpha(@vc_accent, 0.85);
+  color: @vc_accent_fg;
+}
+
+popover.menu modelbutton:disabled { color: @vc_fg_faint; }
+
+popover.menu modelbutton accelerator,
+popover.menu modelbutton .accelerator {
+  color: @vc_fg_faint;
+  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
+  font-size: 10px;
+}
+
+popover.menu separator {
+  margin: 3px 4px;
+  background: @vc_line;
+  min-height: 1px;
+}
+
+.editor-menu button {
+  background: none;
+  border: none;
+  box-shadow: none;
+}
+
+.editor-menu button image { color: @vc_fg_dim; }
+.editor-menu button:hover image { color: @vc_accent_fg; }
+
+.editor-menu button.current {
+  box-shadow: inset 2px 0 @vc_accent;
+}
+
+.editor-menu .menu-heading {
+  padding: 2px 8px 3px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: @vc_fg_faint;
+}
+
+tooltip,
+tooltip.background {
+  padding: 3px 6px;
+  border-radius: 3px;
+  background: #0e0e0e;
+  border: 1px solid @vc_line;
+  color: @vc_fg;
+  box-shadow: none;
+}
+
+/* ----------------------------------------------------------------- entries */
+
+entry {
+  min-height: 22px;
+  padding: 0 6px;
+  border-radius: 3px;
+  border: 1px solid @vc_border;
+  background: @vc_bg0;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.3);
+  color: @vc_fg;
+  caret-color: @vc_accent;
+}
+
+entry:focus-within {
+  border-color: alpha(@vc_accent, 0.8);
+  outline: none;
+}
+
+entry image { color: @vc_fg_faint; }
+
+/* --------------------------------------------------------- command palette */
+
+.palette-backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.palette {
+  min-width: 560px;
+  margin-top: 56px;
+  padding: 6px;
+  background: @vc_bg2;
+  border: 1px solid @vc_border;
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px alpha(white, 0.05), 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+
+.palette entry {
+  min-height: 30px;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.palette list {
+  background: none;
+}
+
+.palette list > row {
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 3px;
+  color: @vc_fg;
+}
+
+.palette list > row:hover { background: alpha(white, 0.05); }
+
+.palette list > row:selected {
+  background: alpha(@vc_accent, 0.16);
+  box-shadow: inset 2px 0 @vc_accent;
+  color: @vc_fg_strong;
+}
+
+.palette .command-category {
+  color: @vc_fg_faint;
+  min-width: 84px;
+}
+
+.palette .palette-empty {
+  padding: 12px;
+  color: @vc_fg_faint;
+}
+
+.palette .palette-footer {
+  margin-top: 6px;
+  padding: 4px 4px 0;
+  border-top: 1px solid @vc_line;
+  color: @vc_fg_faint;
+  font-size: 11px;
+}
+
+/* -------------------------------------------------------------- scrollbars */
+
+scrollbar {
+  background: none;
+  border: none;
+}
+
+scrollbar slider {
+  min-width: 4px;
+  min-height: 4px;
+  border-radius: 3px;
+  background: alpha(white, 0.18);
+  border: none;
+}
+
+scrollbar slider:hover { background: alpha(white, 0.3); }
+
+/* ----------------------------------------------------------------- dialogs */
+
+window.dialog,
+window.aboutdialog,
+window.messagedialog {
+  background: @vc_bg2;
+}
+
+.dialog-action-area button,
+window.dialog button {
+  min-height: 24px;
+  padding: 0 12px;
+}
+
+label.shortcut-keys {
+  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
+  color: @vc_accent;
+}

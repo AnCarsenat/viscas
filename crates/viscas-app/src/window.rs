@@ -1,229 +1,392 @@
-//! Main application window: header bars, sidebar and viewport.
+//! Main window: top bar, area tree, status bar and command palette.
 
-use std::cell::Cell;
-use std::rc::Rc;
-
-use adw::prelude::*;
+use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::panels::{self, PanelCtx};
-use crate::viewport::Viewport;
-
-/// Default sidebar width range (the width follows `SIDEBAR_FRACTION` within it).
-const SIDEBAR_DEFAULT_MIN: f64 = 380.0;
-const SIDEBAR_DEFAULT_MAX: f64 = 440.0;
-const SIDEBAR_FRACTION: f64 = 0.3;
-/// Limits for a sidebar width chosen by dragging its edge.
-const SIDEBAR_MIN_WIDTH: f64 = 300.0;
-const SIDEBAR_MAX_WIDTH: f64 = 640.0;
-/// A dragged sidebar never takes more than this fraction of the split view.
-const SIDEBAR_MAX_FRACTION: f64 = 0.6;
+use crate::areas::{AreaCommands, Areas};
+use crate::commands::WindowCommands;
+use crate::ctx::AppCtx;
+use crate::layout::{Dir, EditorKind};
+use crate::palette::Palette;
+use crate::workspace::Workspace;
 
 /// Builds and returns the main window for `app`.
-pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
-    let stack = panels::build_stack(&PanelCtx::default());
-    let split_view = adw::OverlaySplitView::builder()
-        .content(&build_content())
-        .min_sidebar_width(SIDEBAR_DEFAULT_MIN)
-        .max_sidebar_width(SIDEBAR_DEFAULT_MAX)
-        .sidebar_width_fraction(SIDEBAR_FRACTION)
-        .build();
-    let sidebar = resizable_sidebar(&split_view, &build_sidebar(&stack));
-    split_view.set_sidebar(Some(&sidebar));
+pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
+    let areas = Areas::new(ctx, Workspace::Graph);
+    let (statusbar, selection_info, area_info) = build_statusbar();
 
-    let window = adw::ApplicationWindow::builder()
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    body.append(areas.widget());
+    body.append(&statusbar);
+    let overlay = gtk::Overlay::builder().child(&body).build();
+
+    let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Viscas")
-        .default_width(1200)
-        .default_height(800)
-        .width_request(360)
-        .height_request(294)
-        .content(&split_view)
+        .default_width(1440)
+        .default_height(880)
+        .width_request(480)
+        .height_request(320)
+        .titlebar(&build_topbar())
+        .child(&overlay)
         .build();
 
-    // Collapse the sidebar into an overlay on narrow windows.
-    let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-        adw::BreakpointConditionLengthType::MaxWidth,
-        720.0,
-        adw::LengthUnit::Sp,
-    ));
-    breakpoint.add_setter(&split_view, "collapsed", Some(&true.to_value()));
-    breakpoint.add_setter(&split_view, "show-sidebar", Some(&false.to_value()));
-    window.add_breakpoint(breakpoint);
+    let palette = Palette::new(&overlay, ctx);
+    palette.contain_focus(&window);
+    install_actions(&window, &areas, &palette);
+    ctx.add_command_provider(WindowCommands::new(&window));
+    ctx.add_command_provider(AreaCommands::new(&areas));
 
-    install_actions(&window, &split_view, &stack);
+    let update_selection = move |sel: &crate::ctx::Selection| {
+        let selected = sel.selected();
+        let text = match selected.len() {
+            0 => "Nothing selected".to_owned(),
+            1 => format!("Node #{}", selected[0]),
+            n => format!("{n} nodes selected"),
+        };
+        let text = match sel.hovered() {
+            Some(id) => format!("{text}  ·  hover #{id}"),
+            None => text,
+        };
+        selection_info.set_label(&text);
+    };
+    update_selection(ctx.selection());
+    ctx.selection().connect_changed(update_selection);
+
+    let update_info = move |areas: &Areas| {
+        let layout = areas.layout();
+        let total = layout.leaves().len();
+        let text = match (areas.active_area(), areas.active_editor()) {
+            (Some(id), Some(kind)) => {
+                let pos = layout
+                    .leaves()
+                    .iter()
+                    .position(|(a, _)| *a == id)
+                    .map_or(0, |p| p + 1);
+                let max = if layout.maximized().is_some() {
+                    "  ·  maximized"
+                } else {
+                    ""
+                };
+                format!("{}  ·  area {pos}/{total}{max}", kind.title())
+            }
+            _ => String::new(),
+        };
+        area_info.set_label(&text);
+    };
+    update_info(&areas);
+    areas.connect_changed(update_info);
+
     window
 }
 
-fn build_sidebar(stack: &adw::ViewStack) -> gtk::Widget {
-    let switcher = adw::ViewSwitcher::builder()
-        .stack(stack)
-        .policy(adw::ViewSwitcherPolicy::Narrow)
-        .build();
-    let header = adw::HeaderBar::builder()
-        .title_widget(&switcher)
-        .show_end_title_buttons(false)
+fn build_topbar() -> gtk::HeaderBar {
+    let header = gtk::HeaderBar::builder()
+        .show_title_buttons(true)
+        .css_classes(["topbar"])
         .build();
 
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(stack));
-    toolbar.upcast()
+    // App menu: logo + name.
+    let logo = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    logo.append(
+        &gtk::Label::builder()
+            .label("∿")
+            .css_classes(["app-logo"])
+            .build(),
+    );
+    logo.append(
+        &gtk::Label::builder()
+            .label("Viscas")
+            .css_classes(["app-name"])
+            .build(),
+    );
+    let app_menu = gtk::MenuButton::builder()
+        .child(&logo)
+        .menu_model(&app_menu())
+        .tooltip_text("Viscas")
+        .css_classes(["app-menu", "flat"])
+        .build();
+    header.pack_start(&app_menu);
+    header.pack_start(&gtk::PopoverMenuBar::from_model(Some(&menubar())));
+
+    // Workspace tabs, radio-like through the stateful `win.workspace` action.
+    let tabs = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(1)
+        .valign(gtk::Align::Center)
+        .css_classes(["workspace-tabs"])
+        .build();
+    for ws in Workspace::ALL {
+        let tab = gtk::ToggleButton::builder()
+            .label(ws.title())
+            .action_name("win.workspace")
+            .action_target(&ws.id().to_variant())
+            .tooltip_text(format!(
+                "{} workspace ({})",
+                ws.title(),
+                crate::shortcuts::label_for(&format!("win.workspace::{}", ws.id()))
+                    .unwrap_or_default()
+            ))
+            .build();
+        tabs.append(&tab);
+    }
+    header.set_title_widget(Some(&tabs));
+
+    // Command palette button with keycap hint.
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    content.append(&gtk::Image::from_icon_name(crate::editors::pick_icon(&[
+        "system-search-symbolic",
+        "edit-find-symbolic",
+    ])));
+    content.append(
+        &gtk::Label::builder()
+            .label("Search commands…")
+            .xalign(0.0)
+            .hexpand(true)
+            .build(),
+    );
+    content.append(
+        &gtk::Label::builder()
+            .label(crate::shortcuts::label_for("win.palette").unwrap_or_default())
+            .css_classes(["keycap"])
+            .build(),
+    );
+    let palette_button = gtk::Button::builder()
+        .child(&content)
+        .action_name("win.palette")
+        .tooltip_text("Command Palette")
+        .valign(gtk::Align::Center)
+        .css_classes(["palette-button"])
+        .build();
+    header.pack_end(&palette_button);
+    header
 }
 
-fn build_content() -> gtk::Widget {
-    let sidebar_button = gtk::ToggleButton::builder()
-        .icon_name("sidebar-show-symbolic")
-        .tooltip_text("Toggle Sidebar (F9)")
-        .action_name("win.toggle-sidebar")
-        .build();
-    let undo_button = gtk::Button::builder()
-        .icon_name("edit-undo-symbolic")
-        .tooltip_text("Undo (Ctrl+Z)")
-        .action_name("win.undo")
-        .build();
-    let redo_button = gtk::Button::builder()
-        .icon_name("edit-redo-symbolic")
-        .tooltip_text("Redo (Ctrl+Shift+Z)")
-        .action_name("win.redo")
-        .build();
-    let menu_button = gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .tooltip_text("Main Menu")
-        .menu_model(&primary_menu())
-        .primary(true)
-        .build();
-
-    let header = adw::HeaderBar::builder()
-        .title_widget(&adw::WindowTitle::new("Untitled", "Viscas"))
-        .build();
-    header.pack_start(&sidebar_button);
-    header.pack_start(&undo_button);
-    header.pack_start(&redo_button);
-    header.pack_end(&menu_button);
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(Viewport::new().widget()));
-    toolbar.upcast()
-}
-
-fn primary_menu() -> gio::Menu {
+fn app_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
     let help = gio::Menu::new();
     help.append(Some("_Keyboard Shortcuts"), Some("app.shortcuts"));
     help.append(Some("_About Viscas"), Some("app.about"));
     let quit = gio::Menu::new();
     quit.append(Some("_Quit"), Some("app.quit"));
-
-    let menu = gio::Menu::new();
     menu.append_section(None, &help);
     menu.append_section(None, &quit);
     menu
 }
 
-/// Lets the user resize the sidebar by dragging its trailing edge.
-///
-/// `AdwOverlaySplitView` has no built-in resize handle, so a thin strip is
-/// overlaid on the sidebar edge. The drag gesture lives on the stationary
-/// split view (so the moving handle cannot feed back into the drag), only
-/// claims presses on the handle, and derives the width from the absolute
-/// pointer position. The chosen width pins min/max sidebar width while the
-/// split view is expanded; collapsing restores the defaults.
-fn resizable_sidebar(split_view: &adw::OverlaySplitView, sidebar: &gtk::Widget) -> gtk::Widget {
-    let handle = gtk::Box::builder()
-        .width_request(6)
-        .halign(gtk::Align::End)
+fn menubar() -> gio::Menu {
+    // Items pointing at unregistered actions render insensitive; they are
+    // placeholders for the document milestone (M8).
+    let file = gio::Menu::new();
+    let doc = gio::Menu::new();
+    doc.append(Some("_New"), Some("win.new"));
+    doc.append(Some("_Open…"), Some("win.open"));
+    doc.append(Some("_Save"), Some("win.save"));
+    doc.append(Some("Save _As…"), Some("win.save-as"));
+    let export = gio::Menu::new();
+    export.append(Some("_Export Viewport…"), Some("win.export"));
+    let quit = gio::Menu::new();
+    quit.append(Some("_Quit"), Some("app.quit"));
+    file.append_section(None, &doc);
+    file.append_section(None, &export);
+    file.append_section(None, &quit);
+
+    let edit = gio::Menu::new();
+    let history = gio::Menu::new();
+    history.append(Some("_Undo"), Some("win.undo"));
+    history.append(Some("_Redo"), Some("win.redo"));
+    let tools = gio::Menu::new();
+    tools.append(Some("_Command Palette"), Some("win.palette"));
+    edit.append_section(None, &history);
+    edit.append_section(None, &tools);
+
+    let view = gio::Menu::new();
+    let area = gio::Menu::new();
+    area.append(
+        Some("Split Area _Horizontally"),
+        Some("win.split-area::horizontal"),
+    );
+    area.append(
+        Some("Split Area _Vertically"),
+        Some("win.split-area::vertical"),
+    );
+    area.append(Some("_Close Area"), Some("win.close-area"));
+    area.append(Some("_Maximize Area"), Some("win.maximize-area"));
+    let editors = gio::Menu::new();
+    for kind in EditorKind::ALL {
+        editors.append(
+            Some(kind.title()),
+            Some(&format!("win.editor::{}", kind.id())),
+        );
+    }
+    let workspaces = gio::Menu::new();
+    for ws in Workspace::ALL {
+        workspaces.append(
+            Some(ws.title()),
+            Some(&format!("win.workspace::{}", ws.id())),
+        );
+    }
+    let subs = gio::Menu::new();
+    subs.append_submenu(Some("_Editor Type"), &editors);
+    subs.append_submenu(Some("_Workspace"), &workspaces);
+    view.append_section(None, &area);
+    view.append_section(None, &subs);
+
+    let help = gio::Menu::new();
+    help.append(Some("_Keyboard Shortcuts"), Some("app.shortcuts"));
+    help.append(Some("_About Viscas"), Some("app.about"));
+
+    let bar = gio::Menu::new();
+    bar.append_submenu(Some("_File"), &file);
+    bar.append_submenu(Some("_Edit"), &edit);
+    bar.append_submenu(Some("_View"), &view);
+    bar.append_submenu(Some("_Help"), &help);
+    bar
+}
+
+/// Status bar; returns it with the selection and active-area labels.
+fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label) {
+    let bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .css_classes(["statusbar"])
         .build();
-    handle.set_cursor_from_name(Some("col-resize"));
-    let overlay = gtk::Overlay::builder().child(sidebar).build();
-    overlay.add_overlay(&handle);
+    let chip = |text: &str, tip: &str, accent: bool| {
+        let label = gtk::Label::builder()
+            .label(text)
+            .tooltip_text(tip)
+            .valign(gtk::Align::Center)
+            .css_classes(["chip"])
+            .build();
+        if accent {
+            label.add_css_class("accent");
+        }
+        label
+    };
+    // Static until the evaluator exists (M1).
+    bar.append(&chip(
+        "EXACT",
+        "Results stay exact (switch: :mode approx)",
+        true,
+    ));
+    bar.append(&chip(
+        "RAD",
+        "Angle unit: radians (switch: :mode deg)",
+        false,
+    ));
+    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    let selection_info = gtk::Label::builder().css_classes(["dim"]).build();
+    bar.append(&selection_info);
+    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    let area_info = gtk::Label::builder().css_classes(["faint"]).build();
+    bar.append(&area_info);
 
-    // Width picked by the user, re-applied when the split view expands.
-    let chosen = Rc::new(Cell::new(None::<f64>));
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    bar.append(&spacer);
 
-    let drag = gtk::GestureDrag::new();
-    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
-    drag.connect_drag_begin(glib::clone!(
-        #[weak]
-        handle,
-        move |gesture, x, y| {
-            let Some(split_view) = gesture.widget() else {
-                return;
-            };
-            let on_handle = split_view
-                .pick(x, y, gtk::PickFlags::DEFAULT)
-                .is_some_and(|w| w == handle || w.is_ancestor(&handle));
-            let collapsed = split_view
-                .downcast_ref::<adw::OverlaySplitView>()
-                .is_some_and(|s| s.is_collapsed());
-            if on_handle && !collapsed {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-            } else {
-                gesture.set_state(gtk::EventSequenceState::Denied);
+    let status = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(5)
+        .build();
+    status.append(
+        &gtk::Label::builder()
+            .label("●")
+            .css_classes(["status-dot"])
+            .build(),
+    );
+    status.append(
+        &gtk::Label::builder()
+            .label("ready")
+            .css_classes(["mono"])
+            .build(),
+    );
+    bar.append(&status);
+    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    bar.append(
+        &gtk::Label::builder()
+            .label(concat!("v", env!("CARGO_PKG_VERSION")))
+            .css_classes(["mono", "faint"])
+            .build(),
+    );
+    (bar, selection_info, area_info)
+}
+
+fn install_actions(window: &gtk::ApplicationWindow, areas: &Areas, palette: &Palette) {
+    let palette_action = gio::SimpleAction::new("palette", None);
+    palette_action.connect_activate(glib::clone!(
+        #[strong]
+        palette,
+        move |_, _| palette.toggle()
+    ));
+    window.add_action(&palette_action);
+
+    let split = gio::SimpleAction::new("split-area", Some(glib::VariantTy::STRING));
+    split.connect_activate(glib::clone!(
+        #[strong]
+        areas,
+        move |_, param| {
+            if let Some(dir) = param.and_then(|p| p.str()).and_then(Dir::from_id) {
+                areas.split(None, dir);
             }
         }
     ));
-    drag.connect_drag_update(glib::clone!(
+    window.add_action(&split);
+
+    let close = gio::SimpleAction::new("close-area", None);
+    close.connect_activate(glib::clone!(
         #[strong]
-        chosen,
-        move |gesture, ox, _| {
-            let Some(split_view) = gesture.widget().and_downcast::<adw::OverlaySplitView>() else {
-                return;
-            };
-            let Some((sx, _)) = gesture.start_point() else {
-                return;
-            };
-            let x = sx + ox;
-            let total = f64::from(split_view.width());
-            let width = if split_view.direction() == gtk::TextDirection::Rtl {
-                total - x
-            } else {
-                x
-            };
-            let max = SIDEBAR_MAX_WIDTH.min(total * SIDEBAR_MAX_FRACTION);
-            let width = width.max(SIDEBAR_MIN_WIDTH).min(max);
-            chosen.set(Some(width));
-            split_view.set_min_sidebar_width(width);
-            split_view.set_max_sidebar_width(width);
+        areas,
+        move |_, _| areas.close(None)
+    ));
+    window.add_action(&close);
+
+    let maximize = gio::SimpleAction::new("maximize-area", None);
+    maximize.connect_activate(glib::clone!(
+        #[strong]
+        areas,
+        move |_, _| areas.toggle_maximize(None)
+    ));
+    window.add_action(&maximize);
+
+    let editor = gio::SimpleAction::new("editor", Some(glib::VariantTy::STRING));
+    editor.connect_activate(glib::clone!(
+        #[strong]
+        areas,
+        move |_, param| {
+            if let Some(kind) = param.and_then(|p| p.str()).and_then(EditorKind::from_id) {
+                areas.set_editor(None, kind);
+            }
         }
     ));
-    split_view.add_controller(drag);
+    window.add_action(&editor);
 
-    split_view.connect_collapsed_notify(move |split_view| {
-        if split_view.is_collapsed() {
-            split_view.set_min_sidebar_width(SIDEBAR_DEFAULT_MIN);
-            split_view.set_max_sidebar_width(SIDEBAR_DEFAULT_MAX);
-        } else if let Some(width) = chosen.get() {
-            let total = f64::from(split_view.width());
-            let max = if total > 0.0 {
-                SIDEBAR_MAX_WIDTH.min(total * SIDEBAR_MAX_FRACTION)
-            } else {
-                SIDEBAR_MAX_WIDTH
+    let workspace = gio::SimpleAction::new_stateful(
+        "workspace",
+        Some(glib::VariantTy::STRING),
+        &areas.workspace().id().to_variant(),
+    );
+    workspace.connect_change_state(glib::clone!(
+        #[strong]
+        areas,
+        move |action, value| {
+            let Some(value) = value else {
+                return;
             };
-            let width = width.max(SIDEBAR_MIN_WIDTH).min(max);
-            split_view.set_min_sidebar_width(width);
-            split_view.set_max_sidebar_width(width);
+            if let Some(ws) = value.str().and_then(Workspace::from_id) {
+                areas.set_workspace(ws);
+                action.set_state(value);
+            }
         }
-    });
-
-    overlay.upcast()
-}
-
-fn install_actions(
-    window: &adw::ApplicationWindow,
-    split_view: &adw::OverlaySplitView,
-    stack: &adw::ViewStack,
-) {
-    window.add_action(&gio::PropertyAction::new(
-        "toggle-sidebar",
-        split_view,
-        "show-sidebar",
     ));
-    window.add_action(&gio::PropertyAction::new(
-        "panel",
-        stack,
-        "visible-child-name",
-    ));
+    window.add_action(&workspace);
 
     // Placeholders until the scene model provides an undo stack.
     for name in ["undo", "redo"] {
