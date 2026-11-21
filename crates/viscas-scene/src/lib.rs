@@ -22,6 +22,10 @@ mod history;
 pub mod names;
 pub mod node;
 pub mod scene;
+
+#[cfg(test)]
+mod tests;
+
 pub use analysis::{Analysis, Letter, Parsed, ParsedSource, Reference, analyze};
 pub use document::{
     DocNode, Document, DocumentError, FORMAT_VERSION, load_document, migrate, save_document,
