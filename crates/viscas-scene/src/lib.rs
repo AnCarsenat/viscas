@@ -14,10 +14,16 @@
 //! - [`document`]: the versioned, human-readable `.viscas` format (RON).
 
 pub mod analysis;
+pub mod eval;
+pub mod events;
 pub mod graph;
+mod history;
 pub mod names;
 pub mod node;
+pub mod scene;
 pub use analysis::{Analysis, Letter, Parsed, ParsedSource, Reference, analyze};
+pub use eval::{NodeEvaluator, NodeResult, Status};
+pub use events::{Change, SceneEvent};
 pub use graph::{DepGraph, Diagnostic, DiagnosticKind, Resolution};
 pub use names::{
     Builtins, DefaultBuiltins, definition_line, is_valid_identifier, parse_definition, unique_name,
@@ -27,3 +33,4 @@ pub use node::{
     NodeContent, NodeId, NodeKind, ParseMode, Projection, PropValue, ScriptLanguage, Source,
     SourceField, Style,
 };
+pub use scene::{DepthFirst, Scene, SceneError};
