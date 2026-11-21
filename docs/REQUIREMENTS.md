@@ -42,7 +42,7 @@ Areas can be split, joined, resized, swapped and maximized (Ctrl+Space).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ top bar: menus · workspace tabs [Graph][Algebra][Data][Script] · ⌘K │
+│ top bar: menus · workspace tabs [Graph][Algebra][Data][Script] · ^P │
 ├──────────────┬──────────────────────────────────────┬───────────────┤
 │ Scene Tree   │                                      │ Inspector     │
 │ (Godot-like) │          Viewport (2D)               │ (properties   │
@@ -83,7 +83,7 @@ with a user default.
 2. **Step-by-step CAS.** Every symbolic result (simplify, solve, derivative,
    integrate, limit…) can expand into its derivation: a sequence of rewrite
    steps with the rule applied, each step typeset and copyable.
-3. **Command palette (Ctrl+K).** Fuzzy search over every action, node,
+3. **Command palette (Ctrl+P / Space).** Fuzzy search over every action, node,
    function, unit and setting. Keyboard-only workflow is a first-class goal.
 
 ## 3. Node model
@@ -94,12 +94,12 @@ opacity, label), and a body. Node properties are what the Inspector edits.
 
 | Node kind   | Example | Notes |
 |-------------|---------|-------|
-| Variable    | `a = 3` | |
-| Function    | `f(x) = x^2 + a` | multi-arg allowed |
+| Variable    | `a := 3` | |
+| Function    | `f(x) := x^2 + a` | multi-arg allowed |
 | Plot        | `y = sin(x)`, `r = θ`, `(cos t, sin t)`, `x^2+y^2 < 4` | explicit, polar, parametric, implicit, inequalities, restrictions `{0<x<2}` |
-| Point       | `P = (1, 2)` | draggable when defined by free variables |
-| Slider      | `a = 3` with range/step/animation | a Variable with slider metadata |
-| List        | `L = [1..10]` | comprehensions `[k^2 for k=[1..5]]` |
+| Point       | `P := (1, 2)` | draggable when defined by free variables |
+| Slider      | `a := 3` with range/step/animation | a Variable with slider metadata |
+| List        | `L := [1..10]` | comprehensions `[k^2 for k=[1..5]]` |
 | Geometry    | `segment(A,B)`, `circle(C,r)`, `polygon(...)` | |
 | Table       | sheet of columns | edited in Sheet editor |
 | Script      | code body | edited in Script editor |
@@ -110,6 +110,10 @@ opacity, label), and a body. Node properties are what the Inspector edits.
 | Regression  | `y1 ~ m x1 + b` | creates fitted parameter nodes |
 
 ## 4. Expression language
+
+- Definitions use `:=` (`a := 3`, `f(x) := x^2`); plain `=` always states an
+  equation/relation (`y = x^2`, `x = 3`). The definition operator is a preference
+  (`:=` default, or `=` for users who prefer it).
 
 - Numbers: integers, rationals, decimals, scientific (`1.2e-3`), complex (`3+2i`).
 - Implicit multiplication (`2x`, `2(x+1)`, `sin 2x`), unicode input (`π`, `θ`, `√`)
@@ -262,6 +266,9 @@ Each milestone splits into feature branches → PR → review → squash merge (
      dragging a cable re-points a reference.
    - **Personality**: a little playful microcopy in empty states, tips and
      errors, never at the cost of clarity. The base look stays Blender-precise.
+
+9. Definition operator `:=` (configurable to `=` in Preferences ▸ Editing).
+10. Command palette: Ctrl+P, or Space when no text field has focus.
 
 ## 15. Open questions
 
