@@ -1,9 +1,14 @@
 //! Editor widgets hosted by areas (REQUIREMENTS §2).
 //!
-//! Only the Viewport is functional so far; every other editor shows an
-//! empty state describing what it will do and in which milestone.
+//! The Viewport, Console and Expressions editors are functional; every
+//! other editor shows an empty state describing what it will do and in
+//! which milestone.
+
+pub mod console;
+pub mod expressions;
 
 use std::f64::consts::PI;
+use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk::{cairo, gio};
@@ -66,6 +71,8 @@ pub struct Editor {
     pub kind: EditorKind,
     pub widget: gtk::Widget,
     pub viewport: Option<Viewport>,
+    /// Builds editor-specific header widgets (fresh for every header).
+    header: Option<Rc<dyn Fn() -> Vec<gtk::Widget>>>,
 }
 
 impl Editor {
@@ -78,17 +85,40 @@ impl Editor {
                     kind,
                     widget: viewport.widget().clone(),
                     viewport: Some(viewport),
+                    header: None,
+                }
+            }
+            EditorKind::Console => {
+                let console = console::Console::new(ctx);
+                let widget = console.widget();
+                Self {
+                    kind,
+                    widget,
+                    viewport: None,
+                    header: Some(Rc::new(move || console.header_content())),
+                }
+            }
+            EditorKind::Expressions => {
+                let list = expressions::Expressions::new(ctx);
+                let widget = list.widget();
+                Self {
+                    kind,
+                    widget,
+                    viewport: None,
+                    header: Some(Rc::new(move || list.header_content())),
                 }
             }
             EditorKind::DependencyGraph => Self {
                 kind,
                 widget: canvas_placeholder(kind, ctx),
                 viewport: None,
+                header: None,
             },
             _ => Self {
                 kind,
                 widget: placeholder(kind, ctx),
                 viewport: None,
+                header: None,
             },
         }
     }
@@ -98,10 +128,14 @@ impl Editor {
         if let Some(viewport) = &self.viewport {
             return viewport.header_widgets();
         }
-        header_menus(self.kind)
+        let mut widgets: Vec<gtk::Widget> = header_menus(self.kind)
             .iter()
             .map(|(title, items)| header_menu(title, items).upcast())
-            .collect()
+            .collect();
+        if let Some(header) = &self.header {
+            widgets.extend(header());
+        }
+        widgets
     }
 }
 
@@ -112,8 +146,8 @@ fn header_menus(kind: EditorKind) -> &'static [(&'static str, &'static [&'static
         EditorKind::Viewport => &[], // built by the viewport itself
         EditorKind::SceneTree => &[("Node", &["New Folder", "Rename", "Delete"])],
         EditorKind::Inspector => &[("Edit", &["Copy Style", "Paste Style"])],
-        EditorKind::Console => &[("Session", &["Clear", "Copy Result", "Pin as Node"])],
-        EditorKind::Expressions => &[("Edit", &["New Expression", "Sort"])],
+        // Console and Expressions put their tools in the header directly.
+        EditorKind::Console | EditorKind::Expressions => &[],
         EditorKind::Sheet => &[("Table", &["Add Column", "Import CSV", "Export CSV"])],
         EditorKind::Script => &[("Run", &["Run Script", "Stop"])],
         EditorKind::DependencyGraph => {
