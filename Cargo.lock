@@ -747,6 +747,7 @@ dependencies = [
  "pangocairo",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ path = "src/main.rs"
 gtk4 = { workspace = true, features = ["v4_14"] }
 pangocairo.workspace = true
 serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
