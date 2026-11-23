@@ -277,6 +277,10 @@ pub enum StmtKind {
         lhs: Expr,
         rhs: Expr,
         restrictions: Vec<Expr>,
+        /// Written with `=` under [`DefinitionOp::Eq`](super::DefinitionOp)
+        /// (printed with `=`; reassigns a visible `let` of the same name).
+        /// `false` for `:=`, which always defines a global.
+        with_eq: bool,
     },
     /// `lhs ~ rhs {restrictions}`
     Regression {
@@ -452,6 +456,7 @@ impl Stmt {
                 lhs,
                 rhs,
                 restrictions,
+                ..
             }
             | StmtKind::Regression {
                 lhs,
@@ -948,6 +953,7 @@ fn write_stmt_body(f: &mut fmt::Formatter<'_>, stmt: &Stmt, depth: usize) -> fmt
             lhs,
             rhs,
             restrictions,
+            ..
         }
         | StmtKind::Regression {
             lhs,
@@ -957,6 +963,7 @@ fn write_stmt_body(f: &mut fmt::Formatter<'_>, stmt: &Stmt, depth: usize) -> fmt
             top(f, lhs)?;
             f.write_str(match stmt.kind {
                 StmtKind::Equation { .. } => " = ",
+                StmtKind::Definition { with_eq: true, .. } => " = ",
                 StmtKind::Definition { .. } => " := ",
                 _ => " ~ ",
             })?;

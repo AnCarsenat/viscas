@@ -560,6 +560,42 @@ impl<'a> Walker<'a> {
                 self.expr(rhs);
                 self.exprs(restrictions);
             }
+            // `a := …` defines (writes) the global `a`; `g(x) := …` defines
+            // a function whose parameters are bound in its body (it may
+            // recurse).
+            StmtKind::Definition {
+                lhs,
+                rhs,
+                restrictions,
+                ..
+            } => match &*lhs.kind {
+                ExprKind::Ident(name) => {
+                    self.expr(rhs);
+                    self.exprs(restrictions);
+                    self.write(name, lhs.span);
+                }
+                ExprKind::Call { callee, args } => {
+                    if let ExprKind::Ident(f) = &*callee.kind {
+                        self.bind(f, false);
+                    }
+                    let params: Vec<String> = args
+                        .iter()
+                        .filter_map(|a| match &*a.kind {
+                            ExprKind::Ident(p) => Some(p.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    self.with(&params, |w| {
+                        w.expr(rhs);
+                        w.exprs(restrictions);
+                    });
+                }
+                _ => {
+                    self.expr(lhs);
+                    self.expr(rhs);
+                    self.exprs(restrictions);
+                }
+            },
             StmtKind::Action { actions } => {
                 for (target, value) in actions {
                     match &*target.kind {

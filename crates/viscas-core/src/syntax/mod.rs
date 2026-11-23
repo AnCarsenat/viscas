@@ -217,7 +217,7 @@ pub enum DefinitionOp {
     #[default]
     ColonEq,
     /// Legacy/alternative: `name = ...` and `f(x, ...) = ...` also define
-    /// (unless the name is `x`, `y`, `r` or a prefix function such as
+    /// (unless the name is `x`, `y`, `r`, `θ` or a prefix function such as
     /// `sin`), so `a = 3` defines `a` while `y = x^2` stays a relation.
     /// `:=` still defines.
     Eq,

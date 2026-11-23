@@ -49,7 +49,7 @@ pub fn is_definition_head(lhs: &Expr) -> bool {
 }
 
 /// In [`DefinitionOp::Eq`] mode, `lhs = rhs` is a definition when `lhs` is a
-/// definition head whose name is not a plot coordinate (`x`, `y`, `r`) or a
+/// definition head whose name is not a plot coordinate (`x`, `y`, `r`, `θ`) or a
 /// prefix function (`sin(x) = y` stays a relation).
 fn is_eq_mode_definition(lhs: &Expr) -> bool {
     let name = match &*lhs.kind {
@@ -61,7 +61,7 @@ fn is_eq_mode_definition(lhs: &Expr) -> bool {
         _ => return false,
     };
     is_definition_head(lhs)
-        && !matches!(name.as_str(), "x" | "y" | "r")
+        && !matches!(name.as_str(), "x" | "y" | "r" | "θ" | "theta")
         && !is_prefix_function(name)
 }
 
@@ -498,6 +498,7 @@ impl Parser {
                                 lhs,
                                 rhs,
                                 restrictions,
+                                with_eq: true,
                             }
                         } else if is_eq {
                             StmtKind::Equation {
@@ -528,6 +529,7 @@ impl Parser {
                             lhs,
                             rhs,
                             restrictions,
+                            with_eq: false,
                         }
                     }
                     T::Arrow => {

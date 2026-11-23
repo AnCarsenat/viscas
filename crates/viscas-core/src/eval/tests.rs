@@ -1649,6 +1649,22 @@ fn y1_equation_is_a_relation_and_colon_eq_defines() {
 }
 
 #[test]
+fn colon_eq_always_defines_global_even_with_let_in_scope() {
+    let mut s = session();
+    // `:=` defines the global; the `let` keeps shadowing it in the script.
+    assert_eq!(ev_with(&mut s, "let g = 1\ng := 5\ng"), "1");
+    let mut fresh = session();
+    fresh.eval("let g = 1\ng := 5").unwrap();
+    fresh.clear_locals();
+    assert_eq!(ev_with(&mut fresh, "g"), "5");
+    // Under DefinitionOp::Eq, `g = v` reassigns the visible `let`.
+    let mut eq = session();
+    eq.parse.definition_op = crate::syntax::DefinitionOp::Eq;
+    assert_eq!(ev_with(&mut eq, "let h = 1\nh = 5\nh"), "5");
+    assert!(!eq.env.contains("h"));
+}
+
+#[test]
 fn definition_returns_value() {
     let mut s = session();
     assert_eq!(ev_with(&mut s, "c := 1/2 + 1/2"), "1");

@@ -453,7 +453,7 @@ fn table_columns_are_bound_in_table_scope() {
 #[test]
 fn colon_equals_definitions() {
     let opts = LineOptions {
-        definition_op: DefinitionOp::ColonEquals,
+        definition_op: DefinitionOp::ColonEq,
     };
     assert_eq!(
         parse_definition_with("a := 3", opts).unwrap(),

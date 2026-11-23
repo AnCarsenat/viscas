@@ -52,11 +52,11 @@ fn classify(line: &str) -> NodeContent {
 
 #[test]
 fn classify_variable_point_list() {
-    assert_eq!(classify("a = 3"), NodeContent::variable("a", "3"));
-    assert_eq!(classify("P = (1, 2)"), NodeContent::point("P", "(1, 2)"));
-    assert_eq!(classify("L = [1..10]"), NodeContent::list("L", "[1..10]"));
+    assert_eq!(classify("a := 3"), NodeContent::variable("a", "3"));
+    assert_eq!(classify("P := (1, 2)"), NodeContent::point("P", "(1, 2)"));
+    assert_eq!(classify("L := [1..10]"), NodeContent::list("L", "[1..10]"));
     assert_eq!(
-        classify("S = [k^2 for k = [1..5]]"),
+        classify("S := [k^2 for k = [1..5]]"),
         NodeContent::list("S", "[k^2 for k = [1..5]]")
     );
 }
@@ -64,13 +64,40 @@ fn classify_variable_point_list() {
 #[test]
 fn classify_function() {
     assert_eq!(
-        classify("f(x, y) = x^2 + a y"),
+        classify("f(x, y) := x^2 + a y"),
         NodeContent::function("f", &["x", "y"], "x^2 + a y")
     );
     assert_eq!(
-        classify("g(t) = t {t > 0}"),
+        classify("g(t) := t {t > 0}"),
         NodeContent::function("g", &["t"], "t {t > 0}")
     );
+}
+
+#[test]
+fn equals_is_a_relation_by_default() {
+    for line in ["a = 3", "f(x) = x^2", "P = (1, 2)"] {
+        assert_eq!(classify(line).kind.tag(), KindTag::Plot, "{line}");
+    }
+}
+
+#[test]
+fn eq_mode_defines_with_equals() {
+    let opts = LineOptions {
+        definition_op: DefinitionOp::Eq,
+    };
+    let c = |l: &str| parse_definition_with(l, opts).unwrap();
+    assert_eq!(c("a = 3"), NodeContent::variable("a", "3"));
+    assert_eq!(c("f(x) = x^2"), NodeContent::function("f", &["x"], "x^2"));
+    assert_eq!(c("b := 1"), NodeContent::variable("b", "1"));
+    for line in ["y = sin x", "x = 3", "r = θ", "θ = 1", "sin(x) = y"] {
+        assert_eq!(c(line).kind.tag(), KindTag::Plot, "{line}");
+    }
+    let f = NodeContent::function("f", &["x"], "x^2");
+    assert_eq!(
+        definition_line_with(&f, opts).as_deref(),
+        Some("f(x) = x^2")
+    );
+    assert_eq!(definition_line(&f).as_deref(), Some("f(x) := x^2"));
 }
 
 #[test]
@@ -106,10 +133,10 @@ fn classify_reports_parse_errors() {
 #[test]
 fn definition_line_roundtrip() {
     for line in [
-        "a = 3",
-        "f(x, y) = x y",
+        "a := 3",
+        "f(x, y) := x y",
         "y = sin x",
-        "P = (1, 2)",
+        "P := (1, 2)",
         "a -> a + 1",
     ] {
         let c = classify(line);

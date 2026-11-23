@@ -113,6 +113,7 @@ pub(crate) fn classify_in(stmt: &Stmt, env: &Env, locals: &[String]) -> Statemen
             lhs,
             rhs,
             restrictions,
+            ..
         } => {
             let (name, params) = match &*lhs.kind {
                 ExprKind::Call { callee, args } => {
@@ -438,9 +439,10 @@ fn exec_top(ev: &mut Evaluator<'_>, stmt: &Stmt) -> EvalResult<(Outcome, bool)> 
                 lhs,
                 rhs,
                 restrictions,
+                with_eq,
             },
         ) => {
-            let (name, value) = ev.exec_definition(lhs, rhs, restrictions)?;
+            let (name, value) = ev.exec_definition(lhs, rhs, restrictions, *with_eq)?;
             let value = finish(ev, value)?;
             Ok((Outcome::Defined { name, value }, false))
         }
@@ -565,6 +567,11 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Forgets the session's `let` locals.
+    pub fn clear_locals(&mut self) {
+        self.locals.clear();
     }
 
     /// Parses and executes `src` (one or more statements). Definitions are

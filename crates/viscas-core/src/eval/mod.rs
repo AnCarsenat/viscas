@@ -130,8 +130,10 @@
 //!
 //! In scripts (`run_program`, blocks): `let x = v` declares a local and
 //! `x = v` **reassigns a visible `let` variable** (any other `=` is an
-//! equation and an error in a script); `g := v` / `h(x) := ...` define
-//! globals (a visible `let` of the same name is reassigned instead);
+//! equation and an error in a script); `g := v` / `h(x) := ...` always
+//! define globals (shadowing: inside the scope, a visible `let g` still
+//! wins over the global `g`; only `DefinitionOp::Eq`'s `g = v` reassigns
+//! the `let` instead);
 //! `fn f(a) { ... }` defines a closure (global at script top level);
 //! `if`/`else`, `for x in list`, `while`, `return`. A block evaluates to
 //! its last statement. Closures capture visible locals by value and can

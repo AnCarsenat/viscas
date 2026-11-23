@@ -1201,8 +1201,9 @@ impl<'a> Evaluator<'a> {
                 lhs,
                 rhs,
                 restrictions,
+                with_eq,
             } => self
-                .exec_definition(lhs, rhs, restrictions)
+                .exec_definition(lhs, rhs, restrictions, *with_eq)
                 .map(|(_, v)| Flow::Value(v)),
             StmtKind::Regression { .. } => Err(EvalError::unsupported(
                 "regression (`~`) is not implemented yet",
@@ -1331,22 +1332,25 @@ impl<'a> Evaluator<'a> {
         })))
     }
 
-    /// `name := value` / `f(x, y) := body`: defines a global. A visible
-    /// `let` variable of the same name is reassigned instead (so scripts
-    /// written with `=` definitions keep working in `DefinitionOp::Eq`).
+    /// `name := value` / `f(x, y) := body`: always defines a global (a
+    /// visible `let` of the same name keeps shadowing it locally). Only a
+    /// definition written with `=` under `DefinitionOp::Eq` (`with_eq`)
+    /// reassigns a visible `let` variable instead, so `=`-style scripts keep
+    /// working.
     #[inline(never)]
     pub(crate) fn exec_definition(
         &mut self,
         lhs: &Expr,
         rhs: &Expr,
         restrictions: &[Expr],
+        with_eq: bool,
     ) -> EvalResult<(String, Value)> {
         let body = with_restrictions(rhs, restrictions);
         match &*lhs.kind {
             ExprKind::Ident(name) => {
                 let name = canonical_name(name);
                 let v = self.eval(&body)?;
-                if !self.set_local(name, v.clone()) {
+                if !(with_eq && self.set_local(name, v.clone())) {
                     self.define_global(name, v.clone(), lhs.span)?;
                 }
                 Ok((name.to_string(), v))

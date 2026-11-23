@@ -213,6 +213,7 @@ fn sx_stmt(s: &Stmt) -> String {
             lhs,
             rhs,
             restrictions,
+            ..
         } => format!("(:= {} {}{})", sx(lhs), sx(rhs), sx_conds(restrictions)),
         StmtKind::Regression {
             lhs,
