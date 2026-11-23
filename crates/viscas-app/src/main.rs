@@ -10,9 +10,13 @@ mod editors;
 mod fuzzy;
 mod layout;
 mod palette;
+mod prefs;
+mod prefs_window;
+mod settings;
 mod shortcuts;
 mod theme;
 mod viewport;
+mod widgets;
 mod window;
 mod workspace;
 

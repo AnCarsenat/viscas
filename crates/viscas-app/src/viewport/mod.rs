@@ -12,6 +12,7 @@ use gtk::{cairo, gdk, glib};
 
 use self::draw::GridLayer;
 use self::view::View;
+use crate::ctx::AppCtx;
 
 /// Zoom factor applied per discrete scroll-wheel step.
 const ZOOM_PER_STEP: f64 = 1.15;
@@ -41,8 +42,9 @@ pub struct Viewport {
 }
 
 impl Viewport {
-    /// Creates a viewport showing the Cartesian grid.
-    pub fn new() -> Self {
+    /// Creates a viewport showing the Cartesian grid. It redraws whenever
+    /// the preferences (theme, viewport options) change.
+    pub fn new(ctx: &AppCtx) -> Self {
         let area = gtk::DrawingArea::builder()
             .hexpand(true)
             .vexpand(true)
@@ -69,7 +71,16 @@ impl Viewport {
             view: Rc::new(RefCell::new(View::default())),
             layers: Rc::default(),
         };
-        viewport.add_layer(GridLayer);
+        viewport.add_layer(GridLayer { ctx: ctx.clone() });
+        let weak_area = viewport.area.downgrade();
+        ctx.preferences()
+            .connect_changed(move |_| match weak_area.upgrade() {
+                Some(area) => {
+                    area.queue_draw();
+                    true
+                }
+                None => false,
+            });
         viewport.install_draw();
         viewport.install_drag();
         viewport.install_scroll();

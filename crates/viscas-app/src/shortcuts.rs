@@ -23,7 +23,8 @@ pub fn all() -> Vec<Shortcut> {
         "<Control><Alt>4",
     ];
     let fixed = [
-        ("win.palette", "<Control>k", "Command palette"),
+        ("win.palette", "<Control>p", "Command palette"),
+        ("app.preferences", "<Control>comma", "Preferences"),
         (
             "win.maximize-area",
             "<Control>space",
@@ -62,7 +63,7 @@ pub fn install(app: &gtk::Application) {
     }
 }
 
-/// Human-readable label of an accelerator, e.g. `Ctrl+K`.
+/// Human-readable label of an accelerator, e.g. `Ctrl+P`.
 fn label(accel: &str) -> String {
     gtk::accelerator_parse(accel)
         .map(|(key, mods)| gtk::accelerator_get_label(key, mods).to_string())
@@ -77,11 +78,38 @@ pub fn label_for(action: &str) -> Option<String> {
         .map(|s| label(s.accel))
 }
 
+/// Key that also opens the palette when focus is not in a text field
+/// (Blender's search key). Handled by the window, not an accelerator.
+pub const PALETTE_KEY_LABEL: &str = "Space";
+
+/// Hint for the palette button: accelerator and the Space key.
+pub fn palette_hint() -> String {
+    match label_for("win.palette") {
+        Some(accel) => format!("{accel} / {PALETTE_KEY_LABEL}"),
+        None => PALETTE_KEY_LABEL.to_owned(),
+    }
+}
+
+/// Keyboard map for display: key label and description.
+pub fn keymap() -> Vec<(String, String)> {
+    all()
+        .iter()
+        .map(|s| {
+            let keys = if s.action == "win.palette" {
+                palette_hint()
+            } else {
+                label(s.accel)
+            };
+            (keys, s.title.clone())
+        })
+        .collect()
+}
+
 /// Plain-text overview of the shortcuts, one per line.
 pub fn overview() -> String {
-    let mut lines: Vec<String> = all()
+    let mut lines: Vec<String> = keymap()
         .iter()
-        .map(|s| format!("{:<18}{}", label(s.accel), s.title))
+        .map(|(keys, title)| format!("{keys:<18}{title}"))
         .collect();
     lines.push(format!("{:<18}Zoom graph at cursor", "Scroll"));
     lines.push(format!("{:<18}Pan graph", "Drag"));

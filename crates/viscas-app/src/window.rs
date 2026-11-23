@@ -35,9 +35,28 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
 
     let palette = Palette::new(&overlay, ctx);
     palette.contain_focus(&window);
+    install_space_key(&window);
     install_actions(&window, &areas, &palette);
     ctx.add_command_provider(WindowCommands::new(&window));
     ctx.add_command_provider(AreaCommands::new(&areas));
+
+    if let Some(notice) = ctx.preferences().load_notice() {
+        let label = gtk::Label::builder()
+            .label(&notice)
+            .tooltip_text(
+                "Details were logged; open Preferences ▸ Save & Load to see the file path",
+            )
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["status-notice"])
+            .build();
+        statusbar.insert_child_after(
+            &label,
+            statusbar
+                .first_child()
+                .and_then(|c| c.next_sibling())
+                .as_ref(),
+        );
+    }
 
     let update_selection = move |sel: &crate::ctx::Selection| {
         let selected = sel.selected();
@@ -155,7 +174,7 @@ fn build_topbar() -> gtk::HeaderBar {
     );
     content.append(
         &gtk::Label::builder()
-            .label(crate::shortcuts::label_for("win.palette").unwrap_or_default())
+            .label(crate::shortcuts::palette_hint())
             .css_classes(["keycap"])
             .build(),
     );
@@ -172,11 +191,14 @@ fn build_topbar() -> gtk::HeaderBar {
 
 fn app_menu() -> gio::Menu {
     let menu = gio::Menu::new();
+    let prefs = gio::Menu::new();
+    prefs.append(Some("_Preferences…"), Some("app.preferences"));
     let help = gio::Menu::new();
     help.append(Some("_Keyboard Shortcuts"), Some("app.shortcuts"));
     help.append(Some("_About Viscas"), Some("app.about"));
     let quit = gio::Menu::new();
     quit.append(Some("_Quit"), Some("app.quit"));
+    menu.append_section(None, &prefs);
     menu.append_section(None, &help);
     menu.append_section(None, &quit);
     menu
@@ -205,8 +227,11 @@ fn menubar() -> gio::Menu {
     history.append(Some("_Redo"), Some("win.redo"));
     let tools = gio::Menu::new();
     tools.append(Some("_Command Palette"), Some("win.palette"));
+    let prefs = gio::Menu::new();
+    prefs.append(Some("_Preferences…"), Some("app.preferences"));
     edit.append_section(None, &history);
     edit.append_section(None, &tools);
+    edit.append_section(None, &prefs);
 
     let view = gio::Menu::new();
     let area = gio::Menu::new();
@@ -317,6 +342,59 @@ fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label) {
             .build(),
     );
     (bar, selection_info, area_info)
+}
+
+/// Space opens the palette like Blender's search, unless focus is in a
+/// text field (where Space types a space). The controller runs in the
+/// bubble phase, so a focused button, check box or row that uses Space
+/// itself gets it first. Holding Space (key repeat) opens it only once.
+fn install_space_key(window: &gtk::ApplicationWindow) {
+    let keys = gtk::EventControllerKey::new();
+    let held = std::rc::Rc::new(std::cell::Cell::new(false));
+    keys.connect_key_released(glib::clone!(
+        #[strong]
+        held,
+        move |_, key, _, _| {
+            if key == gtk::gdk::Key::space {
+                held.set(false);
+            }
+        }
+    ));
+    keys.connect_key_pressed(glib::clone!(
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, key, _, mods| {
+            if key == gtk::gdk::Key::space && held.replace(true) {
+                return glib::Propagation::Stop; // auto-repeat
+            }
+            let plain = !mods.intersects(
+                gtk::gdk::ModifierType::CONTROL_MASK
+                    | gtk::gdk::ModifierType::ALT_MASK
+                    | gtk::gdk::ModifierType::SUPER_MASK
+                    | gtk::gdk::ModifierType::SHIFT_MASK,
+            );
+            if key != gtk::gdk::Key::space || !plain || focus_is_text(&window) {
+                return glib::Propagation::Proceed;
+            }
+            match WidgetExt::activate_action(&window, "win.palette", None) {
+                Ok(()) => glib::Propagation::Stop,
+                Err(_) => glib::Propagation::Proceed,
+            }
+        }
+    ));
+    window.add_controller(keys);
+}
+
+/// Whether the focused widget takes text input.
+fn focus_is_text(window: &gtk::ApplicationWindow) -> bool {
+    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else {
+        return false;
+    };
+    focus.is::<gtk::Text>()
+        || focus.is::<gtk::TextView>()
+        || focus.dynamic_cast_ref::<gtk::Editable>().is_some()
 }
 
 fn install_actions(window: &gtk::ApplicationWindow, areas: &Areas, palette: &Palette) {

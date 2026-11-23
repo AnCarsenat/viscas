@@ -1,4 +1,4 @@
-//! Command palette (Ctrl+K): a centered overlay with a search entry and a
+//! Command palette (Ctrl+P, or Space outside text fields): a centered overlay with a search entry and a
 //! fuzzy-filtered list of the registered commands.
 
 use std::cell::RefCell;
@@ -13,8 +13,6 @@ use crate::fuzzy;
 
 /// Maximum number of rows shown at once.
 const MAX_ROWS: usize = 40;
-/// Accent color used to highlight matched characters (theme `vc_accent`).
-const MATCH_COLOR: &str = "#f0883e";
 
 /// Handle to the palette. Cloning is cheap.
 #[derive(Clone)]
@@ -280,6 +278,11 @@ impl Palette {
         let i = &self.inner;
         let query = i.entry.text();
         let commands = i.commands.borrow();
+        // Matched characters use the theme's readable accent text color.
+        let match_color = i
+            .ctx
+            .preferences()
+            .with(|p| p.effective_theme().ui.accent_text.to_rgb_hex());
         let ranked = fuzzy::rank(&query, commands.iter().map(|c| c.title.as_str()));
         while let Some(child) = i.list.first_child() {
             i.list.remove(&child);
@@ -287,7 +290,7 @@ impl Palette {
         let mut shown = Vec::new();
         for (index, m) in ranked.into_iter().take(MAX_ROWS) {
             let cmd = &commands[index];
-            i.list.append(&command_row(cmd, &m.positions));
+            i.list.append(&command_row(cmd, &m.positions, &match_color));
             shown.push(index);
         }
         if shown.is_empty() {
@@ -309,7 +312,7 @@ impl Palette {
     }
 }
 
-fn command_row(cmd: &Command, positions: &[usize]) -> gtk::ListBoxRow {
+fn command_row(cmd: &Command, positions: &[usize], match_color: &str) -> gtk::ListBoxRow {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -324,7 +327,7 @@ fn command_row(cmd: &Command, positions: &[usize]) -> gtk::ListBoxRow {
     row.append(
         &gtk::Label::builder()
             .use_markup(true)
-            .label(highlight(&cmd.title, positions))
+            .label(highlight(&cmd.title, positions, match_color))
             .xalign(0.0)
             .hexpand(true)
             .build(),
@@ -344,14 +347,15 @@ fn command_row(cmd: &Command, positions: &[usize]) -> gtk::ListBoxRow {
         .build()
 }
 
-/// Pango markup of `text` with the chars at `positions` highlighted.
-fn highlight(text: &str, positions: &[usize]) -> String {
+/// Pango markup of `text` with the chars at `positions` highlighted in
+/// `color` (a `#rrggbb` value).
+fn highlight(text: &str, positions: &[usize], color: &str) -> String {
     let mut out = String::new();
     for (i, c) in text.chars().enumerate() {
         let escaped = glib::markup_escape_text(c.encode_utf8(&mut [0; 4]));
         if positions.contains(&i) {
             out.push_str(&format!(
-                "<span foreground=\"{MATCH_COLOR}\" weight=\"bold\">{escaped}</span>"
+                "<span foreground=\"{color}\" weight=\"bold\">{escaped}</span>"
             ));
         } else {
             out.push_str(&escaped);
