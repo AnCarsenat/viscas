@@ -32,13 +32,14 @@ pub use document::{
 };
 pub use eval::{NodeEvaluator, NodeResult, Status};
 pub use events::{Change, SceneEvent};
-pub use graph::{DepGraph, Diagnostic, DiagnosticKind, Resolution};
+pub use graph::{DepGraph, Diagnostic, DiagnosticKind, EdgeKind, Resolution};
 pub use names::{
-    Builtins, DefaultBuiltins, definition_line, is_valid_identifier, parse_definition, unique_name,
+    Builtins, DefaultBuiltins, DefinitionOp, LineOptions, definition_line, definition_line_with,
+    is_valid_identifier, parse_definition, parse_definition_with, unique_name,
 };
 pub use node::{
     Animation, AnimationMode, Bounds, Color, Column, GridKind, KindTag, LineStyle, Node,
     NodeContent, NodeId, NodeKind, ParseMode, Projection, PropValue, ScriptLanguage, Source,
     SourceField, Style,
 };
-pub use scene::{DepthFirst, Scene, SceneError};
+pub use scene::{DepthFirst, RenameReport, Scene, SceneError};

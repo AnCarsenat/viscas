@@ -1,9 +1,19 @@
 //! Dependency graph: name resolution, edges, cycles and topological order.
 //!
-//! Edges point from a node to the nodes defining the names it references
-//! (its *upstream*). The graph is rebuilt from the cached per-node
-//! [`Analysis`] after every structural or content change; that is linear in
-//! the number of references, which is cheap at document scale.
+//! *Read* edges point from a node to the nodes defining the names it
+//! references (its *upstream*); they drive dirty propagation, the
+//! topological order and cycle detection. *Write* edges ([`EdgeKind::Writes`])
+//! link actions and scripts to the variables they assign (`a -> a + 1`);
+//! they are shown in the dependency view but never order evaluation or form
+//! cycles.
+//!
+//! The graph depends only on node contents, not on tree order: nodes are
+//! processed in id order, so moves and reorders never invalidate it. The
+//! scene builds it lazily from the cached per-node [`Analysis`].
+//!
+//! Function-only cycles (recursion, mutual recursion) are legal: functions
+//! are lazy and resolved at call time, so the evaluator owns their ordering
+//! and may evaluate the members of such a cycle in any order.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -27,6 +37,17 @@ pub enum DiagnosticKind {
     AmbiguousReference { name: String, definers: Vec<NodeId> },
     /// A referenced name is neither defined nor built in.
     UnknownName { name: String },
+    /// A write target (`a` in `a -> 1`) is not defined by any node.
+    UnknownWriteTarget { name: String },
+}
+
+/// Kind of a dependency edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EdgeKind {
+    /// The dependent reads the input's value.
+    Reads,
+    /// The dependent (action/script) assigns the target.
+    Writes,
 }
 
 /// A problem found while analysing a node.
@@ -81,13 +102,16 @@ pub struct DepGraph {
     downstream: HashMap<NodeId, BTreeSet<NodeId>>,
     diagnostics: HashMap<NodeId, Vec<Diagnostic>>,
     resolutions: HashMap<NodeId, Vec<Resolution>>,
+    write_resolutions: HashMap<NodeId, Vec<Vec<NodeId>>>,
+    writes: HashMap<NodeId, BTreeSet<NodeId>>,
+    written_by: HashMap<NodeId, BTreeSet<NodeId>>,
     topo: Vec<NodeId>,
     topo_index: HashMap<NodeId, usize>,
     cycles: Vec<Vec<NodeId>>,
 }
 
 impl DepGraph {
-    /// Build from nodes listed in depth-first tree order.
+    /// Build from nodes listed in id order.
     pub(crate) fn build(nodes: &[GraphNode<'_>], builtins: &dyn Builtins) -> DepGraph {
         let mut g = DepGraph::default();
         let order: HashMap<NodeId, usize> =
@@ -184,6 +208,29 @@ impl DepGraph {
                 resolutions.push(res);
             }
             g.resolutions.insert(n.id, resolutions);
+
+            let mut write_res = Vec::with_capacity(n.analysis.writes.len());
+            let mut reported_writes: HashSet<&str> = HashSet::new();
+            for w in &n.analysis.writes {
+                let defs = g.definers.get(&w.name).cloned().unwrap_or_default();
+                if defs.is_empty() && reported_writes.insert(&w.name) {
+                    g.diag(
+                        n.id,
+                        DiagnosticKind::UnknownWriteTarget {
+                            name: w.name.clone(),
+                        },
+                        format!("cannot assign `{}`: no node defines it", w.name),
+                        Some(w.field),
+                        Some(w.span),
+                    );
+                }
+                for &t in &defs {
+                    g.writes.entry(n.id).or_default().insert(t);
+                    g.written_by.entry(t).or_default().insert(n.id);
+                }
+                write_res.push(defs);
+            }
+            g.write_resolutions.insert(n.id, write_res);
         }
 
         let dupes: Vec<(String, Vec<NodeId>)> = g
@@ -341,7 +388,7 @@ impl DepGraph {
         out
     }
 
-    /// Nodes defining `name`, in tree order.
+    /// Nodes defining `name`, in id order.
     pub fn definers(&self, name: &str) -> &[NodeId] {
         self.definers.get(name).map_or(&[], Vec::as_slice)
     }
@@ -414,7 +461,7 @@ impl DepGraph {
         self.sorted(self.diagnostics.keys().copied())
     }
 
-    /// Every illegal cycle, members in tree order.
+    /// Every illegal cycle, members in id order.
     pub fn cycles(&self) -> &[Vec<NodeId>] {
         &self.cycles
     }
@@ -429,12 +476,40 @@ impl DepGraph {
         self.resolutions.get(&id).map_or(&[], Vec::as_slice)
     }
 
-    /// All edges `(dependent, input)`.
-    pub fn edges(&self) -> Vec<(NodeId, NodeId)> {
+    /// Definers of each write target of `id` (parallel to
+    /// [`Analysis::writes`]).
+    pub fn write_resolutions(&self, id: NodeId) -> &[Vec<NodeId>] {
+        self.write_resolutions.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Nodes `id` assigns (write edges).
+    pub fn writes(&self, id: NodeId) -> Vec<NodeId> {
+        self.writes
+            .get(&id)
+            .map_or_else(Vec::new, |s| self.sorted(s.iter().copied()))
+    }
+
+    /// Actions/scripts assigning `id`.
+    pub fn written_by(&self, id: NodeId) -> Vec<NodeId> {
+        self.written_by
+            .get(&id)
+            .map_or_else(Vec::new, |s| self.sorted(s.iter().copied()))
+    }
+
+    /// All edges `(dependent, input, kind)`; reads first in topological
+    /// order, then writes.
+    pub fn edges(&self) -> Vec<(NodeId, NodeId, EdgeKind)> {
         let mut out = Vec::new();
         for &id in &self.topo {
             for &u in &self.upstream[&id] {
-                out.push((id, u));
+                out.push((id, u, EdgeKind::Reads));
+            }
+        }
+        for &id in &self.topo {
+            if let Some(ts) = self.writes.get(&id) {
+                for &t in ts {
+                    out.push((id, t, EdgeKind::Writes));
+                }
             }
         }
         out

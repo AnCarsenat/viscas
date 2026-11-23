@@ -32,8 +32,12 @@ pub enum SceneEvent {
         new_parent: Option<NodeId>,
     },
     SelectionChanged,
-    /// Edges or diagnostics changed.
-    GraphChanged,
+    /// Edges or diagnostics may have changed because these nodes were
+    /// added, removed, renamed or edited (empty: everything, e.g. after a
+    /// builtins change).
+    GraphChanged {
+        touched: Vec<NodeId>,
+    },
     /// Undo/redo availability or labels changed.
     HistoryChanged,
 }

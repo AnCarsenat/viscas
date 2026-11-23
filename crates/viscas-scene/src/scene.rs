@@ -1,10 +1,20 @@
 //! The scene: node tree + cached analysis + dependency graph + history.
+//!
+//! Performance model: per-node analysis is cached; two indexes (`definers`:
+//! name → defining nodes, `mentions`: name → nodes referencing or writing
+//! it) are updated incrementally on every insert/remove/update and drive
+//! name validation and dirty propagation. The full [`DepGraph`] is built
+//! lazily on the first read after a semantic change; it does not depend on
+//! tree order, so moves and reorders never invalidate it.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
-use crate::analysis::{Analysis, analyze};
+use viscas_core::syntax::{TokenKind, lexer};
+
+use crate::analysis::{Analysis, Reference, analyze};
 use crate::eval::{NodeEvaluator, NodeResult, Status};
 use crate::events::{Change, SceneEvent};
 use crate::graph::{DepGraph, Diagnostic, GraphNode, Resolution};
@@ -31,6 +41,23 @@ pub enum SceneError {
     },
     /// The node's kind has no such source field.
     NoSuchField(SourceField),
+    /// A rewrite would make `name` in `node` refer to something else (a
+    /// local binder or a built-in).
+    NameCapture {
+        node: NodeId,
+        name: String,
+    },
+    /// Cached spans no longer match the node's source text.
+    SourceMismatch {
+        node: NodeId,
+        field: SourceField,
+    },
+    /// The node defines no name (needed as a re-point target).
+    NotDefining(NodeId),
+    /// A node with this id already exists.
+    IdInUse(NodeId),
+    /// No more node ids can be allocated.
+    IdsExhausted,
 }
 
 impl fmt::Display for SceneError {
@@ -46,6 +73,15 @@ impl fmt::Display for SceneError {
                 write!(f, "index {index} out of range (0..={len})")
             }
             SceneError::NoSuchField(field) => write!(f, "node has no `{field}` field"),
+            SceneError::NameCapture { node, name } => {
+                write!(f, "`{name}` would be captured in {node}")
+            }
+            SceneError::SourceMismatch { node, field } => {
+                write!(f, "source of {node} ({field}) changed under the edit")
+            }
+            SceneError::NotDefining(id) => write!(f, "{id} defines no name"),
+            SceneError::IdInUse(id) => write!(f, "node id {id} is already in use"),
+            SceneError::IdsExhausted => f.write_str("node ids exhausted"),
         }
     }
 }
@@ -54,13 +90,63 @@ impl std::error::Error for SceneError {}
 
 pub type Result<T, E = SceneError> = std::result::Result<T, E>;
 
+/// Outcome of [`Scene::rename_refactor`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenameReport {
+    /// Rewritten identifier occurrences.
+    pub rewritten: usize,
+    /// Nodes whose sources were rewritten.
+    pub nodes: Vec<NodeId>,
+}
+
+/// An identifier occurrence offered to a rewrite.
+enum Occ<'a> {
+    Read(&'a Reference, Option<&'a Resolution>),
+    Write(&'a Reference, &'a [NodeId]),
+    /// Occurrence of a name the node defines internally.
+    Own(&'a Reference),
+}
+
+/// Replacement text plus the names it introduces (checked for capture).
+type Pick = Option<(String, Vec<String>)>;
+
+/// Spell a split name (`ab`) with chosen letters replaced (`q b`).
+fn spell(r: &Reference, replace: impl Fn(&str) -> Option<String>) -> Pick {
+    let letters = r.split.as_ref()?;
+    let mut introduced = Vec::new();
+    let parts: Vec<String> = letters
+        .iter()
+        .map(|l| match (!l.bound).then(|| replace(&l.name)).flatten() {
+            Some(new) => {
+                introduced.push(new.clone());
+                new
+            }
+            None => l.name.clone(),
+        })
+        .collect();
+    (!introduced.is_empty()).then(|| (parts.join(" "), introduced))
+}
+
+/// Is `text` exactly the identifier `name`?
+fn is_ident_text(text: &str, name: &str) -> bool {
+    let (tokens, errors) = lexer::lex(text);
+    errors.is_empty()
+        && matches!(tokens.as_slice(), [t, e]
+            if matches!(&t.kind, TokenKind::Ident(n) if n == name)
+            && matches!(e.kind, TokenKind::Eof))
+}
+
 /// A document's node tree with its reactive dependency graph.
 pub struct Scene {
     pub(crate) nodes: HashMap<NodeId, Node>,
     pub(crate) roots: Vec<NodeId>,
     pub(crate) next_id: u64,
     analysis: HashMap<NodeId, Analysis>,
-    graph: DepGraph,
+    /// name → nodes defining it.
+    definers: HashMap<String, BTreeSet<NodeId>>,
+    /// name → nodes reading (incl. split letters) or writing it.
+    mentions: HashMap<String, BTreeSet<NodeId>>,
+    graph: OnceCell<DepGraph>,
     results: HashMap<NodeId, NodeResult>,
     dirty: BTreeSet<NodeId>,
     selection: Vec<NodeId>,
@@ -68,6 +154,7 @@ pub struct Scene {
     history: History,
     builtins: Arc<dyn Builtins>,
     pub(crate) layout: Option<serde_json::Value>,
+    pub(crate) doc_extra: BTreeMap<String, String>,
 }
 
 impl Default for Scene {
@@ -110,7 +197,9 @@ impl Scene {
             roots: Vec::new(),
             next_id: 1,
             analysis: HashMap::new(),
-            graph: DepGraph::default(),
+            definers: HashMap::new(),
+            mentions: HashMap::new(),
+            graph: OnceCell::new(),
             results: HashMap::new(),
             dirty: BTreeSet::new(),
             selection: Vec::new(),
@@ -118,6 +207,7 @@ impl Scene {
             history: History::default(),
             builtins: Arc::new(DefaultBuiltins),
             layout: None,
+            doc_extra: BTreeMap::new(),
         }
     }
 
@@ -227,18 +317,32 @@ impl Scene {
         self.find(|n| n.kind.tag() == tag)
     }
 
-    /// The node defining `name`, or else the first node labelled `name`.
+    /// Nodes defining `name`, in id order (several = duplicate).
+    pub fn definers(&self, name: &str) -> Vec<NodeId> {
+        self.definers
+            .get(name)
+            .map_or_else(Vec::new, |s| s.iter().copied().collect())
+    }
+
+    /// The node defining `name` when exactly one does; `None` when the
+    /// name is defined several times (see [`Scene::definers`]). Names no
+    /// node defines fall back to the first node labelled `name`.
     pub fn lookup(&self, name: &str) -> Option<NodeId> {
-        self.graph.definers(name).first().copied().or_else(|| {
-            self.iter()
+        match self.definers.get(name) {
+            Some(set) if set.len() == 1 => set.iter().next().copied(),
+            Some(set) if !set.is_empty() => None,
+            _ => self
+                .iter()
                 .find(|n| n.name.as_deref() == Some(name))
-                .map(|n| n.id)
-        })
+                .map(|n| n.id),
+        }
     }
 
     /// Is `name` defined by a node other than `except`?
     pub fn is_name_taken(&self, name: &str, except: Option<NodeId>) -> bool {
-        self.graph.definers(name).iter().any(|&d| Some(d) != except)
+        self.definers
+            .get(name)
+            .is_some_and(|s| s.iter().any(|&d| Some(d) != except))
     }
 
     /// A free name derived from `base` (`a`, `a_2`, …).
@@ -255,8 +359,9 @@ impl Scene {
         self.analysis.get(&id)
     }
 
+    /// The dependency graph (built on first use after a change).
     pub fn graph(&self) -> &DepGraph {
-        &self.graph
+        self.graph.get_or_init(|| self.build_graph())
     }
 
     /// Names a node defines.
@@ -265,39 +370,136 @@ impl Scene {
     }
 
     /// Diagnostics of a node (parse errors, cycles, duplicates, unknown
-    /// names).
+    /// names, unknown write targets).
     pub fn diagnostics(&self, id: NodeId) -> &[Diagnostic] {
-        self.graph.diagnostics(id)
+        self.graph().diagnostics(id)
     }
 
     /// Transitive inputs of `id`, topological order.
     pub fn upstream(&self, id: NodeId) -> Vec<NodeId> {
-        self.graph.upstream(id)
+        self.graph().upstream(id)
     }
 
     /// Transitive dependents of `id`, topological order.
     pub fn downstream(&self, id: NodeId) -> Vec<NodeId> {
-        self.graph.downstream(id)
+        self.graph().downstream(id)
     }
 
     /// Everything to highlight when hovering `id`: upstream and downstream.
     pub fn related(&self, id: NodeId) -> Vec<NodeId> {
         let mut v = self.upstream(id);
         v.extend(self.downstream(id));
-        self.graph.sorted(v.into_iter().collect::<BTreeSet<_>>())
+        self.graph().sorted(v.into_iter().collect::<BTreeSet<_>>())
     }
 
     /// All nodes, dependencies first.
     pub fn topo_order(&self) -> &[NodeId] {
-        self.graph.topo_order()
+        self.graph().topo_order()
     }
 
-    /// Replace the built-in name oracle (rebuilds the graph, marks all
+    /// Replace the built-in name oracle (invalidates the graph, marks all
     /// nodes dirty).
     pub fn set_builtins(&mut self, builtins: Arc<dyn Builtins>) {
         self.builtins = builtins;
-        self.rebuild_graph();
+        self.invalidate(Vec::new());
         self.mark_all_dirty();
+    }
+
+    fn build_graph(&self) -> DepGraph {
+        let mut ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        ids.sort_unstable();
+        let empty = Analysis::default();
+        let nodes: Vec<GraphNode<'_>> = ids
+            .iter()
+            .map(|id| {
+                let n = &self.nodes[id];
+                GraphNode {
+                    id: *id,
+                    analysis: self.analysis.get(id).unwrap_or(&empty),
+                    recursive: n.kind.allows_recursion(),
+                    title: n.defined_name().map_or_else(|| n.title(), String::from),
+                }
+            })
+            .collect();
+        DepGraph::build(&nodes, &*self.builtins)
+    }
+
+    fn invalidate(&mut self, touched: Vec<NodeId>) {
+        self.graph = OnceCell::new();
+        self.events.push(SceneEvent::GraphChanged { touched });
+    }
+
+    // ------------------------------------------------------------------
+    // Indexes
+    // ------------------------------------------------------------------
+
+    fn index_add(&mut self, id: NodeId) {
+        let Some(a) = self.analysis.get(&id) else {
+            return;
+        };
+        for name in &a.defines {
+            self.definers.entry(name.clone()).or_default().insert(id);
+        }
+        for name in a.dependency_names() {
+            self.mentions
+                .entry(name.to_string())
+                .or_default()
+                .insert(id);
+        }
+    }
+
+    fn index_remove(&mut self, id: NodeId) {
+        let Some(a) = self.analysis.get(&id) else {
+            return;
+        };
+        for name in &a.defines {
+            if let Some(set) = self.definers.get_mut(name) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.definers.remove(name);
+                }
+            }
+        }
+        for name in a.dependency_names() {
+            if let Some(set) = self.mentions.get_mut(name) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.mentions.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Nodes whose evaluation may change when `ids` change: the nodes
+    /// themselves, every other definer of a name they define (duplicates),
+    /// and everything mentioning those names, transitively.
+    fn impact(&self, ids: &[NodeId]) -> BTreeSet<NodeId> {
+        let mut seen: BTreeSet<NodeId> = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        let push = |id: NodeId, seen: &mut BTreeSet<NodeId>, q: &mut VecDeque<NodeId>| {
+            if seen.insert(id) {
+                q.push_back(id);
+            }
+        };
+        for &id in ids {
+            if !self.contains(id) {
+                continue;
+            }
+            push(id, &mut seen, &mut queue);
+            for name in self.defines(id) {
+                for &d in self.definers.get(name).into_iter().flatten() {
+                    push(d, &mut seen, &mut queue);
+                }
+            }
+        }
+        while let Some(v) = queue.pop_front() {
+            for name in self.defines(v) {
+                for &m in self.mentions.get(name).into_iter().flatten() {
+                    push(m, &mut seen, &mut queue);
+                }
+            }
+        }
+        seen
     }
 
     // ------------------------------------------------------------------
@@ -310,28 +512,25 @@ impl Scene {
 
     /// Dirty nodes in topological order (without clearing).
     pub fn dirty(&self) -> Vec<NodeId> {
-        self.graph.sorted(self.dirty.iter().copied())
+        self.graph().sorted(self.dirty.iter().copied())
     }
 
     /// Take the dirty set in topological order (inputs first).
     pub fn take_dirty(&mut self) -> Vec<NodeId> {
         let set = std::mem::take(&mut self.dirty);
-        self.graph.sorted(set)
+        self.graph().sorted(set)
     }
 
     /// Mark `id` and everything downstream dirty (e.g. re-roll `random`).
     pub fn mark_dirty(&mut self, id: NodeId) {
-        if !self.contains(id) {
-            return;
-        }
-        self.set_dirty(id);
-        for d in self.graph.downstream(id) {
+        for d in self.impact(&[id]) {
             self.set_dirty(d);
         }
     }
 
     pub fn mark_all_dirty(&mut self) {
-        for id in self.dfs_ids() {
+        let ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        for id in ids {
             self.set_dirty(id);
         }
     }
@@ -372,9 +571,11 @@ impl Scene {
     }
 
     /// Evaluate every dirty node, inputs first. Nodes with parse errors,
-    /// blocking diagnostics (cycle, duplicate, ambiguous) or an errored
-    /// input get an error status without calling the evaluator. Returns
-    /// the processed nodes in order.
+    /// blocking diagnostics (cycle, duplicate, ambiguous, unknown write
+    /// target) or an errored input get an error status without calling the
+    /// evaluator. Members of a function-only cycle come in id order; the
+    /// evaluator resolves functions lazily at call time. Returns the
+    /// processed nodes in order.
     pub fn evaluate_dirty(&mut self, evaluator: &mut dyn NodeEvaluator) -> Vec<NodeId> {
         let order = self.take_dirty();
         for &id in &order {
@@ -397,7 +598,7 @@ impl Scene {
                 display: None,
             });
         }
-        if let Some(d) = self.graph.diagnostics(id).iter().find(|d| d.is_error()) {
+        if let Some(d) = self.graph().diagnostics(id).iter().find(|d| d.is_error()) {
             return Some(NodeResult {
                 status: Status::Error {
                     message: d.message.clone(),
@@ -408,7 +609,7 @@ impl Scene {
             });
         }
         let failed = self
-            .graph
+            .graph()
             .direct_upstream(id)
             .into_iter()
             .find(|&u| u != id && self.status(u).is_error())?;
@@ -599,7 +800,8 @@ impl Scene {
             return false;
         };
         for c in t.commands.iter().rev() {
-            self.apply(&c.inverse());
+            let r = self.apply(&c.inverse());
+            debug_assert!(r.is_ok(), "undo failed: {r:?}");
         }
         self.history.push_redo(t);
         self.events.push(SceneEvent::HistoryChanged);
@@ -611,27 +813,32 @@ impl Scene {
             return false;
         };
         for c in &t.commands {
-            self.apply(c);
+            let r = self.apply(c);
+            debug_assert!(r.is_ok(), "redo failed: {r:?}");
         }
         self.history.push_undo(t);
         self.events.push(SceneEvent::HistoryChanged);
         true
     }
 
-    fn execute(&mut self, label: &str, cmd: Command) {
-        self.apply(&cmd);
+    fn execute(&mut self, label: &str, cmd: Command) -> Result<()> {
+        self.apply(&cmd)?;
         self.history.record(label, cmd);
         self.events.push(SceneEvent::HistoryChanged);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
     // Mutations
     // ------------------------------------------------------------------
 
-    fn alloc_id(&mut self) -> NodeId {
+    fn alloc_id(&mut self) -> Result<NodeId> {
         let id = NodeId(self.next_id);
-        self.next_id += 1;
-        id
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(SceneError::IdsExhausted)?;
+        Ok(id)
     }
 
     fn check_index(
@@ -654,43 +861,33 @@ impl Scene {
     }
 
     /// Validate content about to be stored on `id` (or a new node).
-    fn validate(&self, id: Option<NodeId>, c: &NodeContent) -> Result<()> {
+    /// `new_defines` are the names the content would define; names it does
+    /// not define already must be free.
+    fn validate(&self, id: Option<NodeId>, c: &NodeContent, new_defines: &[String]) -> Result<()> {
         if c.kind.defines_by_name()
             && let Some(name) = &c.name
+            && !is_valid_identifier(name)
         {
-            if !is_valid_identifier(name) {
-                return Err(SceneError::InvalidName(name.clone()));
-            }
-            if self.is_name_taken(name, id) {
-                return Err(SceneError::DuplicateName(name.clone()));
+            return Err(SceneError::InvalidName(name.clone()));
+        }
+        if let NodeKind::Function { params, .. } | NodeKind::Regression { params, .. } = &c.kind {
+            let mut seen = HashSet::new();
+            for p in params {
+                if !is_valid_identifier(p) || !seen.insert(p) {
+                    return Err(SceneError::InvalidName(p.clone()));
+                }
             }
         }
-        match &c.kind {
-            NodeKind::Function { params, .. } => {
-                let mut seen = HashSet::new();
-                for p in params {
-                    if !is_valid_identifier(p) || !seen.insert(p) {
-                        return Err(SceneError::InvalidName(p.clone()));
-                    }
-                }
+        let old: &[String] = id.map_or(&[], |id| self.defines(id));
+        for name in new_defines {
+            if !old.contains(name) && self.is_name_taken(name, id) {
+                return Err(SceneError::DuplicateName(name.clone()));
             }
-            NodeKind::Regression { params, .. } => {
-                let mut seen = HashSet::new();
-                for p in params {
-                    if !is_valid_identifier(p) || !seen.insert(p) {
-                        return Err(SceneError::InvalidName(p.clone()));
-                    }
-                    if self.is_name_taken(p, id) {
-                        return Err(SceneError::DuplicateName(p.clone()));
-                    }
-                }
-            }
-            _ => {}
         }
         Ok(())
     }
 
-    fn normalize(mut c: NodeContent) -> NodeContent {
+    pub(crate) fn normalize(mut c: NodeContent) -> NodeContent {
         if c.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
             c.name = None;
         }
@@ -712,8 +909,8 @@ impl Scene {
     ) -> Result<NodeId> {
         let content = Self::normalize(content);
         self.check_index(parent, index, None)?;
-        self.validate(None, &content)?;
-        let id = self.alloc_id();
+        self.validate(None, &content, &analyze(&content).defines)?;
+        let id = self.alloc_id()?;
         let node = Node::new(id, content);
         self.execute(
             "Add node",
@@ -722,7 +919,7 @@ impl Scene {
                 parent,
                 index,
             },
-        );
+        )?;
         Ok(id)
     }
 
@@ -744,8 +941,7 @@ impl Scene {
                 parent,
                 index,
             },
-        );
-        Ok(())
+        )
     }
 
     /// Delete several nodes (and subtrees) as one undo step. Ids inside an
@@ -787,13 +983,28 @@ impl Scene {
                 from: (from_parent, from_index),
                 to: (parent, index),
             },
-        );
-        Ok(())
+        )
     }
 
     /// Move `id` to `index` among its current siblings.
     pub fn reorder(&mut self, id: NodeId, index: usize) -> Result<()> {
         let parent = self.node(id)?.parent;
+        self.move_node(id, parent, index)
+    }
+
+    /// Move `id` right before `sibling` (possibly under another parent).
+    pub fn move_before(&mut self, id: NodeId, sibling: NodeId) -> Result<()> {
+        self.node(id)?;
+        let parent = self.node(sibling)?.parent;
+        if id == sibling {
+            return Ok(());
+        }
+        let index = self
+            .children(parent)
+            .iter()
+            .filter(|&&c| c != id)
+            .position(|&c| c == sibling)
+            .unwrap_or(0);
         self.move_node(id, parent, index)
     }
 
@@ -811,7 +1022,6 @@ impl Scene {
         if before == content {
             return Ok(());
         }
-        let name_changed = before.name != content.name || before.kind.tag() != content.kind.tag();
         let params_changed = match (&before.kind, &content.kind) {
             (NodeKind::Regression { params: a, .. }, NodeKind::Regression { params: b, .. })
             | (NodeKind::Function { params: a, .. }, NodeKind::Function { params: b, .. }) => {
@@ -819,8 +1029,12 @@ impl Scene {
             }
             _ => false,
         };
-        if name_changed || params_changed {
-            self.validate(Some(id), &content)?;
+        let defines_may_change = before.name != content.name
+            || before.kind.tag() != content.kind.tag()
+            || params_changed
+            || matches!(content.kind, NodeKind::Script { .. });
+        if defines_may_change {
+            self.validate(Some(id), &content, &analyze(&content).defines)?;
         }
         self.execute(
             label,
@@ -830,8 +1044,7 @@ impl Scene {
                 after: Box::new(content),
                 key: key.map(String::from),
             },
-        );
-        Ok(())
+        )
     }
 
     /// Edit a node's content in place (one undo step).
@@ -862,27 +1075,63 @@ impl Scene {
         self.set_content(id, c, None, "Rename")
     }
 
-    /// Rename a defining node and rewrite every reference to its old name
-    /// in its dependents (and in its own body), as one undo step.
-    pub fn rename_refactor(&mut self, id: NodeId, new_name: &str) -> Result<()> {
+    /// Rename a defining node and rewrite every occurrence that refers to
+    /// it — in dependents, in writers (`a -> …`) and in its own body
+    /// (recursion) — as one undo step. Refused with
+    /// [`SceneError::NameCapture`] when the new name would be captured by a
+    /// local binder or would rebind an existing built-in use.
+    pub fn rename_refactor(&mut self, id: NodeId, new_name: &str) -> Result<RenameReport> {
         let node = self.node(id)?;
-        let Some(old) = node.defined_name().map(String::from) else {
-            return self.rename(id, Some(new_name));
-        };
+        if node.defined_name().is_none() {
+            self.rename(id, Some(new_name))?;
+            return Ok(RenameReport::default());
+        }
         let mut c = node.content();
         c.name = Some(new_name.to_string());
-        self.validate(Some(id), &Self::normalize(c))?;
-        // Dependents plus the node itself (recursive functions).
-        let mut targets = self.graph.direct_downstream(id);
-        if !targets.contains(&id) {
-            targets.push(id);
+        let c = Self::normalize(c);
+        self.validate(Some(id), &c, &analyze(&c).defines)?;
+        // Existing uses of `new_name` that resolve to a built-in would be
+        // rebound to this node.
+        for &m in self.mentions.get(new_name).into_iter().flatten() {
+            let res = self.graph().resolutions(m);
+            let refs = &self.analysis[&m].references;
+            for (r, res) in refs.iter().zip(res) {
+                let builtin_use = match res {
+                    Resolution::Builtin => r.name == new_name,
+                    Resolution::Split(letters) => letters
+                        .iter()
+                        .any(|(l, defs)| l == new_name && defs.is_empty()),
+                    _ => false,
+                };
+                if builtin_use {
+                    return Err(SceneError::NameCapture {
+                        node: m,
+                        name: new_name.to_string(),
+                    });
+                }
+            }
         }
+        let g = self.graph();
+        let mut targets: BTreeSet<NodeId> = g.direct_downstream(id).into_iter().collect();
+        targets.extend(g.written_by(id));
+        targets.insert(id);
+        let mut plans = Vec::new();
+        for t in targets {
+            if let Some(plan) = self.plan_rewrite(t, &|occ| pick_node(occ, id, new_name))? {
+                plans.push((t, plan));
+            }
+        }
+        let report = RenameReport {
+            rewritten: plans.iter().map(|(_, (_, n))| n).sum(),
+            nodes: plans.iter().map(|(t, _)| *t).collect(),
+        };
         self.transaction("Rename", |s| {
-            for d in targets {
-                s.repoint(d, &old, new_name)?;
+            for (t, (content, _)) in plans {
+                s.set_content(t, content, None, "Re-point reference")?;
             }
             s.rename(id, Some(new_name))
-        })
+        })?;
+        Ok(report)
     }
 
     pub fn set_visible(&mut self, id: NodeId, visible: bool) -> Result<()> {
@@ -936,108 +1185,204 @@ impl Scene {
         self.set_content(id, c, Some(&format!("source:{field}")), "Edit expression")
     }
 
-    /// Re-point references: rewrite every free occurrence of `from` in the
-    /// node's sources to `to`, leaving the rest of the text untouched.
-    /// Letter-split occurrences (`ab` read as `a·b`) are spelled out
-    /// (`c b`). Returns the number of rewritten occurrences.
+    /// Plan a rewrite of the occurrences `pick` selects in node `id`:
+    /// returns the new content and the number of rewritten occurrences, or
+    /// `None` if nothing matched. Fails without side effects on name
+    /// capture or when cached spans do not match the source.
+    fn plan_rewrite(
+        &self,
+        id: NodeId,
+        pick: &dyn Fn(Occ<'_>) -> Pick,
+    ) -> Result<Option<(NodeContent, usize)>> {
+        let node = self.node(id)?;
+        let Some(analysis) = self.analysis.get(&id) else {
+            return Ok(None);
+        };
+        let g = self.graph();
+        let resolutions = g.resolutions(id);
+        let write_res = g.write_resolutions(id);
+        let mut picked: Vec<(&Reference, Pick)> = Vec::new();
+        for (i, r) in analysis.references.iter().enumerate() {
+            picked.push((r, pick(Occ::Read(r, resolutions.get(i)))));
+        }
+        for (i, r) in analysis.writes.iter().enumerate() {
+            let defs = write_res.get(i).map_or(&[][..], Vec::as_slice);
+            picked.push((r, pick(Occ::Write(r, defs))));
+        }
+        for r in &analysis.defined_uses {
+            picked.push((r, pick(Occ::Own(r))));
+        }
+        let mut edits: Vec<(&Reference, String)> = Vec::new();
+        for (r, p) in picked {
+            let Some((text, introduced)) = p else {
+                continue;
+            };
+            if let Some(name) = introduced.iter().find(|n| r.scope.contains(n)) {
+                return Err(SceneError::NameCapture {
+                    node: id,
+                    name: name.clone(),
+                });
+            }
+            edits.push((r, text));
+        }
+        if edits.is_empty() {
+            return Ok(None);
+        }
+        let mut c = node.content();
+        edits.sort_by_key(|(r, _)| std::cmp::Reverse((r.field, r.span.start)));
+        for (r, text) in &edits {
+            let slot = c
+                .kind
+                .source_mut(r.field)
+                .ok_or(SceneError::NoSuchField(r.field))?;
+            let range = r.span.start..r.span.end;
+            if !slot
+                .get(range.clone())
+                .is_some_and(|t| is_ident_text(t, &r.name))
+            {
+                return Err(SceneError::SourceMismatch {
+                    node: id,
+                    field: r.field,
+                });
+            }
+            slot.replace_range(range, text);
+        }
+        Ok(Some((c, edits.len())))
+    }
+
+    /// Re-point references by name: rewrite every free occurrence of `from`
+    /// (reads, letter-split reads such as `ab`, write targets) in the node's
+    /// sources to `to`, leaving the rest of the text untouched. Returns the
+    /// number of rewritten occurrences.
     pub fn repoint(&mut self, id: NodeId, from: &str, to: &str) -> Result<usize> {
         if !is_valid_identifier(to) {
             return Err(SceneError::InvalidName(to.to_string()));
         }
-        let node = self.node(id)?;
-        let Some(analysis) = self.analysis.get(&id) else {
-            return Ok(0);
+        let pick = |occ: Occ<'_>| -> Pick {
+            match occ {
+                Occ::Read(r, _) if r.name == from => Some((to.to_string(), vec![to.into()])),
+                Occ::Read(r, Some(Resolution::Split(_))) => {
+                    spell(r, |l| (l == from).then(|| to.to_string()))
+                }
+                Occ::Write(r, _) if r.name == from => Some((to.to_string(), vec![to.into()])),
+                _ => None,
+            }
         };
-        let resolutions = self.graph.resolutions(id);
-        let mut edits: Vec<(SourceField, usize, usize, String)> = Vec::new();
-        for (i, r) in analysis.references.iter().enumerate() {
-            if r.name == from {
-                edits.push((r.field, r.span.start, r.span.end, to.to_string()));
-            } else if let (Some(Resolution::Split(resolved)), Some(letters)) =
-                (resolutions.get(i), &r.split)
-                && resolved.iter().any(|(l, _)| l == from)
-            {
-                let spelled: Vec<&str> = letters
-                    .iter()
-                    .map(|l| {
-                        if !l.bound && l.name == from {
-                            to
-                        } else {
-                            l.name.as_str()
-                        }
-                    })
-                    .collect();
-                edits.push((r.field, r.span.start, r.span.end, spelled.join(" ")));
-            }
-        }
-        if edits.is_empty() {
-            return Ok(0);
-        }
-        let mut c = node.content();
-        edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
-        for (field, start, end, text) in &edits {
-            let slot = c
-                .kind
-                .source_mut(*field)
-                .ok_or(SceneError::NoSuchField(*field))?;
-            if slot.get(*start..*end).is_none() {
-                continue;
-            }
-            slot.replace_range(*start..*end, text);
-        }
-        self.set_content(id, c, None, "Re-point reference")?;
-        Ok(edits.len())
+        self.apply_plan(id, &pick, "Re-point reference")
     }
 
-    /// Patch-cable helper: make `dependent` reference `to` instead of
-    /// `from` (both must define a name).
+    /// Patch-cable helper: rewrite exactly the occurrences in `dependent`
+    /// that resolve to `from` (whatever name they use) so they refer to the
+    /// name `to` defines. Returns the number of rewritten occurrences.
     pub fn repoint_edge(&mut self, dependent: NodeId, from: NodeId, to: NodeId) -> Result<usize> {
-        let old = self
-            .defines(from)
-            .first()
-            .cloned()
-            .ok_or(SceneError::NoSuchNode(from))?;
+        self.node(from)?;
         let new = self
             .defines(to)
             .first()
             .cloned()
-            .ok_or(SceneError::NoSuchNode(to))?;
-        self.repoint(dependent, &old, &new)
+            .ok_or(SceneError::NotDefining(to))?;
+        self.apply_plan(
+            dependent,
+            &|occ| pick_node(occ, from, &new),
+            "Re-point reference",
+        )
     }
 
-    /// Deep-copy a subtree right after the original. Defined names get
-    /// fresh unique names. Returns the new root.
+    fn apply_plan(
+        &mut self,
+        id: NodeId,
+        pick: &dyn Fn(Occ<'_>) -> Pick,
+        label: &str,
+    ) -> Result<usize> {
+        match self.plan_rewrite(id, pick)? {
+            Some((content, n)) => {
+                self.set_content(id, content, None, label)?;
+                Ok(n)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Deep-copy a subtree right after the original. Every name defined in
+    /// the subtree (node names, regression parameters, script functions)
+    /// gets a fresh unique name, and occurrences inside the copy that refer
+    /// to the subtree are rewritten, so the copy is self-contained (a copied
+    /// recursive `f` calls its copy `f_2`). Returns the new root.
     pub fn duplicate(&mut self, id: NodeId) -> Result<NodeId> {
         let parent = self.node(id)?.parent;
         let index = self.index_in_parent(id).unwrap_or(0) + 1;
         let originals = self.snapshot(id);
-        let mut map = HashMap::new();
-        for n in &originals {
-            let new = self.alloc_id();
-            map.insert(n.id, new);
-        }
+        let subtree: HashSet<NodeId> = originals.iter().map(|n| n.id).collect();
+
+        let mut renames: HashMap<String, String> = HashMap::new();
         let mut taken: HashSet<String> = HashSet::new();
-        let mut nodes = Vec::with_capacity(originals.len());
-        for n in originals {
-            let mut copy = n.clone();
-            copy.id = map[&n.id];
-            copy.parent = n.parent.map(|p| map.get(&p).copied().unwrap_or(p));
-            copy.children = n.children.iter().map(|c| map[c]).collect();
-            if copy.kind.defines_by_name()
-                && let Some(name) = &copy.name
-            {
+        for n in &originals {
+            for name in self.defines(n.id) {
+                if renames.contains_key(name) {
+                    continue;
+                }
                 let fresh = unique_name(name, |c| self.is_name_taken(c, None) || taken.contains(c));
                 taken.insert(fresh.clone());
-                copy.name = Some(fresh);
+                renames.insert(name.clone(), fresh);
             }
-            if let NodeKind::Regression { params, .. } = &mut copy.kind {
+        }
+        let mapped = |name: &str| renames.get(name).cloned();
+        let in_subtree = |ds: &[NodeId]| ds.iter().any(|d| subtree.contains(d));
+        let split_defs = |res: Option<&Resolution>| -> HashMap<String, Vec<NodeId>> {
+            match res {
+                Some(Resolution::Split(letters)) => letters.iter().cloned().collect(),
+                _ => HashMap::new(),
+            }
+        };
+        let pick = |occ: Occ<'_>| -> Pick {
+            let whole = |r: &Reference| mapped(&r.name).map(|n| (n.clone(), vec![n]));
+            match occ {
+                Occ::Read(r, Some(Resolution::Defined(ds))) if in_subtree(ds) => whole(r),
+                Occ::Read(r, res @ Some(Resolution::Split(_))) => {
+                    let defs = split_defs(res);
+                    spell(r, |l| {
+                        defs.get(l)
+                            .filter(|ds| in_subtree(ds))
+                            .and_then(|_| mapped(l))
+                    })
+                }
+                Occ::Write(r, ds) if in_subtree(ds) => whole(r),
+                Occ::Own(r) => whole(r),
+                _ => None,
+            }
+        };
+
+        let mut copies = Vec::with_capacity(originals.len());
+        let mut ids = HashMap::new();
+        for n in &originals {
+            let content = match self.plan_rewrite(n.id, &pick)? {
+                Some((c, _)) => c,
+                None => n.content(),
+            };
+            copies.push((n.clone(), content));
+        }
+        for (n, _) in &copies {
+            let new = self.alloc_id()?;
+            ids.insert(n.id, new);
+        }
+        let mut nodes = Vec::with_capacity(copies.len());
+        for (orig, mut content) in copies {
+            if content.kind.defines_by_name()
+                && let Some(name) = &content.name
+                && let Some(fresh) = renames.get(name)
+            {
+                content.name = Some(fresh.clone());
+            }
+            if let NodeKind::Regression { params, .. } = &mut content.kind {
                 for p in params.iter_mut() {
-                    let fresh =
-                        unique_name(p, |c| self.is_name_taken(c, None) || taken.contains(c));
-                    taken.insert(fresh.clone());
-                    *p = fresh;
+                    if let Some(fresh) = renames.get(p) {
+                        *p = fresh.clone();
+                    }
                 }
             }
+            let mut copy = Node::new(ids[&orig.id], content);
+            copy.parent = orig.parent.map(|p| ids.get(&p).copied().unwrap_or(p));
+            copy.children = orig.children.iter().map(|c| ids[c]).collect();
             nodes.push(copy);
         }
         let root = nodes[0].id;
@@ -1048,7 +1393,7 @@ impl Scene {
                 parent,
                 index,
             },
-        );
+        )?;
         Ok(root)
     }
 
@@ -1056,7 +1401,7 @@ impl Scene {
     // Raw (unrecorded) operations
     // ------------------------------------------------------------------
 
-    pub(crate) fn apply(&mut self, cmd: &Command) {
+    pub(crate) fn apply(&mut self, cmd: &Command) -> Result<()> {
         match cmd {
             Command::Insert {
                 nodes,
@@ -1067,9 +1412,16 @@ impl Scene {
                 if let Some(root) = nodes.first() {
                     self.raw_remove(root.id);
                 }
+                Ok(())
             }
-            Command::Move { id, to, .. } => self.raw_move(*id, to.0, to.1),
-            Command::Update { id, after, .. } => self.raw_update(*id, (**after).clone()),
+            Command::Move { id, to, .. } => {
+                self.raw_move(*id, to.0, to.1);
+                Ok(())
+            }
+            Command::Update { id, after, .. } => {
+                self.raw_update(*id, (**after).clone());
+                Ok(())
+            }
         }
     }
 
@@ -1082,67 +1434,40 @@ impl Scene {
         }
     }
 
-    /// Nodes affected by a change of `ids` in the current graph.
-    fn affected(&self, ids: &[NodeId]) -> BTreeSet<NodeId> {
-        let mut set = BTreeSet::new();
-        for &id in ids {
+    fn mark_set_dirty(&mut self, set: BTreeSet<NodeId>) {
+        for id in set {
             if self.contains(id) {
-                set.insert(id);
-                set.extend(self.graph.downstream(id));
-            }
-        }
-        set
-    }
-
-    /// Rebuild the graph; if `dirty`, mark `ids`, `before` and the new
-    /// downstream of `ids` dirty.
-    fn refresh(&mut self, ids: &[NodeId], before: BTreeSet<NodeId>, dirty: bool) {
-        self.rebuild_graph();
-        if dirty {
-            let mut set = before;
-            set.extend(self.affected(ids));
-            for id in set {
-                if self.contains(id) {
-                    self.set_dirty(id);
-                }
+                self.set_dirty(id);
             }
         }
     }
 
-    pub(crate) fn rebuild_graph(&mut self) {
-        let order = self.dfs_ids();
-        let empty = Analysis::default();
-        let nodes: Vec<GraphNode<'_>> = order
-            .iter()
-            .map(|id| {
-                let n = &self.nodes[id];
-                GraphNode {
-                    id: *id,
-                    analysis: self.analysis.get(id).unwrap_or(&empty),
-                    recursive: n.kind.allows_recursion(),
-                    title: n.defined_name().map_or_else(|| n.title(), String::from),
-                }
-            })
-            .collect();
-        let g = DepGraph::build(&nodes, &*self.builtins);
-        if g != self.graph {
-            self.graph = g;
-            self.events.push(SceneEvent::GraphChanged);
-        }
-    }
-
-    pub(crate) fn raw_insert(&mut self, nodes: Vec<Node>, parent: Option<NodeId>, index: usize) {
+    pub(crate) fn raw_insert(
+        &mut self,
+        nodes: Vec<Node>,
+        parent: Option<NodeId>,
+        index: usize,
+    ) -> Result<()> {
         let Some(root) = nodes.first().map(|n| n.id) else {
-            return;
+            return Ok(());
         };
+        let mut seen = HashSet::new();
+        for n in &nodes {
+            if self.nodes.contains_key(&n.id) || !seen.insert(n.id) {
+                return Err(SceneError::IdInUse(n.id));
+            }
+        }
         let ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
         for mut n in nodes {
             if n.id == root {
                 n.parent = parent.filter(|p| self.nodes.contains_key(p));
             }
-            self.next_id = self.next_id.max(n.id.0 + 1);
+            self.next_id = self.next_id.max(n.id.0.saturating_add(1));
             self.analysis.insert(n.id, analyze(&n.content()));
             self.nodes.insert(n.id, n);
+        }
+        for &id in &ids {
+            self.index_add(id);
         }
         let list = self.child_list_mut(parent);
         let i = index.min(list.len());
@@ -1150,7 +1475,10 @@ impl Scene {
         for &id in &ids {
             self.events.push(SceneEvent::NodeAdded(id));
         }
-        self.refresh(&ids, BTreeSet::new(), true);
+        let dirty = self.impact(&ids);
+        self.mark_set_dirty(dirty);
+        self.invalidate(ids);
+        Ok(())
     }
 
     pub(crate) fn raw_remove(&mut self, root: NodeId) {
@@ -1159,9 +1487,10 @@ impl Scene {
         };
         let parent = node.parent;
         let ids: Vec<NodeId> = self.iter_subtree(root).map(|n| n.id).collect();
-        let before = self.affected(&ids);
+        let before = self.impact(&ids);
         self.child_list_mut(parent).retain(|&c| c != root);
         for &id in &ids {
+            self.index_remove(id);
             self.nodes.remove(&id);
             self.analysis.remove(&id);
             self.results.remove(&id);
@@ -1175,9 +1504,11 @@ impl Scene {
             .filter(|s| !ids.contains(s))
             .collect();
         self.set_selection(sel);
-        self.refresh(&[], before, true);
+        self.mark_set_dirty(before);
+        self.invalidate(ids);
     }
 
+    /// Moves never touch the graph: it does not depend on tree order.
     pub(crate) fn raw_move(&mut self, id: NodeId, parent: Option<NodeId>, index: usize) {
         let Some(node) = self.nodes.get(&id) else {
             return;
@@ -1196,7 +1527,6 @@ impl Scene {
             old_parent,
             new_parent: parent,
         });
-        self.refresh(&[], BTreeSet::new(), false);
     }
 
     pub(crate) fn raw_update(&mut self, id: NodeId, content: NodeContent) {
@@ -1224,13 +1554,12 @@ impl Scene {
             changes.push(Change::Props);
         }
         let semantic = changes.contains(&Change::Name) || changes.contains(&Change::Kind);
-        let before = if semantic {
-            self.affected(&[id])
-        } else {
-            BTreeSet::new()
-        };
+        let mut dirty = BTreeSet::new();
         if semantic {
+            dirty = self.impact(&[id]);
+            self.index_remove(id);
             self.analysis.insert(id, analyze(&content));
+            self.index_add(id);
         }
         if let Some(n) = self.nodes.get_mut(&id) {
             n.set_content(content);
@@ -1239,19 +1568,45 @@ impl Scene {
             self.events.push(SceneEvent::Changed { id, what });
         }
         if semantic {
-            self.refresh(&[id], before, true);
+            dirty.extend(self.impact(&[id]));
+            self.mark_set_dirty(dirty);
+            self.invalidate(vec![id]);
         }
     }
 
-    /// Recompute analysis for every node and rebuild the graph (after
-    /// loading).
-    pub(crate) fn reanalyze_all(&mut self) {
-        self.analysis = self
-            .nodes
-            .iter()
-            .map(|(id, n)| (*id, analyze(&n.content())))
-            .collect();
-        self.rebuild_graph();
+    /// Install loaded nodes (document load): analysis, indexes, all dirty,
+    /// no events or history.
+    pub(crate) fn load_nodes(&mut self, nodes: Vec<Node>, roots: Vec<NodeId>, next_id: u64) {
+        for n in nodes {
+            self.analysis.insert(n.id, analyze(&n.content()));
+            self.nodes.insert(n.id, n);
+        }
+        let ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        for id in ids {
+            self.index_add(id);
+        }
+        self.roots = roots;
+        self.next_id = next_id;
+        self.graph = OnceCell::new();
         self.mark_all_dirty();
+        self.events.clear();
+    }
+}
+
+/// Select occurrences resolving to node `from` and rename them `to`.
+fn pick_node(occ: Occ<'_>, from: NodeId, to: &str) -> Pick {
+    let whole = || Some((to.to_string(), vec![to.to_string()]));
+    match occ {
+        Occ::Read(_, Some(Resolution::Defined(ds))) if ds.contains(&from) => whole(),
+        Occ::Read(r, Some(Resolution::Split(letters))) => {
+            let hits: Vec<&str> = letters
+                .iter()
+                .filter(|(_, ds)| ds.contains(&from))
+                .map(|(l, _)| l.as_str())
+                .collect();
+            spell(r, |l| hits.contains(&l).then(|| to.to_string()))
+        }
+        Occ::Write(_, ds) if ds.contains(&from) => whole(),
+        _ => None,
     }
 }

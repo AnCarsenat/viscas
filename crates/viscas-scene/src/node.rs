@@ -679,6 +679,10 @@ pub struct NodeContent {
     pub style: Style,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub props: BTreeMap<String, PropValue>,
+    /// Fields this version does not know (raw RON text), preserved so
+    /// documents written by newer versions round-trip.
+    #[serde(skip)]
+    pub extra: BTreeMap<String, String>,
 }
 
 impl NodeContent {
@@ -691,6 +695,7 @@ impl NodeContent {
             locked: false,
             style: Style::default(),
             props: BTreeMap::new(),
+            extra: BTreeMap::new(),
         }
     }
 
@@ -807,6 +812,8 @@ pub struct Node {
     pub locked: bool,
     pub style: Style,
     pub props: BTreeMap<String, PropValue>,
+    /// Unknown document fields (raw RON), see [`NodeContent::extra`].
+    pub extra: BTreeMap<String, String>,
 }
 
 impl Node {
@@ -821,6 +828,7 @@ impl Node {
             locked: content.locked,
             style: content.style,
             props: content.props,
+            extra: content.extra,
         }
     }
 
@@ -833,6 +841,7 @@ impl Node {
             locked: self.locked,
             style: self.style.clone(),
             props: self.props.clone(),
+            extra: self.extra.clone(),
         }
     }
 
@@ -843,6 +852,7 @@ impl Node {
         self.locked = c.locked;
         self.style = c.style;
         self.props = c.props;
+        self.extra = c.extra;
     }
 
     /// The name this node defines, if its kind defines by name.

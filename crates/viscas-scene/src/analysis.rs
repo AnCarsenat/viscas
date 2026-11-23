@@ -4,19 +4,25 @@
 //! Scoping rules for free identifiers:
 //!
 //! - Function parameters are bound in the body; regression parameters are
-//!   bound in the regression.
-//! - `let`, `for`, script `fn` parameters, comprehension bindings
+//!   bound in the regression; table column names are bound in the table's
+//!   cells and formulas (outside, columns are reached as `T.x1`).
+//! - `let`, `for`, script `fn` parameters, local functions `g(x) = …`
+//!   (name and parameters, so they may recurse), comprehension bindings
 //!   (`[k^2 for k = L]`, later bindings see earlier ones), `∑`/`∏` indices,
 //!   `d/dx` and `∫ … dx` variables bind in their bodies only (bounds and
 //!   ranges are outside the binder).
 //! - Plots bind `x`, `y` and `θ`/`theta`; `t` when the relation is a
 //!   parametric tuple; `r` when the relation is polar (`r = …` or it
 //!   mentions `θ`).
-//! - In actions, plain targets (`a` in `a -> a + 1`) are *writes*, not
-//!   references.
+//! - Plain action targets (`a` in `a -> a + 1`) and script assignments
+//!   (`a = 5`) are *writes* ([`Analysis::writes`]), not references and
+//!   not definitions.
 //! - A multi-letter name made only of letters (`ab`) is also recorded
 //!   letter by letter ([`Reference::split`]), because the evaluator reads
 //!   an undefined `ab` as `a·b`.
+//!
+//! Each occurrence records the names bound around it
+//! ([`Reference::scope`]) so rewrites can detect name capture.
 
 use viscas_core::syntax::{
     self, Block, ElseBranch, Expr, ExprKind, ParseError, Program, Span, Stmt, StmtKind,
@@ -50,7 +56,7 @@ pub struct Letter {
     pub bound: bool,
 }
 
-/// A free identifier occurrence.
+/// An identifier occurrence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reference {
     pub name: String,
@@ -59,6 +65,10 @@ pub struct Reference {
     pub span: Span,
     /// Letter-wise reading for multi-letter names (`ab` → `a·b`).
     pub split: Option<Vec<Letter>>,
+    /// Names bound by enclosing binders at this occurrence (sorted,
+    /// deduplicated). Rewriting the occurrence to one of these would be
+    /// captured.
+    pub scope: Vec<String>,
 }
 
 /// Everything derived from a node's content without looking at other
@@ -68,10 +78,14 @@ pub struct Analysis {
     pub sources: Vec<ParsedSource>,
     /// Names this node defines.
     pub defines: Vec<String>,
-    /// Free identifier occurrences, in source order per field.
+    /// Free identifier occurrences (reads), in source order per field.
     pub references: Vec<Reference>,
-    /// Names assigned by actions / scripts (`a` in `a -> a + 1`).
-    pub writes: Vec<String>,
+    /// Write targets (`a` in `a -> a + 1`, script `a = 5`).
+    pub writes: Vec<Reference>,
+    /// Occurrences, inside this node, of names the node itself defines and
+    /// binds internally: regression parameters and script top-level `fn`
+    /// names (including the name at the `fn` definition site).
+    pub defined_uses: Vec<Reference>,
 }
 
 impl Analysis {
@@ -98,6 +112,32 @@ impl Analysis {
     /// Distinct referenced names (unsplit), sorted.
     pub fn referenced_names(&self) -> Vec<&str> {
         let mut v: Vec<&str> = self.references.iter().map(|r| r.name.as_str()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Distinct written names, in first-occurrence order.
+    pub fn written_names(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = Vec::new();
+        for w in &self.writes {
+            if !v.contains(&w.name.as_str()) {
+                v.push(&w.name);
+            }
+        }
+        v
+    }
+
+    /// Every name the node mentions in a way that depends on other nodes:
+    /// read names, their split letters and write targets.
+    pub fn dependency_names(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = Vec::new();
+        for r in self.references.iter().chain(&self.writes) {
+            v.push(&r.name);
+            if let Some(letters) = &r.split {
+                v.extend(letters.iter().filter(|l| !l.bound).map(|l| l.name.as_str()));
+            }
+        }
         v.sort_unstable();
         v.dedup();
         v
@@ -143,54 +183,56 @@ pub fn analyze(content: &NodeContent) -> Analysis {
         out.sources.push(parsed);
     }
 
+    let table_columns: Vec<String> = match kind {
+        NodeKind::Table { columns } => columns.iter().map(|c| c.name.clone()).collect(),
+        _ => Vec::new(),
+    };
+
     for parsed in &out.sources {
         let Some(ast) = &parsed.ast else { continue };
-        let mut w = Walker {
-            field: parsed.field,
-            scope: Vec::new(),
-            refs: Vec::new(),
-            writes: Vec::new(),
-            script: false,
-            theta_seen: false,
-        };
+        let text = kind.source(parsed.field).unwrap_or("");
+        let mut w = Walker::new(parsed.field, text);
         match (kind, ast) {
             (NodeKind::Function { params, .. }, Parsed::Expr(e)) => {
-                w.scope.extend(params.iter().cloned());
+                w.bind_all(params, false);
                 w.expr(e);
             }
             (NodeKind::Regression { params, .. }, Parsed::Stmt(s)) => {
-                w.scope.extend(params.iter().cloned());
+                w.bind_all(params, true);
                 w.stmt(s);
             }
+            (NodeKind::Table { .. }, Parsed::Expr(e)) => {
+                w.bind_all(&table_columns, false);
+                w.expr(e);
+            }
             (NodeKind::Plot { .. }, Parsed::Stmt(s)) => {
-                let parametric = is_parametric(s);
-                w.scope.extend(["x", "y", "θ", "theta"].map(String::from));
-                if parametric {
-                    w.scope.push("t".into());
+                w.bind_all(&["x", "y", "θ", "theta"].map(String::from), false);
+                if is_parametric(s) {
+                    w.bind("t", false);
                 }
                 w.stmt(s);
-                let polar = lhs_is(s, "r") || w.saw_theta();
-                if polar {
+                if lhs_is(s, "r") || w.theta_seen {
                     w.bind_after("r");
                 }
             }
             (NodeKind::Script { .. }, Parsed::Program(p)) => {
                 w.script = true;
-                let top = w.program(p);
-                out.defines.extend(top);
+                let top = w.program(p, true);
+                for name in top {
+                    if !out.defines.contains(&name) {
+                        out.defines.push(name);
+                    }
+                }
             }
             (_, Parsed::Expr(e)) => w.expr(e),
             (_, Parsed::Stmt(s)) => w.stmt(s),
             (_, Parsed::Program(p)) => {
-                w.program(p);
+                w.program(p, false);
             }
         }
         out.references.append(&mut w.refs);
-        for name in w.writes {
-            if !out.writes.contains(&name) {
-                out.writes.push(name);
-            }
-        }
+        out.writes.append(&mut w.writes);
+        out.defined_uses.append(&mut w.defined_uses);
     }
     if let NodeKind::Regression { params, .. } = kind {
         out.defines.extend(params.iter().cloned());
@@ -217,7 +259,7 @@ fn lhs_is(s: &Stmt, name: &str) -> bool {
     }
 }
 
-/// Is `name` splittable into letters (`ab`, not `a1`, `x_1`, `km` is)?
+/// Is `name` splittable into letters (`ab`, not `a1`, `x_1`; `km` is)?
 fn split_letters(name: &str) -> Option<Vec<String>> {
     let mut chars = name.chars();
     chars.next()?;
@@ -227,27 +269,76 @@ fn split_letters(name: &str) -> Option<Vec<String>> {
         .then(|| name.chars().map(String::from).collect())
 }
 
-struct Walker {
+/// Byte span of the function name in `fn name(...)` starting at `start`.
+fn fn_name_span(text: &str, start: usize, name: &str) -> Option<Span> {
+    let rest = text.get(start..)?.strip_prefix("fn")?;
+    let trimmed = rest.trim_start();
+    let offset = start + 2 + (rest.len() - trimmed.len());
+    trimmed
+        .starts_with(name)
+        .then(|| Span::new(offset, offset + name.len()))
+}
+
+struct Binder {
+    name: String,
+    /// Defined by the node itself (regression parameter, script `fn`).
+    node_defined: bool,
+}
+
+struct Walker<'a> {
     field: SourceField,
-    scope: Vec<String>,
+    text: &'a str,
+    scope: Vec<Binder>,
     refs: Vec<Reference>,
-    writes: Vec<String>,
+    writes: Vec<Reference>,
+    defined_uses: Vec<Reference>,
     script: bool,
     theta_seen: bool,
 }
 
-impl Walker {
-    fn bound(&self, name: &str) -> bool {
-        self.scope.iter().any(|s| s == name)
+impl<'a> Walker<'a> {
+    fn new(field: SourceField, text: &'a str) -> Self {
+        Walker {
+            field,
+            text,
+            scope: Vec::new(),
+            refs: Vec::new(),
+            writes: Vec::new(),
+            defined_uses: Vec::new(),
+            script: false,
+            theta_seen: false,
+        }
     }
 
-    fn ident(&mut self, name: &str, span: Span) {
-        if name == "θ" || name == "theta" {
-            self.theta_seen = true;
+    fn bind(&mut self, name: &str, node_defined: bool) {
+        self.scope.push(Binder {
+            name: name.to_string(),
+            node_defined,
+        });
+    }
+
+    fn bind_all(&mut self, names: &[String], node_defined: bool) {
+        for n in names {
+            self.bind(n, node_defined);
         }
-        if self.bound(name) {
-            return;
-        }
+    }
+
+    fn binder(&self, name: &str) -> Option<&Binder> {
+        self.scope.iter().rev().find(|b| b.name == name)
+    }
+
+    fn bound(&self, name: &str) -> bool {
+        self.binder(name).is_some()
+    }
+
+    fn scope_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.scope.iter().map(|b| b.name.clone()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn occurrence(&self, name: &str, span: Span) -> Reference {
         let split = split_letters(name).map(|letters| {
             letters
                 .into_iter()
@@ -257,16 +348,30 @@ impl Walker {
                 })
                 .collect()
         });
-        self.refs.push(Reference {
+        Reference {
             name: name.to_string(),
             field: self.field,
             span,
             split,
-        });
+            scope: self.scope_names(),
+        }
     }
 
-    fn saw_theta(&self) -> bool {
-        self.theta_seen
+    fn ident(&mut self, name: &str, span: Span) {
+        if name == "θ" || name == "theta" {
+            self.theta_seen = true;
+        }
+        match self.binder(name) {
+            Some(b) if b.node_defined => {
+                let r = self.occurrence(name, span);
+                self.defined_uses.push(r);
+            }
+            Some(_) => {}
+            None => {
+                let r = self.occurrence(name, span);
+                self.refs.push(r);
+            }
+        }
     }
 
     /// Retroactively bind `name` (polar `r`): drop its references and mark
@@ -279,16 +384,15 @@ impl Walker {
                     l.bound = true;
                 }
             }
+            if let Err(i) = r.scope.binary_search_by(|s| s.as_str().cmp(name)) {
+                r.scope.insert(i, name.to_string());
+            }
         }
     }
 
-    fn with<R>(
-        &mut self,
-        names: impl IntoIterator<Item = String>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
+    fn with<R>(&mut self, names: &[String], f: impl FnOnce(&mut Self) -> R) -> R {
         let mark = self.scope.len();
-        self.scope.extend(names);
+        self.bind_all(names, false);
         let r = f(self);
         self.scope.truncate(mark);
         r
@@ -341,7 +445,7 @@ impl Walker {
                 let mark = self.scope.len();
                 for b in bindings {
                     self.expr(&b.iter);
-                    self.scope.push(b.name.clone());
+                    self.bind(&b.name, false);
                 }
                 self.expr(body);
                 self.scope.truncate(mark);
@@ -365,14 +469,14 @@ impl Walker {
                 self.exprs(conds);
             }
             ExprKind::Derivative { var, expr, .. } => {
-                self.with([var.clone()], |w| w.expr(expr));
+                self.with(std::slice::from_ref(var), |w| w.expr(expr));
             }
             ExprKind::Integral { bounds, body, var } => {
                 if let Some((lo, hi)) = bounds {
                     self.expr(lo);
                     self.expr(hi);
                 }
-                self.with([var.clone()], |w| w.expr(body));
+                self.with(std::slice::from_ref(var), |w| w.expr(body));
             }
             ExprKind::BigOp {
                 var,
@@ -383,15 +487,18 @@ impl Walker {
             } => {
                 self.expr(from);
                 self.expr(to);
-                self.with([var.clone()], |w| w.expr(body));
+                self.with(std::slice::from_ref(var), |w| w.expr(body));
             }
         }
     }
 
-    fn write(&mut self, name: &str) {
-        if !self.bound(name) && !self.writes.iter().any(|w| w == name) {
-            self.writes.push(name.to_string());
+    /// A plain write target (`a` in `a -> …`, script `a = …`).
+    fn write(&mut self, name: &str, span: Span) {
+        if self.bound(name) {
+            return;
         }
+        let r = self.occurrence(name, span);
+        self.writes.push(r);
     }
 
     fn stmt(&mut self, s: &Stmt) {
@@ -405,29 +512,33 @@ impl Walker {
                 rhs,
                 restrictions,
             } if self.script => match &*lhs.kind {
-                // `a = 5` in a script assigns the scene variable `a`.
+                // `a = 5` in a script assigns (writes) the scene variable `a`
+                // — or a local `let` binding when one is in scope.
                 ExprKind::Ident(name) => {
                     self.expr(rhs);
                     self.exprs(restrictions);
-                    self.write(name);
+                    self.write(name, lhs.span);
                 }
-                // `g(x) = …` defines a local function.
+                // `g(x) = …` defines a local function; it may recurse.
                 ExprKind::Call { callee, args }
                     if matches!(&*callee.kind, ExprKind::Ident(_))
                         && args.iter().all(|a| matches!(&*a.kind, ExprKind::Ident(_))) =>
                 {
-                    let params = args.iter().filter_map(|a| match &*a.kind {
-                        ExprKind::Ident(p) => Some(p.clone()),
-                        _ => None,
-                    });
-                    let params: Vec<String> = params.collect();
-                    self.with(params, |w| {
+                    let ExprKind::Ident(f) = &*callee.kind else {
+                        unreachable!()
+                    };
+                    self.bind(f, false);
+                    let params: Vec<String> = args
+                        .iter()
+                        .filter_map(|a| match &*a.kind {
+                            ExprKind::Ident(p) => Some(p.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    self.with(&params, |w| {
                         w.expr(rhs);
                         w.exprs(restrictions);
                     });
-                    if let ExprKind::Ident(f) = &*callee.kind {
-                        self.scope.push(f.clone());
-                    }
                 }
                 _ => {
                     self.expr(lhs);
@@ -452,7 +563,7 @@ impl Walker {
             StmtKind::Action { actions } => {
                 for (target, value) in actions {
                     match &*target.kind {
-                        ExprKind::Ident(name) => self.write(name),
+                        ExprKind::Ident(name) => self.write(name, target.span),
                         _ => self.expr(target),
                     }
                     self.expr(value);
@@ -460,7 +571,7 @@ impl Walker {
             }
             StmtKind::Let { name, value } => {
                 self.expr(value);
-                self.scope.push(name.clone());
+                self.bind(name, false);
             }
             StmtKind::If {
                 cond,
@@ -477,7 +588,7 @@ impl Walker {
             }
             StmtKind::For { var, iter, body } => {
                 self.expr(iter);
-                self.with([var.clone()], |w| w.block(body));
+                self.with(std::slice::from_ref(var), |w| w.block(body));
             }
             StmtKind::While { cond, body } => {
                 self.expr(cond);
@@ -485,7 +596,7 @@ impl Walker {
             }
             StmtKind::Fn { params, body, .. } => {
                 // The name itself is hoisted by `stmts`.
-                self.with(params.iter().cloned(), |w| w.block(body));
+                self.with(params, |w| w.block(body));
             }
             StmtKind::Return(e) => {
                 if let Some(e) = e {
@@ -496,17 +607,25 @@ impl Walker {
     }
 
     /// Walk a statement list in its own scope with hoisted `fn` names.
-    /// Returns the hoisted names.
-    fn stmts(&mut self, stmts: &[Stmt]) -> Vec<String> {
+    /// At the top level of a script (`top`), the hoisted names are defined
+    /// by the node: their definition sites and uses are recorded.
+    fn stmts(&mut self, stmts: &[Stmt], top: bool) -> Vec<String> {
         let mark = self.scope.len();
-        let fns: Vec<String> = stmts
-            .iter()
-            .filter_map(|s| match &s.kind {
-                StmtKind::Fn { name, .. } => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-        self.scope.extend(fns.iter().cloned());
+        let mut fns: Vec<String> = Vec::new();
+        for s in stmts {
+            if let StmtKind::Fn { name, .. } = &s.kind {
+                if top && let Some(span) = fn_name_span(self.text, s.span.start, name) {
+                    let r = self.occurrence(name, span);
+                    self.defined_uses.push(r);
+                }
+                if !fns.contains(name) {
+                    fns.push(name.clone());
+                }
+            }
+        }
+        for f in &fns {
+            self.bind(f, top);
+        }
         for s in stmts {
             self.stmt(s);
         }
@@ -515,10 +634,10 @@ impl Walker {
     }
 
     fn block(&mut self, b: &Block) {
-        self.stmts(&b.stmts);
+        self.stmts(&b.stmts, false);
     }
 
-    fn program(&mut self, p: &Program) -> Vec<String> {
-        self.stmts(&p.stmts)
+    fn program(&mut self, p: &Program, top: bool) -> Vec<String> {
+        self.stmts(&p.stmts, top)
     }
 }

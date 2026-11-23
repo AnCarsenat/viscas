@@ -24,63 +24,52 @@
 //!
 //! Every document carries a `version`. [`load_document`] reads the version
 //! first and routes older versions through [`migrate`]; documents newer than
-//! [`FORMAT_VERSION`] are refused. The app's area/workspace layout travels
-//! as an opaque JSON value in `layout`.
+//! [`FORMAT_VERSION`] are refused. Fields this version does not know (on the
+//! document or on a node) are kept as raw RON text and written back
+//! unchanged, so additive changes by newer versions round-trip. The app's
+//! area/workspace layout travels as an opaque JSON value in `layout`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::names::is_valid_identifier;
 use crate::node::{Node, NodeContent, NodeId, NodeKind, PropValue, Style};
 use crate::scene::Scene;
 
 /// Current document format version.
 pub const FORMAT_VERSION: u32 = 1;
 
-fn default_true() -> bool {
-    true
-}
-
-fn is_true(b: &bool) -> bool {
-    *b
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
 /// One node with its children, as stored on disk.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DocNode {
     pub id: NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub kind: NodeKind,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub visible: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
-    #[serde(default, skip_serializing_if = "Style::is_default")]
     pub style: Style,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub props: BTreeMap<String, PropValue>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DocNode>,
+    /// Unknown fields as raw RON text.
+    pub extra: BTreeMap<String, String>,
 }
 
 /// A whole document.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Document {
     pub version: u32,
     /// Next id to allocate (ids are never reused).
-    #[serde(default)]
     pub next_id: u64,
-    #[serde(default)]
     pub nodes: Vec<DocNode>,
     /// App-owned area/workspace layout, opaque to the scene.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<serde_json::Value>,
+    /// Unknown fields as raw RON text.
+    pub extra: BTreeMap<String, String>,
 }
 
 /// Errors reading or writing documents.
@@ -100,6 +89,13 @@ pub enum DocumentError {
     },
     /// Two nodes share an id.
     DuplicateId(NodeId),
+    /// A node id is too large to allocate a successor.
+    IdOverflow(NodeId),
+    /// A node's content is invalid (bad name or parameter).
+    InvalidContent {
+        id: NodeId,
+        message: String,
+    },
     Serialize(String),
 }
 
@@ -116,12 +112,189 @@ impl fmt::Display for DocumentError {
                 write!(f, "document version {version} is not supported")
             }
             DocumentError::DuplicateId(id) => write!(f, "duplicate node id {id}"),
+            DocumentError::IdOverflow(id) => write!(f, "node id {id} is too large"),
+            DocumentError::InvalidContent { id, message } => write!(f, "node {id}: {message}"),
             DocumentError::Serialize(m) => write!(f, "cannot write document: {m}"),
         }
     }
 }
 
 impl std::error::Error for DocumentError {}
+
+// ---------------------------------------------------------------------------
+// Serde with preserved unknown fields
+// ---------------------------------------------------------------------------
+
+/// Field names of unknown fields must be `'static` for the serializer;
+/// each distinct name is leaked once.
+fn intern(name: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut set = NAMES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&n) = set.get(name) {
+        return n;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    set.insert(leaked);
+    leaked
+}
+
+fn serialize_extra<S: SerializeStruct>(
+    st: &mut S,
+    extra: &BTreeMap<String, String>,
+) -> Result<(), S::Error> {
+    for (k, raw) in extra {
+        let value = ron::value::RawValue::from_ron(raw).map_err(serde::ser::Error::custom)?;
+        st.serialize_field(intern(k), value)?;
+    }
+    Ok(())
+}
+
+fn read_extra<'de, A: MapAccess<'de>>(
+    map: &mut A,
+    key: String,
+    extra: &mut BTreeMap<String, String>,
+) -> Result<(), A::Error> {
+    let raw: Box<ron::value::RawValue> = map.next_value()?;
+    extra.insert(key, raw.get_ron().trim().to_string());
+    Ok(())
+}
+
+const NODE_FIELDS: &[&str] = &[
+    "id", "name", "kind", "visible", "locked", "style", "props", "children",
+];
+
+impl Serialize for DocNode {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("DocNode", NODE_FIELDS.len() + self.extra.len())?;
+        st.serialize_field("id", &self.id)?;
+        if let Some(name) = &self.name {
+            st.serialize_field("name", name)?;
+        }
+        st.serialize_field("kind", &self.kind)?;
+        if !self.visible {
+            st.serialize_field("visible", &false)?;
+        }
+        if self.locked {
+            st.serialize_field("locked", &true)?;
+        }
+        if !self.style.is_default() {
+            st.serialize_field("style", &self.style)?;
+        }
+        if !self.props.is_empty() {
+            st.serialize_field("props", &self.props)?;
+        }
+        if !self.children.is_empty() {
+            st.serialize_field("children", &self.children)?;
+        }
+        serialize_extra(&mut st, &self.extra)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DocNode {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<DocNode, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = DocNode;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a node")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<DocNode, A::Error> {
+                let mut id = None;
+                let mut kind = None;
+                let mut node = DocNode {
+                    id: NodeId(0),
+                    name: None,
+                    kind: NodeKind::Folder,
+                    visible: true,
+                    locked: false,
+                    style: Style::default(),
+                    props: BTreeMap::new(),
+                    children: Vec::new(),
+                    extra: BTreeMap::new(),
+                };
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => id = Some(map.next_value()?),
+                        "name" => node.name = map.next_value()?,
+                        "kind" => kind = Some(map.next_value()?),
+                        "visible" => node.visible = map.next_value()?,
+                        "locked" => node.locked = map.next_value()?,
+                        "style" => node.style = map.next_value()?,
+                        "props" => node.props = map.next_value()?,
+                        "children" => node.children = map.next_value()?,
+                        _ => read_extra(&mut map, key, &mut node.extra)?,
+                    }
+                }
+                node.id = id.ok_or_else(|| de::Error::missing_field("id"))?;
+                node.kind = kind.ok_or_else(|| de::Error::missing_field("kind"))?;
+                Ok(node)
+            }
+        }
+        d.deserialize_struct("DocNode", NODE_FIELDS, V)
+    }
+}
+
+const DOC_FIELDS: &[&str] = &["version", "next_id", "nodes", "layout"];
+
+impl Serialize for Document {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Document", DOC_FIELDS.len() + self.extra.len())?;
+        st.serialize_field("version", &self.version)?;
+        st.serialize_field("next_id", &self.next_id)?;
+        st.serialize_field("nodes", &self.nodes)?;
+        if let Some(layout) = &self.layout {
+            st.serialize_field("layout", layout)?;
+        }
+        serialize_extra(&mut st, &self.extra)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Document {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Document, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Document;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a document")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Document, A::Error> {
+                let mut version = None;
+                let mut doc = Document {
+                    version: 0,
+                    next_id: 0,
+                    nodes: Vec::new(),
+                    layout: None,
+                    extra: BTreeMap::new(),
+                };
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" => version = Some(map.next_value()?),
+                        "next_id" => doc.next_id = map.next_value()?,
+                        "nodes" => doc.nodes = map.next_value()?,
+                        "layout" => doc.layout = map.next_value()?,
+                        _ => read_extra(&mut map, key, &mut doc.extra)?,
+                    }
+                }
+                doc.version = version.ok_or_else(|| de::Error::missing_field("version"))?;
+                Ok(doc)
+            }
+        }
+        d.deserialize_struct("Document", DOC_FIELDS, V)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading and writing
+// ---------------------------------------------------------------------------
 
 fn ron_options() -> ron::Options {
     ron::Options::default().with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
@@ -184,7 +357,30 @@ fn to_doc_node(scene: &Scene, node: &Node) -> DocNode {
             .filter_map(|c| scene.get(*c))
             .map(|c| to_doc_node(scene, c))
             .collect(),
+        extra: node.extra.clone(),
     }
+}
+
+/// Check what the scene API would refuse: invalid names of defining
+/// nodes and invalid or repeated parameters. (Duplicate names are allowed
+/// and reported as diagnostics.)
+fn validate_content(id: NodeId, c: &NodeContent) -> Result<(), DocumentError> {
+    let invalid = |message: String| DocumentError::InvalidContent { id, message };
+    if c.kind.defines_by_name()
+        && let Some(name) = &c.name
+        && !is_valid_identifier(name)
+    {
+        return Err(invalid(format!("`{name}` is not a valid name")));
+    }
+    if let NodeKind::Function { params, .. } | NodeKind::Regression { params, .. } = &c.kind {
+        let mut seen = HashSet::new();
+        for p in params {
+            if !is_valid_identifier(p) || !seen.insert(p) {
+                return Err(invalid(format!("invalid parameter `{p}`")));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Scene {
@@ -200,57 +396,62 @@ impl Scene {
                 .map(|n| to_doc_node(self, n))
                 .collect(),
             layout: self.layout.clone(),
+            extra: self.doc_extra.clone(),
         }
     }
 
     /// Build a scene from a document. Every node starts dirty; history and
     /// selection are empty.
     pub fn from_document(doc: Document) -> Result<Scene, DocumentError> {
-        let mut scene = Scene::new();
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut roots = Vec::new();
         let mut seen = HashSet::new();
-        let mut max_id = 0;
         fn walk(
-            scene: &mut Scene,
+            nodes: &mut Vec<Node>,
             seen: &mut HashSet<NodeId>,
-            max_id: &mut u64,
             parent: Option<NodeId>,
             d: DocNode,
         ) -> Result<NodeId, DocumentError> {
             if !seen.insert(d.id) {
                 return Err(DocumentError::DuplicateId(d.id));
             }
-            *max_id = (*max_id).max(d.id.0);
-            let mut node = Node::new(
-                d.id,
-                NodeContent {
-                    name: d.name,
-                    kind: d.kind,
-                    visible: d.visible,
-                    locked: d.locked,
-                    style: d.style,
-                    props: d.props,
-                },
-            );
+            let content = Scene::normalize(NodeContent {
+                name: d.name,
+                kind: d.kind,
+                visible: d.visible,
+                locked: d.locked,
+                style: d.style,
+                props: d.props,
+                extra: d.extra,
+            });
+            validate_content(d.id, &content)?;
+            let mut node = Node::new(d.id, content);
             node.parent = parent;
             let id = node.id;
-            scene.nodes.insert(id, node);
+            let slot = nodes.len();
+            nodes.push(node);
             let mut children = Vec::with_capacity(d.children.len());
             for c in d.children {
-                children.push(walk(scene, seen, max_id, Some(id), c)?);
+                children.push(walk(nodes, seen, Some(id), c)?);
             }
-            if let Some(n) = scene.nodes.get_mut(&id) {
-                n.children = children;
-            }
+            nodes[slot].children = children;
             Ok(id)
         }
         for d in doc.nodes {
-            let id = walk(&mut scene, &mut seen, &mut max_id, None, d)?;
-            scene.roots.push(id);
+            roots.push(walk(&mut nodes, &mut seen, None, d)?);
         }
-        scene.next_id = doc.next_id.max(max_id + 1);
+        let mut next_id = doc.next_id.max(1);
+        for n in &nodes {
+            let after =
+                n.id.0
+                    .checked_add(1)
+                    .ok_or(DocumentError::IdOverflow(n.id))?;
+            next_id = next_id.max(after);
+        }
+        let mut scene = Scene::new();
+        scene.load_nodes(nodes, roots, next_id);
         scene.layout = doc.layout;
-        scene.reanalyze_all();
-        scene.drain_events();
+        scene.doc_extra = doc.extra;
         Ok(scene)
     }
 
