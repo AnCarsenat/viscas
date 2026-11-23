@@ -7,7 +7,9 @@
 
 use std::f64::consts::TAU;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use viscas_plot::{
     CancelToken, Cancelled, Comparison, PlotOptions, Primitive, Vec2, View, plot_explicit,
@@ -103,11 +105,58 @@ impl fmt::Debug for PlotShape {
     }
 }
 
+/// Recompiles a shape whose closures fall back to the general evaluator,
+/// with the given flag as `EvalOptions::interrupt`, so a superseded job
+/// stops even inside one slow sample.
+pub type Rebuild = Arc<dyn Fn(Arc<AtomicBool>) -> Option<PlotShape> + Send + Sync>;
+
 /// A node's compiled plot.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CompiledPlot {
     pub kind: PlotKind,
     pub shape: PlotShape,
+    /// Present when some closure uses the (slow, interruptible) general
+    /// evaluator; jobs rebuild the shape with their own interrupt flag.
+    pub rebuild: Option<Rebuild>,
+}
+
+impl fmt::Debug for CompiledPlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompiledPlot")
+            .field("kind", &self.kind)
+            .field("shape", &self.shape)
+            .field("rebuild", &self.rebuild.is_some())
+            .finish()
+    }
+}
+
+impl CompiledPlot {
+    pub fn new(kind: PlotKind, shape: PlotShape) -> CompiledPlot {
+        CompiledPlot {
+            kind,
+            shape,
+            rebuild: None,
+        }
+    }
+
+    /// The shape bound to `flag` (itself when no closure needs it).
+    pub fn for_job(self: &Arc<Self>, flag: &Arc<AtomicBool>) -> Arc<CompiledPlot> {
+        match self.rebuild.as_ref().and_then(|r| r(flag.clone())) {
+            Some(shape) => Arc::new(CompiledPlot::new(self.kind, shape)),
+            None => self.clone(),
+        }
+    }
+}
+
+impl PlotKind {
+    /// Draw rank: fills (0) under curves (1) under points (2).
+    pub fn draw_rank(self) -> u8 {
+        match self {
+            PlotKind::Inequality | PlotKind::PolarInequality => 0,
+            PlotKind::Points => 2,
+            _ => 1,
+        }
+    }
 }
 
 /// Visual style of a layer, resolved from the node style (automatic
@@ -143,11 +192,14 @@ impl PlotStyle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotLayer {
     pub node_id: NodeId,
+    pub kind: PlotKind,
     pub style: PlotStyle,
-    pub primitives: Vec<Primitive>,
+    /// Shared, so handing layers to the UI never deep-copies geometry.
+    pub primitives: Arc<Vec<Primitive>>,
     /// The evaluation budget cut sampling short (coarser result).
     pub truncated: bool,
-    /// Rendering failed (e.g. a worker panic); `primitives` is empty.
+    /// Rendering failed (e.g. a worker panic); `primitives` is empty and
+    /// the layer is retried on the next request.
     pub error: Option<String>,
     /// Computed for an older view or revision; still drawable (world
     /// coordinates) until the fresh result arrives. Set by
@@ -165,13 +217,14 @@ pub struct PlotItem {
     pub plot: Arc<CompiledPlot>,
 }
 
-/// Identifies a viewport (an app editor or a scene Viewport node).
+/// A viewport allocated by [`crate::Engine::create_viewport`] (or mapped
+/// from a scene Viewport node by [`crate::Engine::viewport_for_node`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ViewportId(pub u64);
+pub struct ViewportId(pub(crate) u64);
 
-impl From<NodeId> for ViewportId {
-    fn from(id: NodeId) -> Self {
-        ViewportId(id.0)
+impl ViewportId {
+    pub fn raw(self) -> u64 {
+        self.0
     }
 }
 
@@ -181,8 +234,8 @@ impl From<NodeId> for ViewportId {
 #[derive(Clone, Debug)]
 pub struct PlotJob {
     pub viewport: ViewportId,
-    /// Increases with every job of the same viewport; results of older
-    /// generations are discarded.
+    /// Engine-wide increasing job number; results of jobs older than the
+    /// viewport's last cancellation are discarded.
     pub generation: u64,
     pub view: View,
     pub items: Vec<PlotItem>,
@@ -196,17 +249,35 @@ impl PlotJob {
         (0..self.items.len()).map(|i| self.run_item(i)).collect()
     }
 
-    /// Renders item `i`.
+    /// Renders item `i`. A panic becomes an error layer. `Err` when the
+    /// job is cancelled before, during or right after sampling (samples
+    /// interrupted by the job flag are NaN, so such a result is never
+    /// returned).
     pub fn run_item(&self, i: usize) -> Result<PlotLayer, Cancelled> {
         let item = &self.items[i];
         self.cancel.check()?;
-        let (primitives, truncated) = render(&item.plot.shape, &self.view, &self.options)?;
+        let rendered = catch_unwind(AssertUnwindSafe(|| {
+            render(&item.plot.shape, &self.view, &self.options)
+        }));
+        let (primitives, truncated, error) = match rendered {
+            Ok(r) => {
+                let (p, t) = r?;
+                (p, t, None)
+            }
+            Err(_) => (
+                Vec::new(),
+                false,
+                Some("plotting failed (internal error)".into()),
+            ),
+        };
+        self.cancel.check()?;
         Ok(PlotLayer {
             node_id: item.node,
+            kind: item.plot.kind,
             style: item.style.clone(),
-            primitives,
+            primitives: Arc::new(primitives),
             truncated,
-            error: None,
+            error,
             stale: false,
         })
     }

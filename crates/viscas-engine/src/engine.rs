@@ -3,9 +3,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use viscas_core::eval::is_reserved;
@@ -15,13 +17,16 @@ use viscas_plot::{
     find_intersections,
 };
 use viscas_scene::{
-    Builtins, Color, DocumentError, KindTag, NodeContent, NodeId, NodeKind, Scene, SceneError,
-    SceneEvent, parse_definition_with,
+    Builtins, Change, Color, DocumentError, KindTag, NodeContent, NodeId, NodeKind, Scene,
+    SceneError, SceneEvent, parse_definition_with,
 };
 
 use crate::console::ConsoleState;
-use crate::eval::{NodeValue, SceneEvaluator};
-use crate::plot::{CompiledPlot, PlotItem, PlotJob, PlotLayer, PlotShape, PlotStyle, ViewportId};
+use crate::eval::{Defs, NodeValue, SceneEvaluator};
+use crate::lines::line_parse_options;
+use crate::plot::{
+    CompiledPlot, Fn1, PlotItem, PlotJob, PlotLayer, PlotShape, PlotStyle, ViewportId,
+};
 use crate::settings::EngineSettings;
 use crate::worker::{PlotPool, PlotResult};
 
@@ -81,6 +86,12 @@ pub const DEFAULT_PALETTE: [Color; 8] = [
     Color::rgb(0xa0, 0xa8, 0xb8),
 ];
 
+/// At most this many curves take part in feature analysis (pairs grow
+/// quadratically).
+pub const MAX_FEATURE_CURVES: usize = 8;
+/// Evaluation budget of one feature-analysis call.
+const FEATURE_EVALS: usize = 20_000;
+
 /// A root, extremum or intersection near a clicked point.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FeatureHit {
@@ -92,20 +103,31 @@ pub struct FeatureHit {
     pub distance: f64,
 }
 
+/// Result of [`Engine::request_features`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeaturesResult {
+    pub ticket: u64,
+    pub viewport: ViewportId,
+    pub hits: Vec<FeatureHit>,
+}
+
 struct ViewportState {
     view: Option<View>,
-    generation: u64,
-    cancel: CancelToken,
-    pending: usize,
+    /// Interrupt flag of the current jobs (also their cancel token).
+    flag: Arc<AtomicBool>,
+    /// Results of jobs older than this generation are discarded.
+    epoch: u64,
+    /// Node → revision being rendered by a current job.
+    in_flight: HashMap<NodeId, u64>,
 }
 
 impl Default for ViewportState {
     fn default() -> Self {
         ViewportState {
             view: None,
-            generation: 0,
-            cancel: CancelToken::new(),
-            pending: 0,
+            flag: Arc::new(AtomicBool::new(false)),
+            epoch: 0,
+            in_flight: HashMap::new(),
         }
     }
 }
@@ -114,9 +136,17 @@ struct CacheEntry {
     view: View,
     revision: u64,
     layer: PlotLayer,
+    /// `false` for error layers: shown, but re-rendered on the next request.
+    complete: bool,
 }
 
-/// Does a node kind get a palette color when created?
+impl CacheEntry {
+    fn fresh(&self, view: View, revision: u64) -> bool {
+        self.complete && self.view == view && self.revision == revision
+    }
+}
+
+/// Does a node kind get a palette color?
 fn colored_kind(kind: &NodeKind) -> bool {
     matches!(
         kind.tag(),
@@ -134,7 +164,8 @@ pub fn builtins_oracle() -> Arc<dyn Builtins> {
 ///
 /// Typical frame: mutate through [`Engine::scene_mut`] (or the helpers),
 /// call [`Engine::update`], [`Engine::drain_events`] to refresh widgets,
-/// [`Engine::request_plots`] when a view or the scene changed, and
+/// [`Engine::request_plots`] for the viewports in
+/// [`Engine::needs_replot`] (or whose view changed), and
 /// [`Engine::poll_plots`] + [`Engine::layers`] on a timer/idle callback.
 pub struct Engine {
     scene: Scene,
@@ -143,9 +174,19 @@ pub struct Engine {
     events: Vec<SceneEvent>,
     palette: Vec<Color>,
     palette_next: usize,
+    /// Automatic colors of nodes without a style color (never saved).
     auto_colors: HashMap<NodeId, Color>,
     pool: PlotPool,
+    plot_tx: Sender<PlotResult>,
+    plot_rx: Receiver<PlotResult>,
+    feat_tx: Sender<FeaturesResult>,
+    feat_rx: Receiver<FeaturesResult>,
+    feat_flag: Arc<AtomicBool>,
+    feat_ticket: u64,
     viewports: HashMap<ViewportId, ViewportState>,
+    next_viewport: u64,
+    node_viewports: HashMap<NodeId, ViewportId>,
+    next_generation: u64,
     cache: HashMap<(NodeId, ViewportId), CacheEntry>,
     plot_options: PlotOptions,
     pub(crate) console: ConsoleState,
@@ -168,6 +209,17 @@ impl fmt::Debug for Engine {
     }
 }
 
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Interrupt running samples so the pool joins promptly.
+        for s in self.viewports.values() {
+            s.flag.store(true, Ordering::Relaxed);
+        }
+        self.feat_flag.store(true, Ordering::Relaxed);
+        self.interrupt.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Engine {
     /// Empty document, default settings, default worker count.
     pub fn new() -> Engine {
@@ -182,6 +234,8 @@ impl Engine {
         scene.set_builtins(builtins_oracle());
         scene.clear_history();
         scene.drain_events();
+        let (plot_tx, plot_rx) = mpsc::channel();
+        let (feat_tx, feat_rx) = mpsc::channel();
         Engine {
             scene,
             eval: SceneEvaluator::new(settings, interrupt.clone()),
@@ -191,7 +245,16 @@ impl Engine {
             palette_next: 0,
             auto_colors: HashMap::new(),
             pool: PlotPool::new(threads),
+            plot_tx,
+            plot_rx,
+            feat_tx,
+            feat_rx,
+            feat_flag: Arc::new(AtomicBool::new(false)),
+            feat_ticket: 0,
             viewports: HashMap::new(),
+            next_viewport: 1,
+            node_viewports: HashMap::new(),
+            next_generation: 1,
             cache: HashMap::new(),
             plot_options: PlotOptions::default(),
             console: ConsoleState::default(),
@@ -216,29 +279,49 @@ impl Engine {
         &self.eval
     }
 
-    /// Flag that interrupts long evaluations when set (from any thread).
-    /// It is cleared at the start of every [`Engine::update`] and console
-    /// evaluation.
+    /// Snapshot of the scene definitions (console, analysis).
+    pub(crate) fn defs_snapshot(&mut self) -> Defs {
+        self.eval.snapshot()
+    }
+
+    /// Flag that interrupts long scene/console evaluations when set (from
+    /// any thread). Cleared at the start of every [`Engine::update`] and
+    /// console evaluation. Plot jobs use their own flags.
     pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
         self.interrupt.clone()
     }
 
-    /// Evaluate every dirty node (inputs first), invalidate plot caches
-    /// of changed nodes and queue the scene's events. Returns the
-    /// processed nodes in evaluation order.
+    /// Evaluate every dirty node (inputs first), compile plots and queue
+    /// the scene's events. Property edits of plot nodes (`t_min`, …) make
+    /// them dirty. Returns the processed nodes in evaluation order.
     pub fn update(&mut self) -> Vec<NodeId> {
         self.interrupt.store(false, Ordering::Relaxed);
+        let events = self.scene.drain_events();
+        for e in &events {
+            if let SceneEvent::Changed {
+                id,
+                what: Change::Props,
+            } = e
+                && matches!(
+                    self.scene.get(*id).map(|n| &n.kind),
+                    Some(NodeKind::Plot { .. })
+                )
+            {
+                self.scene.mark_dirty(*id);
+            }
+        }
+        self.events.extend(events);
         self.eval.prune(&self.scene);
         // A dirty node must not leak its previous value to dependents
         // evaluated before it is recomputed (or when it is blocked).
         let dirty = self.scene.dirty();
         self.eval.forget_many(&dirty);
         let done = self.scene.evaluate_dirty(&mut self.eval);
+        self.eval.finish_pass(&mut self.scene);
         let scene = &self.scene;
-        let eval = &self.eval;
-        self.cache
-            .retain(|(n, _), e| scene.contains(*n) && e.revision == eval.revision(*n));
+        self.cache.retain(|(n, _), _| scene.contains(*n));
         self.auto_colors.retain(|id, _| scene.contains(*id));
+        self.node_viewports.retain(|id, _| scene.contains(*id));
         let mut missing: Vec<NodeId> = done
             .iter()
             .copied()
@@ -285,32 +368,44 @@ impl Engine {
         }
         self.eval.set_settings(settings);
         self.eval.reset();
-        self.cache.clear();
         self.scene.mark_all_dirty();
         self.update();
     }
 
-    /// Add a node (palette color assigned to plot-like kinds without one,
-    /// in the same undo step) and evaluate.
+    /// Add a node and evaluate. Plot-like nodes without a style color get
+    /// an automatic palette color (kept out of the saved style).
     pub fn add_node(
         &mut self,
         parent: Option<NodeId>,
-        mut content: NodeContent,
+        content: NodeContent,
     ) -> Result<NodeId, EngineError> {
-        if content.style.color.is_none() && colored_kind(&content.kind) {
-            content.style.color = Some(self.next_color());
-        }
         let id = self.scene.add(parent, content)?;
+        self.assign_auto_color(id);
         self.update();
         Ok(id)
+    }
+
+    pub(crate) fn assign_auto_color(&mut self, id: NodeId) {
+        let wants = self
+            .scene
+            .get(id)
+            .is_some_and(|n| n.style.color.is_none() && colored_kind(&n.kind));
+        if wants && !self.auto_colors.contains_key(&id) {
+            let c = self.next_color();
+            self.auto_colors.insert(id, c);
+        }
     }
 
     /// Parse an expression-list line (`a := 3`, `f(x) := x^2`, `y = x^2`)
     /// with the current definition operator and add it as a node.
     pub fn add_line(&mut self, parent: Option<NodeId>, line: &str) -> Result<NodeId, EngineError> {
-        let content = parse_definition_with(line, self.settings().parse_options())
-            .map_err(EngineError::Parse)?;
+        let content = self.line_content(line).map_err(EngineError::Parse)?;
         self.add_node(parent, content)
+    }
+
+    /// Node content of an expression-list line (see [`crate::lines`]).
+    pub fn line_content(&self, line: &str) -> Result<NodeContent, Vec<ParseError>> {
+        parse_definition_with(line, line_parse_options(line, self.settings()))
     }
 
     pub fn undo(&mut self) -> bool {
@@ -329,11 +424,19 @@ impl Engine {
     // Colors
     // ------------------------------------------------------------------
 
-    /// Replace the color cycle (theme colors). Ignored when empty.
+    /// Replace the color cycle (theme colors) and reassign automatic
+    /// colors from it. Ignored when empty.
     pub fn set_palette(&mut self, palette: Vec<Color>) {
-        if !palette.is_empty() {
-            self.palette = palette;
-            self.palette_next = 0;
+        if palette.is_empty() {
+            return;
+        }
+        self.palette = palette;
+        self.palette_next = 0;
+        let mut ids: Vec<NodeId> = self.auto_colors.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let c = self.next_color();
+            self.auto_colors.insert(id, c);
         }
     }
 
@@ -348,8 +451,8 @@ impl Engine {
         c
     }
 
-    /// The color a node is drawn with: its style color, else the
-    /// automatic one assigned when it was first plotted.
+    /// The color a node is drawn with: its style color, else its
+    /// automatic color.
     pub fn node_color(&self, id: NodeId) -> Option<Color> {
         let n = self.scene.get(id)?;
         n.style
@@ -359,17 +462,54 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------
-    // Plotting
+    // Viewports and plotting
     // ------------------------------------------------------------------
+
+    /// Allocate a viewport (one per graph editor).
+    pub fn create_viewport(&mut self) -> ViewportId {
+        let id = ViewportId(self.next_viewport);
+        self.next_viewport += 1;
+        self.viewports.insert(id, ViewportState::default());
+        id
+    }
+
+    /// The viewport of a scene Viewport node (allocated on first use).
+    pub fn viewport_for_node(&mut self, node: NodeId) -> ViewportId {
+        if let Some(v) = self.node_viewports.get(&node)
+            && self.viewports.contains_key(v)
+        {
+            return *v;
+        }
+        let v = self.create_viewport();
+        self.node_viewports.insert(node, v);
+        v
+    }
+
+    /// The viewport mapped to a Viewport node, if any.
+    pub fn node_viewport(&self, node: NodeId) -> Option<ViewportId> {
+        self.node_viewports.get(&node).copied()
+    }
 
     /// Sampling options of plot jobs (budgets, tolerances).
     pub fn plot_options(&self) -> &PlotOptions {
         &self.plot_options
     }
 
+    /// Change sampling options: cancels running jobs and drops caches.
     pub fn set_plot_options(&mut self, options: PlotOptions) {
         self.plot_options = options;
+        self.cancel_all();
         self.cache.clear();
+    }
+
+    fn cancel_all(&mut self) {
+        let epoch = self.next_generation;
+        for s in self.viewports.values_mut() {
+            s.flag.store(true, Ordering::Relaxed);
+            s.flag = Arc::new(AtomicBool::new(false));
+            s.in_flight.clear();
+            s.epoch = epoch;
+        }
     }
 
     /// Is the node and every ancestor visible?
@@ -384,7 +524,7 @@ impl Engine {
         true
     }
 
-    /// Visible plot-like nodes with a compiled plot, in scene (draw) order.
+    /// Visible plot-like nodes with a compiled plot, in scene order.
     pub fn plot_items(&self) -> Vec<PlotItem> {
         self.scene
             .iter()
@@ -409,60 +549,104 @@ impl Engine {
         }
     }
 
-    /// Build the job for `viewport` at `view` containing the nodes whose
-    /// cached layer is missing or out of date, and make it the viewport's
-    /// current job (cancelling the previous one). Use
-    /// [`Engine::request_plots`] to run it on the pool.
+    /// Build the job for `viewport` at `view` with the nodes whose cached
+    /// layer is missing, out of date or failed. With an unchanged view,
+    /// nodes already being rendered are skipped and nothing is cancelled
+    /// (an empty job means "nothing to do"); a new view cancels the
+    /// viewport's running jobs. Use [`Engine::request_plots`] to run it on
+    /// the pool. Unknown viewports yield an empty job.
     pub fn prepare_job(&mut self, viewport: ViewportId, view: View) -> PlotJob {
-        let items: Vec<PlotItem> = self
-            .plot_items()
+        let items = self.plot_items();
+        let options = self.plot_options.clone();
+        let generation = self.next_generation;
+        let cache = &self.cache;
+        let Some(state) = self.viewports.get_mut(&viewport) else {
+            let cancel = CancelToken::new();
+            cancel.cancel();
+            return PlotJob {
+                viewport,
+                generation: 0,
+                view,
+                items: Vec::new(),
+                cancel,
+                options,
+            };
+        };
+        let mut needed: Vec<PlotItem> = items
             .into_iter()
             .filter(|it| {
-                !self
-                    .cache
+                !cache
                     .get(&(it.node, viewport))
-                    .is_some_and(|e| e.view == view && e.revision == it.revision)
+                    .is_some_and(|e| e.fresh(view, it.revision))
             })
             .collect();
-        let state = self.viewports.entry(viewport).or_default();
-        state.cancel.cancel();
-        state.cancel = CancelToken::new();
-        state.generation += 1;
-        state.view = Some(view);
-        state.pending = 0;
-        let mut options = self.plot_options.clone();
-        options.cancel = state.cancel.clone();
+        let same_view = state.view == Some(view);
+        if same_view {
+            needed.retain(|it| state.in_flight.get(&it.node) != Some(&it.revision));
+        } else {
+            state.flag.store(true, Ordering::Relaxed);
+            state.flag = Arc::new(AtomicBool::new(false));
+            state.in_flight.clear();
+            state.epoch = generation;
+            state.view = Some(view);
+        }
+        let cancel = CancelToken::from(state.flag.clone());
+        let mut options = options;
+        options.cancel = cancel.clone();
+        if needed.is_empty() {
+            return PlotJob {
+                viewport,
+                generation: 0,
+                view,
+                items: needed,
+                cancel,
+                options,
+            };
+        }
+        self.next_generation += 1;
+        for it in &mut needed {
+            state.in_flight.insert(it.node, it.revision);
+            it.plot = it.plot.for_job(&state.flag);
+        }
         PlotJob {
             viewport,
-            generation: state.generation,
+            generation,
             view,
-            items,
-            cancel: state.cancel.clone(),
+            items: needed,
+            cancel,
             options,
         }
     }
 
-    /// Start (re)plotting `viewport` at `view` in the background. Cached
-    /// layers are reused; a previous job of the viewport is cancelled.
-    /// Returns the number of nodes being rendered.
+    /// Start (re)plotting `viewport` at `view` in the background (see
+    /// [`Engine::prepare_job`]). Returns the number of nodes queued.
     pub fn request_plots(&mut self, viewport: ViewportId, view: View) -> usize {
-        let job = self.prepare_job(viewport, view);
+        let job = Arc::new(self.prepare_job(viewport, view));
         let n = job.items.len();
-        if let Some(s) = self.viewports.get_mut(&viewport) {
-            s.pending = n;
-        }
-        if n > 0 {
-            self.pool.submit(job);
+        for i in 0..n {
+            let job = job.clone();
+            let tx = self.plot_tx.clone();
+            self.pool.spawn(job.cancel.clone(), move || {
+                if let Ok(layer) = job.run_item(i) {
+                    let _ = tx.send(PlotResult {
+                        viewport: job.viewport,
+                        generation: job.generation,
+                        revision: job.items[i].revision,
+                        view: job.view,
+                        layer,
+                    });
+                }
+            });
         }
         n
     }
 
     /// Render a job synchronously on the calling thread and store the
-    /// results (headless export, tests).
+    /// results (headless export, tests). `false` if it was cancelled.
     pub fn run_job_now(&mut self, job: &PlotJob) -> bool {
-        match job.run() {
-            Ok(layers) => {
-                for (layer, item) in layers.into_iter().zip(&job.items) {
+        for (i, item) in job.items.iter().enumerate() {
+            match job.run_item(i) {
+                Ok(layer) => {
                     self.accept(PlotResult {
                         viewport: job.viewport,
                         generation: job.generation,
@@ -471,30 +655,34 @@ impl Engine {
                         layer,
                     });
                 }
-                true
+                Err(_) => return false,
             }
-            Err(_) => false,
         }
+        !job.cancel.is_cancelled()
     }
 
     pub(crate) fn accept(&mut self, r: PlotResult) -> bool {
         let Some(state) = self.viewports.get_mut(&r.viewport) else {
             return false;
         };
-        if r.generation != state.generation {
+        if r.generation < state.epoch {
             return false;
         }
-        state.pending = state.pending.saturating_sub(1);
         let node = r.layer.node_id;
+        if state.in_flight.get(&node) == Some(&r.revision) {
+            state.in_flight.remove(&node);
+        }
         if !self.scene.contains(node) || r.revision != self.eval.revision(node) {
             return false;
         }
+        let complete = r.layer.error.is_none();
         self.cache.insert(
             (node, r.viewport),
             CacheEntry {
                 view: r.view,
                 revision: r.revision,
                 layer: r.layer,
+                complete,
             },
         );
         true
@@ -504,7 +692,7 @@ impl Engine {
     /// viewports that received fresh layers (redraw them).
     pub fn poll_plots(&mut self) -> Vec<ViewportId> {
         let mut out = Vec::new();
-        while let Some(r) = self.pool.try_recv() {
+        while let Ok(r) = self.plot_rx.try_recv() {
             let vp = r.viewport;
             if self.accept(r) && !out.contains(&vp) {
                 out.push(vp);
@@ -513,28 +701,61 @@ impl Engine {
         out
     }
 
-    /// Block until every viewport's current job finished or `timeout`
+    /// Block until every viewport's current jobs finished or `timeout`
     /// elapsed (tests, export). Returns `true` when all are done.
     pub fn wait_for_plots(&mut self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             self.poll_plots();
-            if self.viewports.values().all(|s| s.pending == 0) {
+            if self.viewports.values().all(|s| s.in_flight.is_empty()) {
                 return true;
             }
             let now = Instant::now();
             if now >= deadline {
                 return false;
             }
-            if let Some(r) = self.pool.recv_timeout(deadline - now) {
+            if let Ok(r) = self.plot_rx.recv_timeout(deadline - now) {
                 self.accept(r);
             }
         }
     }
 
-    /// Nodes still being rendered for the viewport's current job.
+    /// Background tasks waiting for a worker.
+    pub fn queued_tasks(&self) -> usize {
+        self.pool.queued()
+    }
+
+    /// Nodes still being rendered for the viewport.
     pub fn pending_plots(&self, viewport: ViewportId) -> usize {
-        self.viewports.get(&viewport).map_or(0, |s| s.pending)
+        self.viewports
+            .get(&viewport)
+            .map_or(0, |s| s.in_flight.len())
+    }
+
+    /// Viewports with a view whose layers are missing or out of date and
+    /// not being rendered: call [`Engine::request_plots`] for them (e.g.
+    /// after [`Engine::update`]).
+    pub fn needs_replot(&self) -> Vec<ViewportId> {
+        let items = self.plot_items();
+        let mut out: Vec<ViewportId> = self
+            .viewports
+            .iter()
+            .filter_map(|(vp, s)| {
+                let view = s.view?;
+                items
+                    .iter()
+                    .any(|it| {
+                        !self
+                            .cache
+                            .get(&(it.node, *vp))
+                            .is_some_and(|e| e.fresh(view, it.revision))
+                            && s.in_flight.get(&it.node) != Some(&it.revision)
+                    })
+                    .then_some(*vp)
+            })
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// The view of the viewport's latest request.
@@ -545,91 +766,135 @@ impl Engine {
     /// Cancel and drop a viewport (editor closed).
     pub fn close_viewport(&mut self, viewport: ViewportId) {
         if let Some(s) = self.viewports.remove(&viewport) {
-            s.cancel.cancel();
+            s.flag.store(true, Ordering::Relaxed);
         }
         self.cache.retain(|(_, v), _| *v != viewport);
+        self.node_viewports.retain(|_, v| *v != viewport);
     }
 
-    /// Best available layers of a viewport in draw order. Layers computed
-    /// for an older view are returned with `stale = true` (still correct
-    /// in world coordinates); styles always reflect the current node style.
+    /// Best available layers of a viewport: fills, then curves, then
+    /// points (scene order within each group). Layers computed for an
+    /// older view or an older revision of their node come back with
+    /// `stale = true` until the fresh result arrives; styles always
+    /// reflect the current node style. Cloning a layer shares its
+    /// geometry.
     pub fn layers(&self, viewport: ViewportId) -> Vec<PlotLayer> {
         let view = self.viewport_view(viewport);
-        self.plot_items()
+        let mut out: Vec<PlotLayer> = self
+            .plot_items()
             .into_iter()
             .filter_map(|it| {
                 let e = self.cache.get(&(it.node, viewport))?;
-                if e.revision != it.revision {
-                    return None;
-                }
                 let mut layer = e.layer.clone();
                 layer.style = it.style;
-                layer.stale = Some(e.view) != view;
+                layer.stale = Some(e.view) != view || e.revision != it.revision;
                 Some(layer)
             })
-            .collect()
+            .collect();
+        out.sort_by_key(|l| l.kind.draw_rank());
+        out
     }
 
     // ------------------------------------------------------------------
     // Analysis
     // ------------------------------------------------------------------
 
+    fn feature_curves(&self, flag: Option<&Arc<AtomicBool>>) -> Vec<(NodeId, Fn1)> {
+        self.plot_items()
+            .into_iter()
+            .filter_map(|it| {
+                let plot = match flag {
+                    Some(f) => it.plot.for_job(f),
+                    None => it.plot,
+                };
+                match &plot.shape {
+                    PlotShape::ExplicitY(f) => Some((it.node, f.clone())),
+                    _ => None,
+                }
+            })
+            .take(MAX_FEATURE_CURVES)
+            .collect()
+    }
+
+    fn feature_options(&self, cancel: CancelToken) -> PlotOptions {
+        PlotOptions {
+            cancel,
+            max_evals: FEATURE_EVALS,
+            ..self.plot_options.clone()
+        }
+    }
+
     /// Roots, extrema, y-intercepts and pairwise intersections of the
     /// visible explicit curves `y = f(x)` within `radius` (world units) of
-    /// `point`, nearest first. Uses the viewport's latest view; empty if
-    /// it was never plotted.
+    /// `point`, nearest first, using the viewport's latest view. Bounded
+    /// work (at most [`MAX_FEATURE_CURVES`] curves, a fixed evaluation
+    /// budget per search); prefer [`Engine::request_features`] on the UI
+    /// thread.
     pub fn features_near(&self, viewport: ViewportId, point: Vec2, radius: f64) -> Vec<FeatureHit> {
         let Some(view) = self.viewport_view(viewport) else {
             return Vec::new();
         };
-        let opts = PlotOptions {
-            cancel: CancelToken::none(),
-            ..self.plot_options.clone()
-        };
-        let curves: Vec<(NodeId, crate::plot::Fn1)> = self
-            .plot_items()
-            .into_iter()
-            .filter_map(|it| match &it.plot.shape {
-                PlotShape::ExplicitY(f) => Some((it.node, f.clone())),
-                _ => None,
-            })
-            .collect();
-        let mut hits = Vec::new();
-        let mut push = |node, other, feature: Feature| {
-            let distance = (feature.pos - point).length();
-            if distance <= radius {
-                hits.push(FeatureHit {
-                    node,
-                    other,
-                    feature,
-                    distance,
+        let opts = self.feature_options(CancelToken::none());
+        compute_features(&self.feature_curves(None), view, point, radius, &opts)
+    }
+
+    /// [`Engine::features_near`] on the worker pool. A newer request
+    /// cancels the previous one. Returns the ticket of the result
+    /// delivered by [`Engine::poll_features`], or `None` when the viewport
+    /// was never plotted.
+    pub fn request_features(
+        &mut self,
+        viewport: ViewportId,
+        point: Vec2,
+        radius: f64,
+    ) -> Option<u64> {
+        let view = self.viewport_view(viewport)?;
+        self.feat_flag.store(true, Ordering::Relaxed);
+        self.feat_flag = Arc::new(AtomicBool::new(false));
+        self.feat_ticket += 1;
+        let ticket = self.feat_ticket;
+        let cancel = CancelToken::from(self.feat_flag.clone());
+        let curves = self.feature_curves(Some(&self.feat_flag));
+        let opts = self.feature_options(cancel.clone());
+        let tx = self.feat_tx.clone();
+        self.pool.spawn(cancel.clone(), move || {
+            let hits = compute_features(&curves, view, point, radius, &opts);
+            if !cancel.is_cancelled() {
+                let _ = tx.send(FeaturesResult {
+                    ticket,
+                    viewport,
+                    hits,
                 });
             }
-        };
-        for (node, f) in &curves {
-            if let Ok(fs) = explicit_features(&**f, &view, &opts) {
-                for ft in fs.data {
-                    push(*node, None, ft);
-                }
+        });
+        Some(ticket)
+    }
+
+    /// Finished feature requests (only the latest ticket is kept).
+    pub fn poll_features(&mut self) -> Vec<FeaturesResult> {
+        let mut out = Vec::new();
+        while let Ok(r) = self.feat_rx.try_recv() {
+            if r.ticket == self.feat_ticket {
+                out.push(r);
             }
         }
-        let b = view.bounds();
-        let samples = view.width_px().ceil() as usize;
-        for (i, (a, f)) in curves.iter().enumerate() {
-            for (bn, g) in &curves[i + 1..] {
-                if let Ok(pts) = find_intersections(&**f, &**g, b.x_min, b.x_max, samples, &opts) {
-                    for p in pts.data {
-                        let ft = Feature {
-                            pos: p,
-                            kind: FeatureKind::Intersection,
-                        };
-                        push(*a, Some(*bn), ft);
-                    }
-                }
+        out
+    }
+
+    /// Wait up to `timeout` for the latest feature request.
+    pub fn wait_for_features(&mut self, timeout: Duration) -> Option<FeaturesResult> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            match self.feat_rx.recv_timeout(deadline - now) {
+                Ok(r) if r.ticket == self.feat_ticket => return Some(r),
+                Ok(_) => continue,
+                Err(_) => return None,
             }
         }
-        hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
-        hits
     }
 
     // ------------------------------------------------------------------
@@ -642,12 +907,9 @@ impl Engine {
         scene.drain_events();
         self.scene = scene;
         self.eval.reset();
+        self.cancel_all();
         self.cache.clear();
-        for s in self.viewports.values_mut() {
-            s.cancel.cancel();
-            s.pending = 0;
-            s.generation += 1;
-        }
+        self.node_viewports.clear();
         self.auto_colors.clear();
         self.palette_next = 0;
         self.console.forget_pin();
@@ -655,6 +917,11 @@ impl Engine {
             touched: Vec::new(),
         });
         self.events.push(SceneEvent::HistoryChanged);
+        let mut ids = self.scene.dfs_ids();
+        ids.sort_unstable();
+        for id in ids {
+            self.assign_auto_color(id);
+        }
         self.update();
     }
 
@@ -685,10 +952,11 @@ impl Engine {
         self.scene.save_to_string()
     }
 
-    /// Write the document to `path` (remembered as the document path).
+    /// Write the document to `path` atomically (temporary file in the same
+    /// directory, fsync, rename); remembered as the document path.
     pub fn save_path(&mut self, path: impl AsRef<Path>) -> Result<(), EngineError> {
         let text = self.save_string()?;
-        std::fs::write(path.as_ref(), text)?;
+        atomic_write(path.as_ref(), text.as_bytes())?;
         self.path = Some(path.as_ref().to_path_buf());
         Ok(())
     }
@@ -706,4 +974,81 @@ impl Engine {
     pub fn set_layout(&mut self, layout: Option<serde_json::Value>) {
         self.scene.set_layout(layout);
     }
+}
+
+/// Feature search over explicit curves (any thread).
+fn compute_features(
+    curves: &[(NodeId, Fn1)],
+    view: View,
+    point: Vec2,
+    radius: f64,
+    opts: &PlotOptions,
+) -> Vec<FeatureHit> {
+    let mut hits = Vec::new();
+    let mut push = |node, other, feature: Feature| {
+        let distance = (feature.pos - point).length();
+        if distance <= radius {
+            hits.push(FeatureHit {
+                node,
+                other,
+                feature,
+                distance,
+            });
+        }
+    };
+    for (node, f) in curves {
+        if let Ok(fs) = explicit_features(&**f, &view, opts) {
+            for ft in fs.data {
+                push(*node, None, ft);
+            }
+        }
+    }
+    let b = view.bounds();
+    let samples = view.width_px().ceil() as usize;
+    for (i, (a, f)) in curves.iter().enumerate() {
+        for (bn, g) in &curves[i + 1..] {
+            if let Ok(pts) = find_intersections(&**f, &**g, b.x_min, b.x_max, samples, opts) {
+                for p in pts.data {
+                    let ft = Feature {
+                        pos: p,
+                        kind: FeatureKind::Intersection,
+                    };
+                    push(*a, Some(*bn), ft);
+                }
+            }
+        }
+    }
+    hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    hits
+}
+
+/// Write `bytes` to `path` via a synced temporary file in the same
+/// directory and a rename, so a crash never leaves a truncated document.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("the document path has no file name"))?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }

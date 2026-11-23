@@ -1,19 +1,31 @@
 //! The console: one-line evaluation sharing the scene's definitions, with
-//! its own session locals, `ans`/`ans2`, commands and input history.
+//! its own definitions, session locals, `ans`/`ans2`, commands and input
+//! history.
+//!
+//! Name rules:
+//! - Scene nodes are visible by name and are never shadowed: `a := 1`
+//!   when a node defines `a` redefines that node (one undo step).
+//! - New names stay console-local until `:pin`. A console definition
+//!   whose name a node later takes (pin, add) yields to the node; it comes
+//!   back if the node goes away (e.g. undo of the pin).
+//! - `:pin` turns the last input into a node, pinning the console-only
+//!   definitions it depends on first, as one undo step.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use viscas_core::eval::{
-    AngleUnit, BUILTINS, ErrorKind, Outcome, Session, StatementKind, Value, canonical_name,
-    format_value,
+    AngleUnit, BUILTINS, ErrorKind, EvalError, Outcome, Session, StatementKind, Value,
+    canonical_name, format_value,
 };
-use viscas_core::syntax::Span;
-use viscas_scene::{NodeId, definition_line_with};
+use viscas_core::syntax::{ExprKind, Span, StmtKind, parse_program_with, parse_statement_with};
+use viscas_scene::{NodeContent, NodeId, analyze, definition_line_with};
 
 use crate::complete::{candidate_names, suggest};
 use crate::engine::Engine;
-use crate::eval::env_with;
+use crate::eval::{env_with, stmt_spans};
 use crate::help::{command_help, constant_help, function_help};
+use crate::lines::line_parse_options;
 
 /// Maximum number of remembered console inputs.
 pub const HISTORY_LIMIT: usize = 1000;
@@ -25,9 +37,12 @@ pub enum ItemKind {
     Value,
     /// A console definition (`a := 3`).
     Definition { name: String },
+    /// `a := …` redefined the scene node `a` ("updated node a"); `exact`
+    /// and `approx` show its new value.
+    UpdatedNode { node: NodeId, name: String },
     /// A plot relation (`y = x^2`): no value; `:pin` turns it into a plot.
     Relation { kind: String },
-    /// `:pin` created this node.
+    /// `:pin` created this node (dependencies first, the pinned line last).
     Pinned { node: NodeId },
     /// A `:vars` entry.
     Variable { name: String, scene: bool },
@@ -87,9 +102,13 @@ pub struct ConsoleOutput {
 /// Console state kept by the engine.
 #[derive(Debug, Default)]
 pub(crate) struct ConsoleState {
-    pub(crate) session: Session,
+    session: Session,
+    /// Console definitions (including `ans`, `ans2`).
+    defs: BTreeMap<String, Value>,
+    /// Source line of each console definition (for `:pin`).
+    sources: HashMap<String, String>,
     history: Vec<String>,
-    /// The last successful non-command input (for `:pin`).
+    /// The last successful non-command statement (for `:pin`).
     last: Option<String>,
 }
 
@@ -97,27 +116,28 @@ impl ConsoleState {
     pub(crate) fn forget_pin(&mut self) {
         self.last = None;
     }
-
-    pub(crate) fn session_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self
-            .session
-            .env
-            .names()
-            .filter(|n| *n != "ans" && *n != "ans2")
-            .map(String::from)
-            .collect();
-        v.sort();
-        v
-    }
 }
 
 const MODES: &[&str] = &["exact", "approx", "deg", "rad", "real", "complex"];
 
+/// Is `span` a usable range of `text`?
+fn span_in(text: &str, span: Span) -> bool {
+    span.start <= span.end
+        && span.end <= text.len()
+        && text.is_char_boundary(span.start)
+        && text.is_char_boundary(span.end)
+}
+
+fn shift(span: Span, by: usize) -> Span {
+    Span {
+        start: span.start + by,
+        end: span.end + by,
+    }
+}
+
 impl Engine {
-    /// Evaluate one console line (expression, definition, relation, or a
-    /// `:command`). Console definitions live in the console session and
-    /// shadow scene nodes of the same name; scene nodes are visible by
-    /// name.
+    /// Evaluate one console line (expressions, definitions, relations, or
+    /// a `:command`), statement by statement.
     pub fn console_eval(&mut self, line: &str) -> ConsoleOutput {
         let input = line.trim();
         self.push_history(input);
@@ -134,15 +154,64 @@ impl Engine {
         }
         self.interrupt_flag().store(false, Ordering::Relaxed);
         let settings = *self.settings();
-        let defs = self.evaluator().defs().clone();
+        let program = match parse_program_with(input, &settings.parse_options()) {
+            Ok(p) => p,
+            Err(errs) => {
+                let e = &errs[0];
+                out.error = Some(ConsoleError {
+                    message: e.message.clone(),
+                    span: span_in(input, e.span).then_some(e.span),
+                });
+                return out;
+            }
+        };
+        for stmt in &program.stmts {
+            let (start, end) = (stmt.span.start, stmt.span.end);
+            if !span_in(input, stmt.span) {
+                continue;
+            }
+            let text = &input[start..end];
+            if !self.console_statement(text, start, &mut out) {
+                return out;
+            }
+            self.console.last = Some(text.to_string());
+        }
+        out
+    }
+
+    /// One statement; `false` after an error (reported in `out`).
+    fn console_statement(&mut self, text: &str, offset: usize, out: &mut ConsoleOutput) -> bool {
+        let settings = *self.settings();
+        let popts = line_parse_options(text, &settings);
+        let stmt = parse_statement_with(text, &popts).ok();
+        // Scene nodes are never shadowed: redefine the node instead.
+        if let Some(s) = &stmt
+            && let StmtKind::Definition { lhs, .. } = &s.kind
+            && let Some(name) = defined_name(lhs)
+            && let Some(id) = self.scene().lookup(&name)
+        {
+            return self.redefine_node(id, &name, text, out);
+        }
+        let defs = self.defs_snapshot();
+        let mut env = env_with(&defs);
+        for (n, v) in &self.console.defs {
+            if !self.evaluator().defines(n) {
+                let _ = env.define(n, v.clone());
+            }
+        }
         let opts = self.evaluator().eval_options();
         let session = &mut self.console.session;
-        session
-            .env
-            .set_resolver(env_with(&defs).resolver().cloned());
+        session.env = env;
         session.opts = opts;
-        session.parse = settings.parse_options();
-        match session.run(input) {
+        session.parse = popts;
+        let result = session.run(text);
+        let globals: Vec<(String, Value)> = session
+            .env
+            .names()
+            .filter_map(|n| session.env.get(n).map(|v| (n.to_string(), v.clone())))
+            .collect();
+        self.console.defs.extend(globals);
+        match result {
             Ok(outcomes) => {
                 for o in outcomes {
                     let item = match o {
@@ -151,6 +220,7 @@ impl Engine {
                             value_item(&v, &settings, ItemKind::Value)
                         }
                         Outcome::Defined { name, value } => {
+                            self.console.sources.insert(name.clone(), text.to_string());
                             value_item(&value, &settings, ItemKind::Definition { name })
                         }
                         Outcome::Relation(info) => ConsoleItem {
@@ -163,30 +233,98 @@ impl Engine {
                     };
                     out.results.push(item);
                 }
-                self.console.last = Some(input.to_string());
+                true
             }
             Err(e) => {
-                if let ErrorKind::UnknownName(name) = &e.kind {
-                    out.suggestions = suggest(name, &candidate_names(self));
-                }
-                let span = (e.span.end <= input.len() && e.span != Span::default()
-                    || e.kind == ErrorKind::Parse)
-                    .then_some(e.span);
-                out.error = Some(ConsoleError {
-                    message: e.message,
-                    span,
-                });
+                self.report(e, text, offset, stmt.as_ref(), out);
+                false
             }
         }
-        out
+    }
+
+    fn report(
+        &self,
+        e: EvalError,
+        text: &str,
+        offset: usize,
+        stmt: Option<&viscas_core::syntax::Stmt>,
+        out: &mut ConsoleOutput,
+    ) {
+        if let ErrorKind::UnknownName(name) = &e.kind {
+            out.suggestions = suggest(name, &candidate_names(self));
+        }
+        // Keep the span only if it points into this statement's own tree
+        // (errors inside a called function's body carry spans into that
+        // body's text).
+        let own = match (&e.kind, stmt) {
+            (ErrorKind::Parse, _) => true,
+            (_, Some(s)) => {
+                let mut spans = Vec::new();
+                stmt_spans(s, &mut spans);
+                spans.contains(&e.span)
+            }
+            (_, None) => e.span != Span::default(),
+        };
+        let span = (own && span_in(text, e.span)).then(|| shift(e.span, offset));
+        out.error = Some(ConsoleError {
+            message: e.message,
+            span,
+        });
+    }
+
+    fn redefine_node(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        text: &str,
+        out: &mut ConsoleOutput,
+    ) -> bool {
+        let content = match self.line_content(text) {
+            Ok(c) => c,
+            Err(errs) => {
+                out.error = Some(ConsoleError {
+                    message: errs[0].message.clone(),
+                    span: None,
+                });
+                return false;
+            }
+        };
+        if let Err(e) = self.scene_mut().set_kind(id, content.kind) {
+            out.error = Some(ConsoleError {
+                message: e.to_string(),
+                span: None,
+            });
+            return false;
+        }
+        self.update();
+        if let viscas_scene::Status::Error { message, .. } = self.scene().status(id) {
+            out.error = Some(ConsoleError {
+                message: format!("updated node `{name}`, which now has an error: {message}"),
+                span: None,
+            });
+            return false;
+        }
+        let (exact, approx) = self
+            .value(id)
+            .map(|v| (v.exact.clone(), v.approx.clone()))
+            .unwrap_or_default();
+        out.results.push(ConsoleItem {
+            exact,
+            approx,
+            kind: ItemKind::UpdatedNode {
+                node: id,
+                name: name.to_string(),
+            },
+        });
+        true
     }
 
     fn set_ans(&mut self, v: &Value) {
-        let env = &mut self.console.session.env;
-        if let Some(prev) = env.get("ans").cloned() {
-            let _ = env.define("ans2", prev);
+        let defs = &mut self.console.defs;
+        if let Some(prev) = defs.get("ans").cloned() {
+            defs.insert("ans2".into(), prev);
         }
-        let _ = env.define("ans", v.clone());
+        defs.insert("ans".into(), v.clone());
     }
 
     fn push_history(&mut self, input: &str) {
@@ -214,9 +352,15 @@ impl Engine {
         }
     }
 
-    /// Names defined in the console session (not in the scene), sorted.
+    /// Active console definitions (not `ans`/`ans2`, not names a scene
+    /// node currently provides), sorted.
     pub fn console_names(&self) -> Vec<String> {
-        self.console.session_names()
+        self.console
+            .defs
+            .keys()
+            .filter(|n| *n != "ans" && *n != "ans2" && !self.evaluator().defines(n))
+            .cloned()
+            .collect()
     }
 
     fn console_command(&mut self, cmd: &str, out: &mut ConsoleOutput) {
@@ -228,8 +372,9 @@ impl Engine {
             "mode" => self.cmd_mode(&args, out),
             "pin" => self.cmd_pin(out),
             "clear" => {
-                self.console.session = Default::default();
-                self.console.last = None;
+                let history = std::mem::take(&mut self.console.history);
+                self.console = Default::default();
+                self.console.history = history;
                 out.cleared = true;
             }
             "vars" => self.cmd_vars(out),
@@ -306,7 +451,7 @@ impl Engine {
                 .push(ConsoleItem::info(format!("scene node: {line}{value}")));
             return;
         }
-        if let Some(v) = self.console.session.env.get(canon) {
+        if let Some(v) = self.console.defs.get(canon) {
             out.results.push(ConsoleItem::info(format!(
                 "console definition: {canon} = {}",
                 format_value(v, &self.settings().exact_format())
@@ -353,65 +498,110 @@ impl Engine {
             .push(ConsoleItem::info(format!("mode: {}", s.mode_summary())));
     }
 
+    /// Console-only definitions `content` depends on, dependencies first.
+    fn pin_plan(
+        &self,
+        content: &NodeContent,
+        seen: &mut HashSet<String>,
+        plan: &mut Vec<NodeContent>,
+    ) -> Result<(), String> {
+        let analysis = analyze(content);
+        for raw in analysis.dependency_names() {
+            let name = canonical_name(raw).to_string();
+            if self.evaluator().defines(&name)
+                || self.scene().lookup(&name).is_some()
+                || !seen.insert(name.clone())
+            {
+                continue;
+            }
+            match self.console.sources.get(&name) {
+                Some(src) => {
+                    let dep = self
+                        .line_content(src)
+                        .map_err(|e| format!("cannot pin `{name}`: {}", e[0].message))?;
+                    self.pin_plan(&dep, seen, plan)?;
+                    plan.push(dep);
+                }
+                None if self.console.defs.contains_key(&name) => {
+                    return Err(format!(
+                        "cannot pin: `{name}` is a console value without a definition to pin"
+                    ));
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
     fn cmd_pin(&mut self, out: &mut ConsoleOutput) {
-        let Some(line) = self.console.last.clone() else {
+        let fail = |out: &mut ConsoleOutput, message: String| {
             out.error = Some(ConsoleError {
-                message: "nothing to pin yet: evaluate something first".into(),
+                message,
                 span: None,
             });
-            return;
         };
-        let content =
-            match viscas_scene::parse_definition_with(&line, self.settings().parse_options()) {
-                Ok(c) => c,
-                Err(e) => {
-                    out.error = Some(ConsoleError {
-                        message: e
-                            .first()
-                            .map_or_else(|| "parse error".into(), |e| e.message.clone()),
-                        span: None,
-                    });
-                    return;
-                }
-            };
-        let defined = content
+        let Some(line) = self.console.last.clone() else {
+            return fail(out, "nothing to pin yet: evaluate something first".into());
+        };
+        let content = match self.line_content(&line) {
+            Ok(c) => c,
+            Err(e) => return fail(out, e[0].message.clone()),
+        };
+        if let Some(name) = content
             .kind
             .defines_by_name()
-            .then(|| content.name.clone())
-            .flatten();
-        if let Some(name) = &defined
+            .then_some(())
+            .and(content.name.as_ref())
             && self.scene().is_name_taken(name, None)
         {
-            out.error = Some(ConsoleError {
-                message: format!("a node named `{name}` already exists"),
-                span: None,
-            });
-            return;
+            return fail(out, format!("a node named `{name}` already exists"));
         }
-        match self.add_node(None, content) {
-            Ok(id) => {
-                // The node now provides the name; drop the console shadow.
-                if let Some(name) = &defined {
-                    self.console.session.env.remove(name);
+        let mut plan = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(n) = &content.name {
+            seen.insert(canonical_name(n).to_string());
+        }
+        if let Err(m) = self.pin_plan(&content, &mut seen, &mut plan) {
+            return fail(out, m);
+        }
+        plan.push(content);
+        let scene = self.scene_mut();
+        scene.begin_group("Pin from console");
+        let mut ids = Vec::new();
+        let mut error = None;
+        for c in plan {
+            match scene.add(None, c) {
+                Ok(id) => ids.push(id),
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
                 }
-                let shown = self
-                    .value(id)
-                    .map(|v| (v.exact.clone(), v.approx.clone()))
-                    .unwrap_or_default();
-                out.results.push(ConsoleItem {
-                    exact: shown.0,
-                    approx: shown.1,
-                    kind: ItemKind::Pinned { node: id },
-                });
-                self.console.last = None;
-            }
-            Err(e) => {
-                out.error = Some(ConsoleError {
-                    message: e.to_string(),
-                    span: None,
-                });
             }
         }
+        scene.end_group();
+        if let Some(e) = error {
+            if !ids.is_empty() {
+                self.scene_mut().undo();
+            }
+            self.update();
+            return fail(out, e);
+        }
+        for &id in &ids {
+            self.assign_auto_color(id);
+        }
+        self.update();
+        for id in ids {
+            let (exact, approx) = self
+                .value(id)
+                .map(|v| (v.exact.clone(), v.approx.clone()))
+                .unwrap_or_default();
+            out.results.push(ConsoleItem {
+                exact,
+                approx,
+                kind: ItemKind::Pinned { node: id },
+            });
+        }
+        self.console.last = None;
     }
 
     fn cmd_vars(&self, out: &mut ConsoleOutput) {
@@ -433,8 +623,8 @@ impl Engine {
                 kind: ItemKind::Variable { name, scene: true },
             });
         }
-        for name in self.console.session_names() {
-            if let Some(v) = self.console.session.env.get(&name) {
+        for name in self.console_names() {
+            if let Some(v) = self.console.defs.get(&name) {
                 let item = value_item(v, &settings, ItemKind::Variable { name, scene: false });
                 out.results.push(item);
             }
@@ -442,6 +632,17 @@ impl Engine {
         if out.results.is_empty() {
             out.results.push(ConsoleItem::info("no definitions yet"));
         }
+    }
+}
+
+fn defined_name(lhs: &viscas_core::syntax::Expr) -> Option<String> {
+    match &*lhs.kind {
+        ExprKind::Ident(n) => Some(canonical_name(n).to_string()),
+        ExprKind::Call { callee, .. } => match &*callee.kind {
+            ExprKind::Ident(n) => Some(canonical_name(n).to_string()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

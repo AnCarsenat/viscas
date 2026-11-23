@@ -43,6 +43,7 @@ mod console;
 mod engine;
 mod eval;
 pub mod help;
+pub mod lines;
 mod plot;
 mod settings;
 mod worker;
@@ -52,11 +53,14 @@ mod tests;
 
 pub use complete::{Completion, CompletionKind, completion_start, suggest};
 pub use console::{ConsoleError, ConsoleItem, ConsoleOutput, HISTORY_LIMIT, ItemKind};
-pub use engine::{DEFAULT_PALETTE, Engine, EngineError, FeatureHit, builtins_oracle};
+pub use engine::{
+    DEFAULT_PALETTE, Engine, EngineError, FeatureHit, FeaturesResult, MAX_FEATURE_CURVES,
+    builtins_oracle,
+};
 pub use eval::{NodeValue, SceneEvaluator};
 pub use plot::{
     CompiledPlot, DEFAULT_RANGE, Fn1, Fn2, PlotItem, PlotJob, PlotKind, PlotLayer, PlotShape,
-    PlotStyle, ViewportId, render,
+    PlotStyle, Rebuild, ViewportId, render,
 };
 pub use settings::EngineSettings;
 pub use worker::{PlotPool, PlotResult};
