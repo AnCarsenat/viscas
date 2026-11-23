@@ -123,7 +123,7 @@ approx_cases! {
     pi_ascii: "pi" => std::f64::consts::PI;
     tau_value: "τ" => std::f64::consts::TAU;
     e_value: "e" => std::f64::consts::E;
-    phi_value: "φ" => 1.618_033_988_749_895;
+    phi_value: "φ" => (1.0 + 5.0_f64.sqrt()) / 2.0;
     sqrt2: "√2" => std::f64::consts::SQRT_2;
     irrational_power: "2^(1/2)" => std::f64::consts::SQRT_2;
     sin_value: "sin(1)" => 0.841_470_984_807_896_5;
