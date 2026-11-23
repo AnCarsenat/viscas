@@ -431,8 +431,9 @@ fn duplicate_subtree_with_fresh_names() {
     assert!(!kids.contains(&a) && !kids.contains(&b));
     assert_eq!(titles(&s, &kids), vec!["a_2", "b_2"]);
     assert_eq!(s.parent(kids[0]), Some(f2));
-    // The copy of `b` still references the original `a`.
-    assert_eq!(s.graph().direct_upstream(kids[1]), vec![a]);
+    // The copy is self-contained: `b_2` references `a_2`.
+    assert_eq!(main_src(&s, kids[1]), "a_2 + 1");
+    assert_eq!(s.graph().direct_upstream(kids[1]), vec![kids[0]]);
     assert!(s.undo());
     assert_eq!(s.len(), 4);
 }
@@ -535,9 +536,16 @@ fn graph_changed_event_only_when_graph_changes() {
         },
     )
     .unwrap();
-    assert!(!s.drain_events().contains(&SceneEvent::GraphChanged));
+    assert!(
+        !s.drain_events()
+            .iter()
+            .any(|e| matches!(e, SceneEvent::GraphChanged { .. }))
+    );
     s.set_source(b, SourceField::Main, "2").unwrap();
-    assert!(s.drain_events().contains(&SceneEvent::GraphChanged));
+    assert!(
+        s.drain_events()
+            .contains(&SceneEvent::GraphChanged { touched: vec![b] })
+    );
 }
 
 #[test]

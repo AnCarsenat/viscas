@@ -22,7 +22,7 @@ fn edges_follow_references() {
     assert_eq!(s.graph().direct_upstream(b), vec![a]);
     assert_eq!(s.graph().direct_upstream(p), vec![f]);
     assert_eq!(s.graph().direct_downstream(a), vec![b]);
-    assert!(s.graph().edges().contains(&(f, b)));
+    assert!(s.graph().edges().contains(&(f, b, EdgeKind::Reads)));
 }
 
 #[test]
@@ -197,16 +197,16 @@ fn custom_builtins() {
 #[test]
 fn duplicate_definitions_are_reported_on_all() {
     // Duplicates cannot be created through the API but can come from
-    // documents or from script functions.
-    let mut s = Scene::new();
-    let a = var(&mut s, "a", "1");
-    let sc = s
-        .add(
-            None,
-            NodeContent::script(ScriptLanguage::Viscas, "fn a(x) { return x }"),
-        )
-        .unwrap();
-    let u = var(&mut s, "u", "a");
+    // documents.
+    let s = Scene::load_from_str(
+        r#"(version: 1, nodes: [
+            (id: 1, name: "a", kind: Variable(expr: "1")),
+            (id: 2, kind: Script(source: "fn a(x) { return x }")),
+            (id: 3, name: "u", kind: Variable(expr: "a")),
+        ])"#,
+    )
+    .unwrap();
+    let (a, sc, u) = (NodeId(1), NodeId(2), NodeId(3));
     for id in [a, sc] {
         assert!(has_kind(&s, id, |k| matches!(
             k,
@@ -332,7 +332,7 @@ fn action_reads_create_edges_but_writes_do_not() {
     assert_eq!(s.graph().direct_upstream(act), vec![b]);
     assert!(s.downstream(act).is_empty());
     assert!(s.downstream(a).is_empty());
-    assert_eq!(s.analysis(act).unwrap().writes, vec!["a"]);
+    assert_eq!(s.analysis(act).unwrap().written_names(), vec!["a"]);
 }
 
 #[test]
@@ -388,6 +388,7 @@ fn deep_chain_does_not_overflow() {
             style: Style::default(),
             props: Default::default(),
             children: Vec::new(),
+            extra: Default::default(),
         })
         .collect();
     let s = Scene::from_document(Document {
@@ -395,6 +396,7 @@ fn deep_chain_does_not_overflow() {
         next_id: 0,
         nodes,
         layout: None,
+        extra: Default::default(),
     })
     .unwrap();
     let first = s.lookup("v_0").unwrap();

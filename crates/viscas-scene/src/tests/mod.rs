@@ -7,6 +7,7 @@ mod graph;
 mod history;
 mod names;
 mod repoint;
+mod review;
 mod tree;
 
 use crate::*;

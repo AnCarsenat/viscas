@@ -124,7 +124,7 @@ fn regression_params_are_bound_and_defined() {
 fn action_targets_are_writes() {
     let a = analyze(&NodeContent::action("a -> a + b, c -> 0"));
     assert_eq!(a.referenced_names(), vec!["a", "b"]);
-    assert_eq!(a.writes, vec!["a", "c"]);
+    assert_eq!(a.written_names(), vec!["a", "c"]);
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn script_assignment_is_a_write_and_local_functions_bind() {
         "a = b + 1\ng(x) = x + c\ng(2)",
     ));
     assert_eq!(a.referenced_names(), vec!["b", "c"]);
-    assert_eq!(a.writes, vec!["a"]);
+    assert_eq!(a.written_names(), vec!["a"]);
 }
 
 #[test]

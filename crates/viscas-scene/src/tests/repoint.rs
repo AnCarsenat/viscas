@@ -145,7 +145,11 @@ fn repoint_edge_between_nodes() {
     assert_eq!(main_src(&s, p), "y = b x");
     assert_eq!(s.graph().direct_upstream(p), vec![b]);
     let note = s.add(None, NodeContent::note("hi")).unwrap();
-    assert!(s.repoint_edge(p, note, a).is_err());
+    assert_eq!(s.repoint_edge(p, note, a), Ok(0), "no such edge");
+    assert_eq!(
+        s.repoint_edge(p, b, note),
+        Err(SceneError::NotDefining(note))
+    );
 }
 
 #[test]

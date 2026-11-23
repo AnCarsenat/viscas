@@ -174,7 +174,9 @@ fn undo_rename_refactor_is_one_step() {
     let a = var(&mut s, "a", "1");
     var(&mut s, "b", "a + 1");
     var(&mut s, "c", "2a");
-    check_undo_redo(&mut s, |s| s.rename_refactor(a, "k").unwrap());
+    check_undo_redo(&mut s, |s| {
+        s.rename_refactor(a, "k").unwrap();
+    });
 }
 
 #[test]
