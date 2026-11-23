@@ -5,7 +5,7 @@
 pub mod css;
 pub mod model;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use gtk::prelude::*;
 use gtk::{gdk, glib};
@@ -15,6 +15,8 @@ use crate::prefs::Preferences;
 thread_local! {
     /// The installed provider and the stylesheet it currently holds.
     static PROVIDER: RefCell<Option<(gtk::CssProvider, String)>> = const { RefCell::new(None) };
+    /// The color scheme last given to GTK.
+    static LAST_DARK: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Stylesheet options taken from the preferences.
@@ -35,7 +37,9 @@ pub fn apply(prefs: &Preferences) {
         return;
     };
     let theme = prefs.effective_theme();
-    set_color_scheme(&display, theme.dark);
+    if LAST_DARK.replace(Some(theme.dark)) != Some(theme.dark) {
+        set_color_scheme(&display, theme.dark);
+    }
     let sheet = css::stylesheet(&theme, &style_options(prefs));
     PROVIDER.with_borrow_mut(|slot| match slot {
         Some((_, current)) if *current == sheet => {}

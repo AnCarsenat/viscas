@@ -282,7 +282,7 @@ impl Palette {
         let match_color = i
             .ctx
             .preferences()
-            .with(|p| p.effective_theme().ui.accent_text.to_hex());
+            .with(|p| p.effective_theme().ui.accent_text.to_rgb_hex());
         let ranked = fuzzy::rank(&query, commands.iter().map(|c| c.title.as_str()));
         while let Some(child) = i.list.first_child() {
             i.list.remove(&child);

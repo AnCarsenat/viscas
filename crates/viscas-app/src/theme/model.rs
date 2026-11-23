@@ -85,6 +85,11 @@ impl Color {
         }
     }
 
+    /// `#rrggbb`, ignoring alpha (for Pango markup).
+    pub fn to_rgb_hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+
     /// CSS value: `#rrggbb`, or `rgba(r, g, b, a)` when not opaque.
     pub fn to_css(self) -> String {
         if self.a == 255 {
@@ -459,8 +464,8 @@ impl Theme {
     }
 
     /// Serializes to TOML.
-    pub fn to_toml(&self) -> String {
-        toml::to_string_pretty(self).unwrap_or_default()
+    pub fn to_toml(&self) -> Result<String, String> {
+        toml::to_string_pretty(self).map_err(|e| e.to_string())
     }
 
     /// Parses a theme file. Missing fields come from the built-in base
@@ -727,6 +732,7 @@ mod tests {
             "rgba(255, 255, 255, 0.502)"
         );
         assert_eq!(Color::hex(0x123456).to_css(), "#123456");
+        assert_eq!(Color::hexa(0x123456, 0.5).to_rgb_hex(), "#123456");
     }
 
     #[test]
@@ -797,7 +803,7 @@ mod tests {
     #[test]
     fn toml_round_trip() {
         for theme in builtins() {
-            let text = theme.to_toml();
+            let text = theme.to_toml().unwrap();
             assert_eq!(Theme::from_toml(&text).unwrap(), theme);
         }
     }

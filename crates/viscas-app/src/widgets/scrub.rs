@@ -46,7 +46,8 @@ impl ScrubSpec {
         }
         let scale = 10f64.powi(self.digits as i32);
         let rounded = (v * scale).round() / scale;
-        rounded.clamp(self.min, self.max)
+        // `+ 0.0` turns -0.0 into 0.0 so it never displays as "-0".
+        rounded.clamp(self.min, self.max) + 0.0
     }
 
     /// `v` moved by `n` steps.
@@ -373,6 +374,13 @@ mod tests {
         assert_eq!(s.normalize(f64::INFINITY), 0.5);
         let inv = ScrubSpec::new(10.0, 0.0, -1.0, 0);
         assert_eq!((inv.min, inv.max, inv.step), (0.0, 10.0, 1.0));
+    }
+
+    #[test]
+    fn negative_zero_displays_as_zero() {
+        let s = ScrubSpec::new(-1.0, 1.0, 0.1, 1);
+        assert_eq!(s.format(s.normalize(-0.01)), "0.0");
+        assert_eq!(s.format(s.stepped(0.1, -1)), "0.0");
     }
 
     #[test]

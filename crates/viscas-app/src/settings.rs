@@ -1,8 +1,7 @@
 //! Runtime glue for preferences: loading at startup, (auto-)saving, user
 //! themes, live theme application and the desktop color scheme.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use gtk::prelude::*;
@@ -16,39 +15,82 @@ use crate::theme;
 /// value does not write the file on every motion event.
 const AUTO_SAVE_DELAY: Duration = Duration::from_millis(600);
 
+thread_local! {
+    /// An automatic save is scheduled.
+    static SAVE_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// A theme application is scheduled on idle.
+    static APPLY_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// The settings portal proxy; kept alive so its signal subscription
+    /// (`SettingChanged`) keeps working.
+    static PORTAL: RefCell<Option<gio::DBusProxy>> = const { RefCell::new(None) };
+}
+
 /// Loads preferences and user themes into `ctx`, applies the theme and
 /// keeps applying/saving it on every change. Call once, after the display
 /// exists.
 pub fn init(ctx: &AppCtx) {
     let store = ctx.preferences();
-    if let Some(path) = prefs::preferences_path() {
-        let (loaded, warnings) = prefs::load(&path);
-        log_all(&warnings);
-        store.replace(loaded);
-    }
     reload_user_themes(ctx);
+    load_into(ctx);
     theme::apply(&store.get());
 
-    let pending = Rc::new(Cell::new(false));
     let weak = ctx.downgrade();
     store.connect_changed(move |p: &Preferences| {
-        theme::apply(p);
-        if p.auto_save && !pending.replace(true) {
-            let pending = pending.clone();
+        // Coalesce bursts (scrubbing, revert) into one stylesheet reload.
+        if !APPLY_PENDING.replace(true) {
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                APPLY_PENDING.set(false);
+                if let Some(ctx) = weak.upgrade() {
+                    theme::apply(&ctx.preferences().get());
+                }
+            });
+        }
+        if p.auto_save && !SAVE_PENDING.replace(true) {
             let weak = weak.clone();
             glib::timeout_add_local_once(AUTO_SAVE_DELAY, move || {
-                pending.set(false);
-                if let Some(ctx) = weak.upgrade()
-                    && ctx.preferences().with(|p| p.auto_save)
-                    && let Err(e) = save_now(&ctx)
-                {
-                    glib::g_warning!("viscas", "auto-save preferences: {e}");
+                if let Some(ctx) = weak.upgrade() {
+                    flush(&ctx);
                 }
             });
         }
         true
     });
     watch_color_scheme(ctx);
+}
+
+/// Writes a scheduled automatic save now (e.g. at shutdown).
+pub fn flush(ctx: &AppCtx) {
+    if SAVE_PENDING.replace(false)
+        && ctx.preferences().with(|p| p.auto_save)
+        && let Err(e) = save_now(ctx)
+    {
+        glib::g_warning!("viscas", "auto-save preferences: {e}");
+    }
+}
+
+/// Loads the preferences file into `ctx`. When part of the file had to be
+/// discarded, the original is backed up first and a notice is recorded.
+fn load_into(ctx: &AppCtx) {
+    let Some(path) = prefs::preferences_path() else {
+        return;
+    };
+    let loaded = prefs::load(&path);
+    log_all(&loaded.warnings);
+    let notice = if loaded.lossy {
+        Some(match prefs::backup(&path) {
+            Ok(bak) => format!(
+                "Some preferences were invalid and reset; original saved as {}",
+                bak.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            ),
+            Err(e) => format!("Some preferences were invalid and reset (backup failed: {e})"),
+        })
+    } else {
+        None
+    };
+    ctx.preferences().set_load_notice(notice);
+    ctx.preferences().replace(loaded.prefs);
 }
 
 fn log_all(warnings: &[String]) {
@@ -59,6 +101,7 @@ fn log_all(warnings: &[String]) {
 
 /// Writes the current preferences now; returns an error message on failure.
 pub fn save_now(ctx: &AppCtx) -> Result<(), String> {
+    SAVE_PENDING.set(false);
     let path = prefs::preferences_path().ok_or("no config directory ($HOME unset)")?;
     prefs::save(&path, &ctx.preferences().get())
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
@@ -66,11 +109,7 @@ pub fn save_now(ctx: &AppCtx) -> Result<(), String> {
 
 /// Reloads the saved preferences (defaults when there is no file).
 pub fn revert(ctx: &AppCtx) {
-    if let Some(path) = prefs::preferences_path() {
-        let (loaded, warnings) = prefs::load(&path);
-        log_all(&warnings);
-        ctx.preferences().replace(loaded);
-    }
+    load_into(ctx);
 }
 
 /// Rescans the user themes directory.
@@ -129,6 +168,7 @@ fn watch_color_scheme(ctx: &AppCtx) {
                     return;
                 }
             };
+            PORTAL.with_borrow_mut(|slot| *slot = Some(proxy.clone()));
             let read_weak = weak.clone();
             proxy.call(
                 "ReadOne",

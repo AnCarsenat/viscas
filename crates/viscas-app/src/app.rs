@@ -15,6 +15,9 @@ pub fn build() -> gtk::Application {
     let ctx = AppCtx::new();
     let startup_ctx = ctx.clone();
     app.connect_startup(move |app| setup(app, &startup_ctx));
+    // Write a pending automatic preferences save before exiting.
+    let shutdown_ctx = ctx.clone();
+    app.connect_shutdown(move |_| settings::flush(&shutdown_ctx));
     app.connect_activate(move |app| {
         let window = app
             .active_window()

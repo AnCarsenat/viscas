@@ -41,7 +41,8 @@ impl Default for StyleOptions {
 
 /// `@define-color vc_<token> <value>;` for every UI color of `theme`.
 pub fn palette_css(theme: &Theme) -> String {
-    let mut out = format!("/* palette: {} */\n", theme.name.replace("*/", ""));
+    // The theme name is user data and deliberately not emitted.
+    let mut out = String::from("/* generated palette */\n");
     for field in UiColors::FIELDS {
         out.push_str(&format!(
             "@define-color vc_{} {};\n",
@@ -54,11 +55,7 @@ pub fn palette_css(theme: &Theme) -> String {
 
 /// CSS font-family list starting with `preferred` (quotes stripped).
 pub fn mono_families(preferred: &str) -> String {
-    let clean: String = preferred
-        .chars()
-        .filter(|c| !matches!(c, '"' | '\\' | ';' | '{' | '}'))
-        .collect();
-    let clean = clean.trim();
+    let clean = crate::prefs::clean_font(preferred);
     if clean.is_empty() {
         MONO_FALLBACK.to_owned()
     } else {
@@ -84,7 +81,8 @@ pub fn stylesheet(theme: &Theme, opts: &StyleOptions) -> String {
 }
 
 /// Multiplies every `<number>px` length in `css` by `factor`, and those of
-/// `font-size` declarations by `font_factor`. Comments are left alone.
+/// `font-size` declarations by `font_factor`. Comments and string
+/// literals are left alone.
 pub fn scale_px(css: &str, factor: f64, font_factor: f64) -> String {
     let bytes = css.as_bytes();
     let mut out = String::with_capacity(css.len());
@@ -94,6 +92,17 @@ pub fn scale_px(css: &str, factor: f64, font_factor: f64) -> String {
         let c = bytes[i];
         if css[i..].starts_with("/*") {
             let end = css[i + 2..].find("*/").map_or(css.len(), |p| i + 2 + p + 2);
+            out.push_str(&css[i..end]);
+            i = end;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            // String literal: copied verbatim (honouring escapes).
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != c {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            let end = (j + 1).min(css.len());
             out.push_str(&css[i..end]);
             i = end;
             continue;
@@ -218,6 +227,31 @@ mod tests {
         assert!(css.contains("\"Fira Code\", \"JetBrains Mono\""));
         assert!(css.contains("font-size: 30px")); // window font: 12 * 15/12 * 2
         assert!(css.contains("tooltip, tooltip.background { opacity: 0; }"));
+    }
+
+    #[test]
+    fn scale_skips_strings() {
+        let css = r#"a { font-family: "Font 10px"; content: '2px\'3px'; padding: 2px; }"#;
+        assert_eq!(
+            scale_px(css, 2.0, 2.0),
+            r#"a { font-family: "Font 10px"; content: '2px\'3px'; padding: 4px; }"#
+        );
+    }
+
+    #[test]
+    fn theme_name_never_reaches_css() {
+        let mut theme = viscas_dark();
+        theme.name = "**//} window { background: red; } /*".to_owned();
+        let css = palette_css(&theme);
+        assert!(!css.contains("red"));
+        assert!(!css.contains("window"));
+    }
+
+    #[test]
+    fn mono_family_is_sanitized() {
+        let fam = mono_families("x\"; } window { color: red; } /*");
+        assert!(fam.starts_with("\"x window color red\", "), "{fam}");
+        assert!(!fam.contains('{') && !fam.contains(';') && !fam.contains('*'));
     }
 
     #[test]
