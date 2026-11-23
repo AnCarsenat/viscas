@@ -1,29 +1,14 @@
 /*
- * Viscas theme — dark, dense, precise.
+ * Viscas stylesheet — dense, precise, themeable.
  *
- * Loaded at APPLICATION priority on top of GTK's built-in Adwaita (forced
- * dark), so everything visible here is ours. Colors are defined once below;
- * the viewport grid colors in src/viewport/draw.rs mirror them.
+ * Loaded at APPLICATION priority on top of GTK's built-in Adwaita (dark or
+ * light to match the theme), so everything visible here is ours. Colors
+ * come only from the generated @vc_* palette; px lengths are scaled by the
+ * UI scale preference and the MONO placeholder is replaced by the monospace family.
  */
 
-/* ---------------------------------------------------------------- palette */
-
-@define-color vc_gap        #111111;  /* gutters between areas */
-@define-color vc_bg0        #181818;  /* top bar, status bar */
-@define-color vc_bg1        #1f1f1f;  /* editor bodies */
-@define-color vc_bg2        #272727;  /* area headers */
-@define-color vc_bg3        #303030;  /* widgets */
-@define-color vc_bg4        #3a3a3a;  /* widget hover */
-@define-color vc_bg5        #454545;  /* widget pressed */
-@define-color vc_border     #0b0b0b;  /* outer 1px borders */
-@define-color vc_line       #333333;  /* inner hairlines */
-@define-color vc_fg         #d2d2d2;
-@define-color vc_fg_strong  #f2f2f2;
-@define-color vc_fg_dim     #9a9a9a;
-@define-color vc_fg_faint   #5f5f5f;
-@define-color vc_accent     #f0883e;  /* the one accent: warm orange */
-@define-color vc_accent_fg  #1a1006;
-@define-color vc_ok         #7fbf6a;
+/* The @vc_* palette is generated from the active theme (src/theme) and
+   prepended at runtime. */
 
 /* GTK's own named colors, so stock widgets follow the palette. */
 @define-color theme_bg_color          @vc_bg1;
@@ -57,7 +42,7 @@ window.background {
 
 window.csd {
   border-radius: 6px;
-  box-shadow: 0 0 0 1px @vc_border, 0 6px 22px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 0 0 1px @vc_border, 0 6px 22px alpha(@vc_shadow, 0.55);
 }
 
 window.maximized,
@@ -78,7 +63,7 @@ selection {
 
 .mono,
 .mono label {
-  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", "Hack", "DejaVu Sans Mono", monospace;
+  font-family: __MONO__;
   font-size: 11px;
   font-feature-settings: "tnum";
 }
@@ -96,7 +81,7 @@ button {
   border: 1px solid @vc_border;
   background: @vc_bg3;
   background-image: none;
-  box-shadow: inset 0 1px alpha(white, 0.04);
+  box-shadow: inset 0 1px alpha(@vc_tint, 0.04);
   color: @vc_fg;
   font-weight: normal;
   transition: background-color 80ms ease-out;
@@ -121,7 +106,7 @@ button.flat:hover,
 menubutton.flat > button:hover,
 .area-header button:hover,
 .topbar button:hover {
-  background-color: alpha(white, 0.07);
+  background-color: alpha(@vc_tint, 0.07);
 }
 
 button.flat:active,
@@ -130,7 +115,7 @@ button.flat:checked,
 .area-header button:checked,
 .topbar button:active,
 .topbar button:checked {
-  background-color: alpha(white, 0.11);
+  background-color: alpha(@vc_tint, 0.11);
 }
 
 button image { -gtk-icon-size: 14px; }
@@ -176,10 +161,10 @@ headerbar.topbar button {
 }
 
 .app-logo {
-  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
+  font-family: __MONO__;
   font-weight: 800;
   font-size: 13px;
-  color: @vc_accent;
+  color: @vc_accent_text;
 }
 
 .app-name {
@@ -201,7 +186,7 @@ popovermenubar > item {
 
 popovermenubar > item:hover,
 popovermenubar > item:selected {
-  background-color: alpha(white, 0.07);
+  background-color: alpha(@vc_tint, 0.07);
   color: @vc_fg;
 }
 
@@ -227,7 +212,7 @@ popovermenubar > item:selected {
 .workspace-tabs button:checked {
   background-color: @vc_bg3;
   color: @vc_fg_strong;
-  box-shadow: inset 0 -2px @vc_accent, inset 0 1px alpha(white, 0.05);
+  box-shadow: inset 0 -2px @vc_accent, inset 0 1px alpha(@vc_tint, 0.05);
 }
 
 .palette-button {
@@ -248,7 +233,7 @@ popovermenubar > item:selected {
 }
 
 .keycap {
-  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", "Hack", monospace;
+  font-family: __MONO__;
   font-size: 10px;
   padding: 0 4px;
   min-height: 14px;
@@ -284,10 +269,10 @@ windowcontrols > button.image-button > image {
   -gtk-icon-size: 12px;
 }
 
-windowcontrols > button:hover { background-color: alpha(white, 0.08); color: @vc_fg; }
+windowcontrols > button:hover { background-color: alpha(@vc_tint, 0.08); color: @vc_fg; }
 
 windowcontrols > button.close:hover {
-  background-color: #b5412e;
+  background-color: @vc_danger;
   color: white;
 }
 
@@ -323,11 +308,11 @@ paned > separator:hover {
   background: @vc_bg2;
   border-bottom: 1px solid @vc_border;
   border-radius: 3px 3px 0 0;
-  box-shadow: inset 0 1px alpha(white, 0.035);
+  box-shadow: inset 0 1px alpha(@vc_tint, 0.035);
 }
 
 .area.active > .area-header {
-  background: #2c2c2c;
+  background: @vc_header_active;
 }
 
 .area.maximized {
@@ -348,19 +333,19 @@ paned > separator:hover {
 .area-header .area-tool:hover { color: @vc_fg; }
 
 .area-header .area-tool.close:hover {
-  color: #ff7a66;
+  color: @vc_danger_text;
 }
 
 .area-header .editor-switch > button {
   padding: 0 4px 0 3px;
   background: @vc_bg3;
   border: 1px solid @vc_border;
-  box-shadow: inset 0 1px alpha(white, 0.04);
+  box-shadow: inset 0 1px alpha(@vc_tint, 0.04);
 }
 
 .area-header .editor-switch > button:hover { background: @vc_bg4; }
 
-.area-header .editor-switch image.editor-icon { color: @vc_accent; }
+.area-header .editor-switch image.editor-icon { color: @vc_accent_text; }
 
 .area-header .editor-switch .editor-title {
   font-weight: 600;
@@ -438,7 +423,7 @@ paned > separator:hover {
   padding: 1px 6px;
   border-radius: 3px;
   border: 1px solid alpha(@vc_accent, 0.45);
-  color: @vc_accent;
+  color: @vc_accent_text;
   background: alpha(@vc_accent, 0.08);
 }
 
@@ -447,7 +432,7 @@ paned > separator:hover {
   padding: 1px 6px;
   border-radius: 3px;
   background: alpha(@vc_bg0, 0.82);
-  border: 1px solid alpha(white, 0.06);
+  border: 1px solid alpha(@vc_tint, 0.06);
   color: @vc_fg_dim;
 }
 
@@ -468,7 +453,7 @@ paned > separator:hover {
 }
 
 .chip {
-  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", "Hack", monospace;
+  font-family: __MONO__;
   font-size: 10px;
   font-weight: 600;
   padding: 0 5px;
@@ -482,7 +467,7 @@ paned > separator:hover {
 .chip.accent {
   border-color: alpha(@vc_accent, 0.5);
   background: alpha(@vc_accent, 0.12);
-  color: @vc_accent;
+  color: @vc_accent_text;
 }
 
 .status-dot {
@@ -498,7 +483,7 @@ popover.menu > contents {
   background: @vc_bg2;
   border: 1px solid @vc_border;
   border-radius: 4px;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 4px 14px alpha(@vc_shadow, 0.5);
   color: @vc_fg;
 }
 
@@ -524,7 +509,7 @@ popover.menu modelbutton:disabled { color: @vc_fg_faint; }
 popover.menu modelbutton accelerator,
 popover.menu modelbutton .accelerator {
   color: @vc_fg_faint;
-  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
+  font-family: __MONO__;
   font-size: 10px;
 }
 
@@ -559,9 +544,9 @@ tooltip,
 tooltip.background {
   padding: 3px 6px;
   border-radius: 3px;
-  background: #0e0e0e;
+  background: @vc_tooltip_bg;
   border: 1px solid @vc_line;
-  color: @vc_fg;
+  color: @vc_tooltip_fg;
   box-shadow: none;
 }
 
@@ -573,7 +558,7 @@ entry {
   border-radius: 3px;
   border: 1px solid @vc_border;
   background: @vc_bg0;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.3);
+  box-shadow: inset 0 1px 2px alpha(@vc_shadow, 0.3);
   color: @vc_fg;
   caret-color: @vc_accent;
 }
@@ -588,7 +573,7 @@ entry image { color: @vc_fg_faint; }
 /* --------------------------------------------------------- command palette */
 
 .palette-backdrop {
-  background: rgba(0, 0, 0, 0.35);
+  background: alpha(@vc_shadow, 0.35);
 }
 
 .palette {
@@ -598,7 +583,7 @@ entry image { color: @vc_fg_faint; }
   background: @vc_bg2;
   border: 1px solid @vc_border;
   border-radius: 6px;
-  box-shadow: 0 0 0 1px alpha(white, 0.05), 0 12px 40px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 0 0 1px alpha(@vc_tint, 0.05), 0 12px 40px alpha(@vc_shadow, 0.6);
 }
 
 .palette entry {
@@ -618,7 +603,7 @@ entry image { color: @vc_fg_faint; }
   color: @vc_fg;
 }
 
-.palette list > row:hover { background: alpha(white, 0.05); }
+.palette list > row:hover { background: alpha(@vc_tint, 0.05); }
 
 .palette list > row:selected {
   background: alpha(@vc_accent, 0.16);
@@ -655,11 +640,11 @@ scrollbar slider {
   min-width: 4px;
   min-height: 4px;
   border-radius: 3px;
-  background: alpha(white, 0.18);
+  background: alpha(@vc_tint, 0.18);
   border: none;
 }
 
-scrollbar slider:hover { background: alpha(white, 0.3); }
+scrollbar slider:hover { background: alpha(@vc_tint, 0.3); }
 
 /* ----------------------------------------------------------------- dialogs */
 
@@ -676,6 +661,220 @@ window.dialog button {
 }
 
 label.shortcut-keys {
-  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
-  color: @vc_accent;
+  font-family: __MONO__;
+  color: @vc_accent_text;
+}
+
+/* ------------------------------------------------------ property widgets */
+
+/* Numeric scrub field: value centered between step arrows. */
+.scrub {
+  min-height: 20px;
+  border-radius: 4px;
+  border: 1px solid @vc_border;
+  background: @vc_bg0;
+  box-shadow: inset 0 1px alpha(@vc_shadow, 0.25);
+  color: @vc_fg;
+}
+
+.scrub:hover { background: mix(@vc_bg0, @vc_bg3, 0.5); }
+
+.scrub.scrubbing,
+.scrub.editing {
+  border-color: alpha(@vc_accent, 0.8);
+}
+
+.scrub .scrub-value {
+  font-feature-settings: "tnum";
+  padding: 0 2px;
+}
+
+.scrub .scrub-entry,
+.scrub .scrub-entry:focus-within {
+  min-height: 18px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  box-shadow: none;
+}
+
+.scrub button.scrub-arrow {
+  min-height: 18px;
+  min-width: 14px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  box-shadow: none;
+  color: @vc_fg_faint;
+}
+
+.scrub button.scrub-arrow image { -gtk-icon-size: 10px; }
+.scrub:hover button.scrub-arrow { color: @vc_fg_dim; }
+.scrub button.scrub-arrow:hover {
+  color: @vc_fg_strong;
+  background: alpha(@vc_tint, 0.08);
+}
+
+/* Color swatch. */
+button.swatch {
+  min-height: 18px;
+  padding: 2px;
+  border-radius: 4px;
+  border: 1px solid @vc_border;
+  background: @vc_bg0;
+  box-shadow: none;
+}
+
+button.swatch:hover { border-color: @vc_fg_faint; }
+
+/* Checkboxes: small rounded squares, accent when checked. */
+checkbutton {
+  min-height: 20px;
+  padding: 0;
+  color: @vc_fg;
+  border-spacing: 6px;
+}
+
+checkbutton check {
+  min-width: 12px;
+  min-height: 12px;
+  margin: 0;
+  padding: 0;
+  border-radius: 3px;
+  border: 1px solid @vc_border;
+  background: @vc_bg0;
+  background-image: none;
+  box-shadow: inset 0 1px alpha(@vc_shadow, 0.25);
+  color: @vc_accent_fg;
+  -gtk-icon-size: 10px;
+}
+
+checkbutton:hover check { background-color: mix(@vc_bg0, @vc_bg3, 0.6); }
+
+checkbutton check:checked {
+  background: @vc_accent;
+  border-color: mix(@vc_accent, @vc_border, 0.5);
+}
+
+/* Drop-downs look like Blender's menu buttons. */
+dropdown > button {
+  min-height: 20px;
+  padding: 0 4px 0 8px;
+  border-radius: 4px;
+}
+
+dropdown > button label { color: @vc_fg; }
+
+dropdown arrow { -gtk-icon-size: 10px; color: @vc_fg_dim; min-width: 10px; }
+
+dropdown popover listview { background: none; }
+
+dropdown popover listview > row {
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 3px;
+}
+
+dropdown popover listview > row:hover,
+dropdown popover listview > row:selected {
+  background: alpha(@vc_accent, 0.85);
+  color: @vc_accent_fg;
+}
+
+/* Collapsible panels with a disclosure triangle. */
+.panel {
+  border-radius: 4px;
+  border: 1px solid @vc_border;
+  background: @vc_bg2;
+}
+
+.panel > button.panel-header {
+  min-height: 22px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 3px 3px 0 0;
+  background: @vc_bg3;
+  box-shadow: inset 0 1px alpha(@vc_tint, 0.04);
+}
+
+.panel.collapsed > button.panel-header { border-radius: 3px; }
+.panel > button.panel-header:hover { background: @vc_bg4; }
+
+.panel .panel-arrow { -gtk-icon-size: 10px; color: @vc_fg_dim; }
+
+.panel .panel-title {
+  font-weight: 600;
+  color: @vc_fg_strong;
+}
+
+.panel .panel-body {
+  padding: 6px 10px 8px;
+  border-top: 1px solid @vc_border;
+}
+
+.prop-row { min-height: 22px; }
+
+.prop-row .prop-label { color: @vc_fg_dim; }
+
+/* ------------------------------------------------------ preferences window */
+
+window.prefs-window {
+  background: @vc_bg1;
+}
+
+.prefs-body { background: @vc_bg1; }
+
+.prefs-sidebar {
+  padding: 8px 6px;
+  background: @vc_bg0;
+  border-right: 1px solid @vc_border;
+}
+
+.prefs-categories { background: none; }
+
+.prefs-categories > row {
+  min-height: 22px;
+  padding: 0 10px;
+  margin-bottom: 2px;
+  border-radius: 4px;
+  color: @vc_fg_dim;
+}
+
+.prefs-categories > row:hover {
+  background: alpha(@vc_tint, 0.06);
+  color: @vc_fg;
+}
+
+.prefs-categories > row:selected {
+  background: @vc_bg3;
+  color: @vc_fg_strong;
+  box-shadow: inset 2px 0 @vc_accent, inset 0 1px alpha(@vc_tint, 0.04);
+}
+
+.prefs-menu > button {
+  min-height: 22px;
+  min-width: 28px;
+  padding: 0 6px;
+}
+
+.prefs-content { background: @vc_bg1; }
+
+.prefs-page {
+  padding: 12px 16px 16px;
+}
+
+.prefs-note {
+  margin: 4px 2px;
+  color: @vc_fg_dim;
+}
+
+.prefs-badge {
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid alpha(@vc_accent, 0.5);
+  background: alpha(@vc_accent, 0.12);
+  color: @vc_accent_text;
+  font-size: 10px;
 }

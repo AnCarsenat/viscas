@@ -10,6 +10,7 @@ use gtk::{cairo, gio};
 
 use crate::ctx::AppCtx;
 use crate::layout::EditorKind;
+use crate::theme::model::{Color, GraphColors};
 use crate::viewport::Viewport;
 
 /// Candidate symbolic icons, most preferred first. Icon themes differ
@@ -68,12 +69,11 @@ pub struct Editor {
 }
 
 impl Editor {
-    /// Creates the editor. `_ctx` gives access to the selection and
-    /// preferences once editors use them (M2).
-    pub fn new(kind: EditorKind, _ctx: &AppCtx) -> Self {
+    /// Creates the editor; it follows the theme and preferences in `ctx`.
+    pub fn new(kind: EditorKind, ctx: &AppCtx) -> Self {
         match kind {
             EditorKind::Viewport => {
-                let viewport = Viewport::new();
+                let viewport = Viewport::new(ctx);
                 Self {
                     kind,
                     widget: viewport.widget().clone(),
@@ -82,12 +82,12 @@ impl Editor {
             }
             EditorKind::DependencyGraph => Self {
                 kind,
-                widget: canvas_placeholder(kind),
+                widget: canvas_placeholder(kind, ctx),
                 viewport: None,
             },
             _ => Self {
                 kind,
-                widget: placeholder(kind),
+                widget: placeholder(kind, ctx),
                 viewport: None,
             },
         }
@@ -150,9 +150,9 @@ fn header_menu(title: &str, items: &[&str]) -> gtk::MenuButton {
         .build()
 }
 
-/// The text block of an empty state: icon, name, description, quip and the
-/// milestone that will implement the editor.
-fn empty_state(kind: EditorKind) -> gtk::Box {
+/// The text block of an empty state: icon, name, description, quip (when
+/// playful microcopy is on) and the milestone that will implement it.
+fn empty_state(kind: EditorKind, ctx: &AppCtx) -> gtk::Box {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(3)
@@ -181,7 +181,17 @@ fn empty_state(kind: EditorKind) -> gtk::Box {
         .wrap(true)
         .justify(gtk::Justification::Center)
         .css_classes(["placeholder-quip"])
+        .visible(ctx.preferences().with(|p| p.interface.playful))
         .build();
+    let weak_quip = quip.downgrade();
+    ctx.preferences()
+        .connect_changed(move |p| match weak_quip.upgrade() {
+            Some(quip) => {
+                quip.set_visible(p.interface.playful);
+                true
+            }
+            None => false,
+        });
     let milestone = gtk::Label::builder()
         .label(format!("planned · {}", kind.milestone()))
         .halign(gtk::Align::Center)
@@ -195,45 +205,66 @@ fn empty_state(kind: EditorKind) -> gtk::Box {
     column
 }
 
-fn placeholder(kind: EditorKind) -> gtk::Widget {
+fn placeholder(kind: EditorKind, ctx: &AppCtx) -> gtk::Widget {
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .hexpand(true)
         .vexpand(true)
         .css_classes(["placeholder"])
-        .child(&empty_state(kind))
+        .child(&empty_state(kind, ctx))
         .build();
     scrolled.upcast()
 }
 
 /// Dependency Graph empty state: a hint of the infinite node canvas (dot
 /// grid and a few capsules wired together) behind the text.
-fn canvas_placeholder(kind: EditorKind) -> gtk::Widget {
+fn canvas_placeholder(kind: EditorKind, ctx: &AppCtx) -> gtk::Widget {
     let canvas = gtk::DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
         .build();
-    canvas.set_draw_func(|_, cr, w, h| draw_canvas_hint(cr, f64::from(w), f64::from(h)));
+    let draw_ctx = ctx.downgrade();
+    canvas.set_draw_func(move |_, cr, w, h| {
+        if let Some(ctx) = draw_ctx.upgrade() {
+            let colors = ctx.preferences().with(|p| p.effective_theme().dep_graph);
+            draw_canvas_hint(cr, f64::from(w), f64::from(h), &colors);
+        }
+    });
+    let weak_canvas = canvas.downgrade();
+    ctx.preferences()
+        .connect_changed(move |_| match weak_canvas.upgrade() {
+            Some(canvas) => {
+                canvas.queue_draw();
+                true
+            }
+            None => false,
+        });
     let overlay = gtk::Overlay::builder()
         .child(&canvas)
         .css_classes(["placeholder"])
         .build();
-    let text = empty_state(kind);
+    let text = empty_state(kind, ctx);
     text.set_can_target(false);
     overlay.add_overlay(&text);
     overlay.upcast()
 }
 
-fn draw_canvas_hint(cr: &cairo::Context, w: f64, h: f64) {
+/// Sets `color` as the cairo source.
+fn set(cr: &cairo::Context, color: Color) {
+    let (r, g, b, a) = color.rgba_f64();
+    cr.set_source_rgba(r, g, b, a);
+}
+
+fn draw_canvas_hint(cr: &cairo::Context, w: f64, h: f64, colors: &GraphColors) {
     if w <= 0.0 || h <= 0.0 {
         return;
     }
-    cr.set_source_rgb(0.098, 0.098, 0.098);
+    set(cr, colors.background);
     let _ = cr.paint();
 
     // Dot grid.
     const STEP: f64 = 18.0;
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.07);
+    set(cr, colors.dots);
     let mut y = (h / 2.0) % STEP;
     while y < h {
         let mut x = (w / 2.0) % STEP;
@@ -254,7 +285,7 @@ fn draw_canvas_hint(cr: &cairo::Context, w: f64, h: f64) {
         (cx + 160.0, cy + 130.0, 128.0),
     ];
     cr.set_line_width(1.0);
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.07);
+    set(cr, colors.wire);
     let wires = [(0, 1), (2, 3), (0, 3)];
     for (from, to) in wires {
         let (ax, ay, aw) = capsules[from];
@@ -268,15 +299,15 @@ fn draw_canvas_hint(cr: &cairo::Context, w: f64, h: f64) {
     }
     for (x, y, width) in capsules {
         capsule(cr, x + 0.5, y + 0.5, width, 22.0);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.025);
+        set(cr, colors.capsule);
         let _ = cr.fill_preserve();
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.09);
+        set(cr, colors.capsule_border);
         let _ = cr.stroke();
         // Ports, the right one in the accent color.
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.16);
+        set(cr, colors.port);
         cr.arc(x, y + 11.0, 2.5, 0.0, 2.0 * PI);
         let _ = cr.fill();
-        cr.set_source_rgba(0.941, 0.533, 0.243, 0.45);
+        set(cr, colors.port_active);
         cr.arc(x + width, y + 11.0, 2.5, 0.0, 2.0 * PI);
         let _ = cr.fill();
     }

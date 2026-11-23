@@ -56,6 +56,7 @@ impl CommandProvider for WindowCommands {
 pub fn specs() -> Vec<(String, String, &'static str)> {
     let mut list: Vec<(String, String, &'static str)> = [
         ("win.palette", "Command Palette", "General"),
+        ("app.preferences", "Preferences…", "General"),
         ("app.shortcuts", "Keyboard Shortcuts", "Help"),
         ("app.about", "About Viscas", "Help"),
         ("app.quit", "Quit", "General"),

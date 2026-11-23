@@ -4,16 +4,17 @@ use gtk::gio;
 use gtk::prelude::*;
 
 use crate::ctx::AppCtx;
-use crate::{shortcuts, theme, window};
+use crate::{prefs_window, settings, shortcuts, window};
 
 pub const APP_ID: &str = "io.github.ancarsenat.Viscas";
 
 /// Creates the application with all actions and accelerators installed.
 pub fn build() -> gtk::Application {
     let app = gtk::Application::builder().application_id(APP_ID).build();
-    app.connect_startup(setup);
     // One context for the application, shared by every window.
     let ctx = AppCtx::new();
+    let startup_ctx = ctx.clone();
+    app.connect_startup(move |app| setup(app, &startup_ctx));
     app.connect_activate(move |app| {
         let window = app
             .active_window()
@@ -23,8 +24,8 @@ pub fn build() -> gtk::Application {
     app
 }
 
-fn setup(app: &gtk::Application) {
-    theme::install();
+fn setup(app: &gtk::Application, ctx: &AppCtx) {
+    settings::init(ctx);
 
     let quit = gio::ActionEntry::builder("quit")
         .activate(|app: &gtk::Application, _, _| app.quit())
@@ -35,7 +36,11 @@ fn setup(app: &gtk::Application) {
     let shortcuts = gio::ActionEntry::builder("shortcuts")
         .activate(|app: &gtk::Application, _, _| show_shortcuts(app))
         .build();
-    app.add_action_entries([quit, about, shortcuts]);
+    let prefs_ctx = ctx.clone();
+    let preferences = gio::ActionEntry::builder("preferences")
+        .activate(move |app: &gtk::Application, _, _| prefs_window::present(app, &prefs_ctx, None))
+        .build();
+    app.add_action_entries([quit, about, shortcuts, preferences]);
 
     shortcuts::install(app);
 }

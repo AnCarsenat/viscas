@@ -1,7 +1,8 @@
 //! Application context shared by the window, areas, editors and commands.
 //!
 //! [`AppCtx`] is created once in `app.rs` and passed down; cloning is cheap.
-//! It holds application state that is *not* layout: preferences, the shared
+//! It holds application state that is *not* layout: observable preferences
+//! (see [`PrefsStore`]), the shared
 //! selection/hover model, and the command providers the palette queries.
 //! The area layout itself stays pure UI state owned by `Areas`.
 
@@ -9,6 +10,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::commands::{Command, CommandProvider};
+use crate::prefs::Preferences;
+use crate::theme::model::{self, Theme};
 
 /// Placeholder node id until `viscas-scene` provides real node handles.
 pub type NodeId = u64;
@@ -73,33 +76,114 @@ impl Selection {
     }
 }
 
-/// User preferences. Placeholder for `feat/preferences`, which will load
-/// and save `~/.config/viscas/preferences.toml` and drive the theme.
-pub struct Preferences {
-    theme: RefCell<String>,
+type PrefsListener = Rc<dyn Fn(&Preferences) -> bool>;
+
+/// Observable user preferences plus the themes available to choose from.
+///
+/// Every change goes through [`PrefsStore::update`], which validates the
+/// result and notifies listeners when something actually changed.
+#[derive(Default)]
+pub struct PrefsStore {
+    prefs: RefCell<Preferences>,
+    listeners: RefCell<Vec<PrefsListener>>,
+    user_themes: RefCell<Vec<Theme>>,
+    /// Desktop color scheme: `Some(true)` for dark, `None` when unknown.
+    system_dark: Cell<Option<bool>>,
 }
 
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            theme: RefCell::new("Viscas Dark".to_owned()),
+impl PrefsStore {
+    /// A copy of the current preferences.
+    pub fn get(&self) -> Preferences {
+        self.prefs.borrow().clone()
+    }
+
+    /// Reads the current preferences without copying them.
+    pub fn with<R>(&self, f: impl FnOnce(&Preferences) -> R) -> R {
+        f(&self.prefs.borrow())
+    }
+
+    /// Edits the preferences; listeners run if anything changed.
+    pub fn update(&self, f: impl FnOnce(&mut Preferences)) {
+        let changed = {
+            let mut prefs = self.prefs.borrow_mut();
+            let before = prefs.clone();
+            f(&mut prefs);
+            prefs.validate();
+            self.follow_system(&mut prefs);
+            *prefs != before
+        };
+        if changed {
+            self.notify();
         }
     }
-}
 
-impl Preferences {
-    #[allow(
-        dead_code,
-        reason = "read by the preferences window (feat/preferences)"
-    )]
-    pub fn theme_name(&self) -> String {
-        self.theme.borrow().clone()
+    /// Replaces every preference (revert, factory settings).
+    pub fn replace(&self, prefs: Preferences) {
+        self.update(move |p| *p = prefs);
+    }
+
+    /// Calls `f` after every change. `f` returns `false` to disconnect
+    /// (e.g. when the widget it updates is gone); it must not capture the
+    /// owning [`AppCtx`] strongly.
+    pub fn connect_changed(&self, f: impl Fn(&Preferences) -> bool + 'static) {
+        self.listeners.borrow_mut().push(Rc::new(f));
+    }
+
+    fn notify(&self) {
+        let prefs = self.get();
+        let listeners = self.listeners.borrow().clone();
+        let dead: Vec<PrefsListener> = listeners.into_iter().filter(|f| !f(&prefs)).collect();
+        if !dead.is_empty() {
+            self.listeners
+                .borrow_mut()
+                .retain(|f| !dead.iter().any(|d| Rc::ptr_eq(d, f)));
+        }
+    }
+
+    /// Built-in themes followed by the user's themes.
+    pub fn themes(&self) -> Vec<Theme> {
+        let mut list = model::builtins();
+        list.extend(self.user_themes.borrow().iter().cloned());
+        list
+    }
+
+    pub fn set_user_themes(&self, themes: Vec<Theme>) {
+        *self.user_themes.borrow_mut() = themes;
+    }
+
+    pub fn system_dark(&self) -> Option<bool> {
+        self.system_dark.get()
+    }
+
+    /// Records the desktop color scheme and, when following it, switches
+    /// between the dark and light built-in themes.
+    pub fn set_system_dark(&self, dark: Option<bool>) {
+        if self.system_dark.replace(dark) != dark {
+            self.update(|_| {});
+        }
+    }
+
+    fn follow_system(&self, prefs: &mut Preferences) {
+        let Some(dark) = self.system_dark.get() else {
+            return;
+        };
+        if prefs.system.follow_system && prefs.theme.dark != dark {
+            let name = if dark {
+                model::DARK_NAME
+            } else {
+                model::LIGHT_NAME
+            };
+            if let Some(theme) = model::builtin(name) {
+                prefs.theme = theme;
+                prefs.themes.preset = name.to_owned();
+            }
+        }
     }
 }
 
 #[derive(Default)]
 struct Inner {
-    preferences: Preferences,
+    preferences: PrefsStore,
     selection: Selection,
     providers: RefCell<Vec<Rc<dyn CommandProvider>>>,
 }
@@ -110,16 +194,26 @@ pub struct AppCtx {
     inner: Rc<Inner>,
 }
 
+/// Weak handle to an [`AppCtx`], for closures owned by the context itself.
+#[derive(Clone)]
+pub struct WeakCtx(std::rc::Weak<Inner>);
+
+impl WeakCtx {
+    pub fn upgrade(&self) -> Option<AppCtx> {
+        self.0.upgrade().map(|inner| AppCtx { inner })
+    }
+}
+
 impl AppCtx {
     pub fn new() -> Self {
         Self::default()
     }
 
-    #[allow(
-        dead_code,
-        reason = "read by the preferences window (feat/preferences)"
-    )]
-    pub fn preferences(&self) -> &Preferences {
+    pub fn downgrade(&self) -> WeakCtx {
+        WeakCtx(Rc::downgrade(&self.inner))
+    }
+
+    pub fn preferences(&self) -> &PrefsStore {
         &self.inner.preferences
     }
 
@@ -171,6 +265,36 @@ mod tests {
         sel.connect_changed(|s| s.connect_changed(|_| {}));
         sel.set_hovered(Some(1));
         sel.set_hovered(None);
+    }
+
+    #[test]
+    fn prefs_notify_on_change_and_drop_dead_listeners() {
+        let store = PrefsStore::default();
+        let count = Rc::new(Cell::new(0));
+        let c = count.clone();
+        store.connect_changed(move |_| {
+            c.set(c.get() + 1);
+            true
+        });
+        store.connect_changed(|_| false);
+        store.update(|p| p.interface.playful = false);
+        store.update(|p| p.interface.playful = false);
+        assert_eq!(count.get(), 1);
+        assert_eq!(store.listeners.borrow().len(), 1);
+        // Validation runs on every update.
+        store.update(|p| p.interface.ui_scale = 50.0);
+        assert_eq!(store.get().interface.ui_scale, 2.0);
+    }
+
+    #[test]
+    fn prefs_follow_system_scheme() {
+        let store = PrefsStore::default();
+        store.set_system_dark(Some(false));
+        assert!(store.get().theme.dark, "not following yet");
+        store.update(|p| p.system.follow_system = true);
+        assert_eq!(store.get().theme.name, model::LIGHT_NAME);
+        store.set_system_dark(Some(true));
+        assert_eq!(store.get().themes.preset, model::DARK_NAME);
     }
 
     struct Fixed(&'static str);
