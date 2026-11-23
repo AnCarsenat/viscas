@@ -62,6 +62,10 @@ pub struct Evaluator<'a> {
     steps: u64,
     /// Stack address when the evaluator was created (stack budget origin).
     stack_base: usize,
+    /// List elements created so far (ranges, comprehensions).
+    elements: u64,
+    /// Captured variables of the closure being executed (shared).
+    captured: Arc<Vec<(String, Value)>>,
     pi: Option<Number>,
     _guard: Option<InterruptGuard>,
 }
@@ -89,6 +93,8 @@ impl<'a> Evaluator<'a> {
             depth: 0,
             steps: 0,
             stack_base,
+            elements: 0,
+            captured: Arc::new(Vec::new()),
             pi: None,
             _guard: guard,
         }
@@ -101,8 +107,34 @@ impl<'a> Evaluator<'a> {
     // ----- budgets -------------------------------------------------------
 
     /// Counts one evaluation step; polls the interrupt flag periodically.
+    /// Accounts for `n` list elements created by ranges and comprehensions
+    /// (one global budget per evaluator) and charges `n` steps.
+    pub(crate) fn alloc(&mut self, n: u64, span: Span) -> EvalResult<()> {
+        self.elements = self.elements.saturating_add(n);
+        if self.elements > self.opts.max_elements {
+            return Err(EvalError::new(
+                ErrorKind::Other,
+                format!(
+                    "too many list elements created (limit {})",
+                    self.opts.max_elements
+                ),
+                span,
+            ));
+        }
+        self.charge(n, span)
+    }
+
+    #[inline]
     pub(crate) fn tick(&mut self, span: Span) -> EvalResult<()> {
-        self.steps += 1;
+        self.charge(1, span)
+    }
+
+    /// Charges `n` steps of work (vectorised list operations, matrix
+    /// products and ranges charge proportionally to their size) and polls
+    /// the interrupt flag every 1024 steps.
+    pub(crate) fn charge(&mut self, n: u64, span: Span) -> EvalResult<()> {
+        let before = self.steps;
+        self.steps = self.steps.saturating_add(n);
         if self.steps > self.opts.max_steps {
             return Err(EvalError::new(
                 ErrorKind::StepLimit,
@@ -113,7 +145,7 @@ impl<'a> Evaluator<'a> {
                 span,
             ));
         }
-        if self.steps & 1023 == 0
+        if (before >> 10) != (self.steps >> 10)
             && let Some(flag) = &self.opts.interrupt
             && flag.load(AtomicOrdering::Relaxed)
         {
@@ -158,6 +190,11 @@ impl<'a> Evaluator<'a> {
         self.scopes.pop();
     }
 
+    /// Pops the innermost scope and returns its variables.
+    pub(crate) fn take_scope(&mut self) -> Vec<(String, Value)> {
+        self.scopes.pop().unwrap_or_default()
+    }
+
     /// Binds `name` in the innermost scope (creating one if needed).
     pub(crate) fn bind_local(&mut self, name: &str, value: Value) {
         if self.scopes.len() <= self.base {
@@ -193,10 +230,28 @@ impl<'a> Evaluator<'a> {
             .iter()
             .rev()
             .find_map(|s| s.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v))
+            .or_else(|| {
+                self.captured
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v)
+            })
     }
 
+    /// Captured variables of the current closure followed by its locals
+    /// (later entries shadow earlier ones).
     fn visible_locals(&self) -> Vec<(String, Value)> {
-        self.scopes[self.base..].iter().flatten().cloned().collect()
+        self.captured
+            .iter()
+            .chain(self.scopes[self.base..].iter().flatten())
+            .cloned()
+            .collect()
+    }
+
+    /// Names of the visible locals (for statement analysis).
+    pub(crate) fn local_names(&self) -> Vec<String> {
+        self.visible_locals().into_iter().map(|(n, _)| n).collect()
     }
 
     /// Defines a global (fails in a read-only evaluator or for reserved
@@ -288,7 +343,7 @@ impl<'a> Evaluator<'a> {
         self.lookup_local(name).is_some()
             || CONSTANTS.contains(&name)
             || builtins::lookup(name).is_some()
-            || self.env().lookup(name).is_some()
+            || self.env().has(name)
     }
 
     /// Splits an unknown multi-letter name into known pieces (`xy` → `x·y`,
@@ -364,12 +419,20 @@ impl<'a> Evaluator<'a> {
             ExprKind::Call { callee, args } => self.eval_call(callee, args, span),
             ExprKind::Member { expr, name } => self.eval_member(expr, name, span),
             ExprKind::Index { expr, indices } => self.eval_index(expr, indices),
-            ExprKind::List(items) => self.eval_items(items).map(make_list),
+            ExprKind::List(items) => {
+                let v = self.eval_items(items)?;
+                check_nesting(&v, span)?;
+                Ok(make_list(v))
+            }
             ExprKind::Range { start, second, end } => {
                 self.eval_range(start, second.as_ref(), end, span)
             }
             ExprKind::Comprehension { body, bindings } => self.eval_comprehension(body, bindings),
-            ExprKind::Tuple(items) => self.eval_items(items).map(Value::Tuple),
+            ExprKind::Tuple(items) => {
+                let v = self.eval_items(items)?;
+                check_nesting(&v, span)?;
+                Ok(Value::Tuple(v))
+            }
             ExprKind::Piecewise {
                 branches,
                 otherwise,
@@ -519,6 +582,7 @@ impl<'a> Evaluator<'a> {
         let r = self.comprehension(body, bindings, 0, &mut out);
         self.pop_scope();
         r?;
+        check_nesting(&out, body.span)?;
         Ok(make_list(out))
     }
 
@@ -619,35 +683,22 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// Piecewise with list-valued conditions: selects element-wise.
+    /// Piecewise with list-valued conditions: selects element-wise. The
+    /// branch index of every element is computed first; later conditions
+    /// are only evaluated while some element is still unresolved, and a
+    /// branch value only if some element selects it.
+    #[inline(never)]
     fn piecewise_lists(
         &mut self,
         branches: &[Branch],
         otherwise: Option<&Expr>,
-        mut conds: Vec<Value>,
+        conds: Vec<Value>,
         from: usize,
         span: Span,
     ) -> EvalResult<Value> {
-        for b in &branches[from..] {
-            conds.push(self.eval(&b.cond)?);
-        }
-        let len = conds
-            .iter()
-            .find_map(|c| match c {
-                Value::List(l) => Some(l.len()),
-                _ => None,
-            })
-            .expect("a list condition");
-        let mut values = Vec::with_capacity(branches.len());
-        for b in branches {
-            values.push(match &b.value {
-                Some(v) => self.eval(v)?,
-                None => Value::num(self.mode_num(Number::one())),
-            });
-        }
-        let other = match otherwise {
-            Some(o) => self.eval(o)?,
-            None => Value::Undefined,
+        let len = match conds.last() {
+            Some(Value::List(l)) => l.len(),
+            _ => unreachable!("called with a list condition last"),
         };
         let pick = |v: &Value, i: usize| -> EvalResult<Value> {
             match v {
@@ -656,17 +707,41 @@ impl<'a> Evaluator<'a> {
                 other => Ok(other.clone()),
             }
         };
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            let mut chosen = None;
-            for (k, c) in conds.iter().enumerate() {
-                if self.truth(&pick(c, i)?, span)? {
-                    chosen = Some(pick(&values[k], i)?);
-                    break;
+        // Earlier scalar conditions were all false; `None` = unresolved.
+        let mut choice: Vec<Option<usize>> = vec![None; len];
+        let mut k = from - 1;
+        let mut cond = conds.into_iter().last();
+        loop {
+            let c = cond.take().expect("condition");
+            self.charge(len as u64, span)?;
+            for (i, ch) in choice.iter_mut().enumerate() {
+                if ch.is_none() && self.truth(&pick(&c, i)?, span)? {
+                    *ch = Some(k);
                 }
             }
-            out.push(match chosen {
-                Some(v) => v,
+            k += 1;
+            if k >= branches.len() || choice.iter().all(Option::is_some) {
+                break;
+            }
+            cond = Some(self.eval(&branches[k].cond)?);
+        }
+        let mut values: Vec<Option<Value>> = vec![None; branches.len()];
+        for b in choice.iter().flatten() {
+            if values[*b].is_none() {
+                values[*b] = Some(match &branches[*b].value {
+                    Some(v) => self.eval(v)?,
+                    None => Value::num(self.mode_num(Number::one())),
+                });
+            }
+        }
+        let other = match otherwise {
+            Some(o) if choice.iter().any(Option::is_none) => self.eval(o)?,
+            _ => Value::Undefined,
+        };
+        let mut out = Vec::with_capacity(len);
+        for (i, ch) in choice.iter().enumerate() {
+            out.push(match ch {
+                Some(b) => pick(values[*b].as_ref().expect("evaluated"), i)?,
                 None => pick(&other, i)?,
             });
         }
@@ -716,6 +791,14 @@ impl<'a> Evaluator<'a> {
                         .map(|(v, keep)| if keep { v } else { Value::Undefined })
                         .collect(),
                 )),
+                Value::List(items) => Err(EvalError::other(
+                    format!(
+                        "restriction has {} conditions for a list of {} elements",
+                        m.len(),
+                        items.len()
+                    ),
+                    expr.span,
+                )),
                 other => Ok(Value::List(
                     m.into_iter()
                         .map(|keep| {
@@ -746,6 +829,7 @@ impl<'a> Evaluator<'a> {
                     body.span,
                 ));
             }
+            self.alloc(1, body.span)?;
             out.push(self.eval(body)?);
             return Ok(());
         };
@@ -820,11 +904,9 @@ impl<'a> Evaluator<'a> {
             return Err(EvalError::other("range has too many elements", span));
         }
         let n = n as usize;
+        self.alloc(n as u64 + 1, span)?;
         let mut out = Vec::with_capacity(n + 1);
         for k in 0..=n {
-            if k & 255 == 0 {
-                self.tick(span)?;
-            }
             out.push(Value::Number(a + &(&step * &Number::from(k as u64))));
         }
         Ok(Value::List(out))
@@ -928,7 +1010,10 @@ impl<'a> Evaluator<'a> {
                         ));
                     }
                     1 => argv.into_iter().next().expect("one"),
-                    _ => Value::Tuple(argv),
+                    _ => {
+                        check_nesting(&argv, span)?;
+                        Value::Tuple(argv)
+                    }
                 };
                 self.arith(Arith::Mul, other, rhs, span)
             }
@@ -988,7 +1073,7 @@ impl<'a> Evaluator<'a> {
                     return Err(arity_error(f.name(), n, n, args.len(), span));
                 }
                 self.enter(span)?;
-                let mut frame = u.captured.clone();
+                let mut frame = Vec::with_capacity(u.params.len() + 1);
                 if let Some(name) = &u.name {
                     frame.push((name.clone(), Value::Function(f.clone())));
                 }
@@ -996,6 +1081,7 @@ impl<'a> Evaluator<'a> {
                     frame.push((p.clone(), a));
                 }
                 let saved_base = self.base;
+                let saved_captured = std::mem::replace(&mut self.captured, u.captured.clone());
                 self.base = self.scopes.len();
                 self.scopes.push(frame);
                 let r = match &u.body {
@@ -1004,6 +1090,7 @@ impl<'a> Evaluator<'a> {
                 };
                 self.scopes.truncate(self.base);
                 self.base = saved_base;
+                self.captured = saved_captured;
                 self.depth -= 1;
                 r
             }
@@ -1240,7 +1327,7 @@ impl<'a> Evaluator<'a> {
                 .map(|p| canonical_name(p).to_string())
                 .collect(),
             body,
-            captured: self.visible_locals(),
+            captured: Arc::new(self.visible_locals()),
         })))
     }
 
@@ -1378,6 +1465,46 @@ pub(crate) fn with_restrictions(e: &Expr, restrictions: &[Expr]) -> Expr {
     }
 }
 
+/// Maximum nesting of lists/points inside each other. Bounding it keeps
+/// every recursive walk over values (clone, drop, display, broadcasting)
+/// shallow, so `x = [x]` in a loop is an error instead of a stack overflow.
+pub(crate) const MAX_NESTING: usize = 32;
+
+/// Nesting depth of a value (0 for scalars), counted up to `limit`.
+fn nesting(v: &Value, limit: usize) -> usize {
+    let items = match v {
+        Value::List(items) | Value::Tuple(items) => items,
+        Value::Matrix(_) => return 2,
+        _ => return 0,
+    };
+    if limit == 0 {
+        return 1;
+    }
+    1 + items
+        .iter()
+        .map(|i| nesting(i, limit - 1))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Fails if wrapping `items` in a list/point would exceed [`MAX_NESTING`].
+pub(crate) fn check_nesting(items: &[Value], span: Span) -> EvalResult<()> {
+    let deepest = items
+        .iter()
+        .filter(|v| matches!(v, Value::List(_) | Value::Tuple(_)))
+        .map(|v| nesting(v, MAX_NESTING))
+        .max()
+        .unwrap_or(0);
+    if deepest >= MAX_NESTING {
+        return Err(EvalError::new(
+            ErrorKind::DepthLimit,
+            format!("lists nested more than {MAX_NESTING} levels deep"),
+            span,
+        ));
+    }
+    Ok(())
+}
+
 /// A list literal of equal-length numeric rows becomes a [`Matrix`].
 pub(crate) fn make_list(items: Vec<Value>) -> Value {
     if matches!(items.first(), Some(Value::List(_)))
@@ -1436,27 +1563,40 @@ pub(crate) fn split_with(name: &str, known: &dyn Fn(&str) -> bool) -> Option<Vec
     if let Some(last) = atoms.last_mut() {
         last.push_str(sub);
     }
-    fn go(atoms: &[String], known: &dyn Fn(&str) -> bool, out: &mut Vec<String>) -> bool {
-        if atoms.is_empty() {
+    /// Backtracking split from atom `at`; `failed[i]` memoizes positions
+    /// from which no split exists, so the search is polynomial.
+    fn go(
+        atoms: &[String],
+        at: usize,
+        known: &dyn Fn(&str) -> bool,
+        failed: &mut [bool],
+        out: &mut Vec<String>,
+    ) -> bool {
+        if at == atoms.len() {
             return true;
         }
-        for take in (1..=atoms.len()).rev() {
-            if out.is_empty() && take == atoms.len() {
+        if failed[at] {
+            return false;
+        }
+        for end in (at + 1..=atoms.len()).rev() {
+            if at == 0 && end == atoms.len() {
                 continue; // the whole name is not a split
             }
-            let piece: String = atoms[..take].concat();
+            let piece: String = atoms[at..end].concat();
             if known(&piece) {
                 out.push(piece);
-                if go(&atoms[take..], known, out) {
+                if go(atoms, end, known, failed, out) {
                     return true;
                 }
                 out.pop();
             }
         }
+        failed[at] = true;
         false
     }
     let mut out = Vec::new();
-    go(&atoms, known, &mut out).then_some(out)
+    let mut failed = vec![false; atoms.len()];
+    go(&atoms, 0, known, &mut failed, &mut out).then_some(out)
 }
 
 /// Is `name` a constant or builtin (cannot be a free variable)?

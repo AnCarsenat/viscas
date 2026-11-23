@@ -58,6 +58,11 @@ impl Env {
                 "`{name}` is a built-in name and cannot be redefined"
             ));
         }
+        if PLOT_VARS.contains(&name) {
+            return Err(format!(
+                "`{name}` is a plot variable and cannot be defined globally; use another name (e.g. `{name}_0`) or a `let` local"
+            ));
+        }
         self.globals.insert(name.to_string(), value);
         Ok(())
     }
@@ -87,6 +92,16 @@ impl Env {
         self.resolver.as_ref()
     }
 
+    /// Existence check without cloning global values (the resolver is
+    /// still asked, as it has no separate existence query).
+    pub fn has(&self, name: &str) -> bool {
+        self.globals.contains_key(name)
+            || self
+                .resolver
+                .as_ref()
+                .is_some_and(|r| r.resolve(name).is_some())
+    }
+
     /// Globals first, then the resolver.
     pub fn lookup(&self, name: &str) -> Option<Value> {
         if let Some(v) = self.globals.get(name) {
@@ -109,6 +124,10 @@ pub fn canonical_name(name: &str) -> &str {
         other => other,
     }
 }
+
+/// Plot coordinates: always free in statement analysis and never definable
+/// as globals (they may be parameters and `let` locals).
+pub const PLOT_VARS: &[&str] = &["x", "y", "r", "θ", "t"];
 
 /// Mathematical constants (after [`canonical_name`]).
 pub const CONSTANTS: &[&str] = &["π", "τ", "e", "φ", "i", "∞", "true", "false"];
@@ -151,8 +170,12 @@ pub struct EvalOptions {
     /// stack overflow. The default (1 MiB) suits 2 MiB threads; raise it on
     /// threads with bigger stacks for deeper recursion.
     pub max_stack: usize,
-    /// Maximum number of evaluation steps (one per expression node visited).
+    /// Maximum number of evaluation steps (one per expression node visited;
+    /// list operations, matrix products and ranges charge per element).
     pub max_steps: u64,
+    /// Maximum number of list elements ranges and comprehensions may create
+    /// in one evaluation (memory budget).
+    pub max_elements: u64,
     /// Cooperative cancellation; installed for the number tower as well
     /// (see [`crate::number::install_interrupt`]).
     pub interrupt: Option<Arc<AtomicBool>>,
@@ -178,6 +201,7 @@ impl Default for EvalOptions {
             float64: false,
             max_depth: Self::DEFAULT_MAX_DEPTH,
             max_stack: Self::DEFAULT_MAX_STACK,
+            max_elements: 10_000_000,
             max_steps: Self::DEFAULT_MAX_STEPS,
             interrupt: None,
         }

@@ -469,7 +469,7 @@ fn fold_numbers(
     let nums = number_args(ev, args, span)?;
     let mut it = nums.into_iter();
     let Some(mut acc) = it.next() else {
-        return Ok(Value::Undefined);
+        return Err(EvalError::number(NumberError::Domain("empty list"), span));
     };
     for n in it {
         acc = f(&acc, &n).at(span)?;

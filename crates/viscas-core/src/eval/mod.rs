@@ -27,7 +27,12 @@
 //! - `Undefined` comes from failed restrictions and piecewise expressions
 //!   without a matching branch; it propagates through arithmetic and counts
 //!   as false in conditions. Numeric failures (division by zero, domain
-//!   errors) are *errors* with a span; the plot path turns them into NaN.
+//!   errors) are *errors* with a span. The plot path turns both into NaN
+//!   but keeps them apart (an "undefined" NaN payload counts as false in
+//!   conditions, an error NaN — including infinities — poisons the result),
+//!   matching the general evaluator.
+//! - Exact-style formatting marks every inexact number with `≈`
+//!   (`≈3.14159265359`), so numeric results never claim exactness.
 //!
 //! # Evaluation rules
 //!
@@ -62,7 +67,8 @@
 //!   `v.f(args)` calls `f(v, args)` when `f` is not a member
 //!   (`L.sort()`, `L.sum()`).
 //! - **Calculus.** `∑`/`∏` with integer bounds are exact loops. `d/dx`,
-//!   `f'(x)` and definite `∫` are numeric (`f64` results): 5-point central
+//!   `f'(x)` and definite `∫` are numeric (`f64` results, shown with `≈`
+//!   even in exact mode): 5-point central
 //!   differences, adaptive Gauss–Kronrod 7/15 (infinite bounds by
 //!   substitution). Indefinite integrals, symbolic derivatives and
 //!   infinite sums need the CAS (marked hooks in `calculus.rs`).
@@ -85,7 +91,10 @@
 //!    piece is unknown the error is "unknown name `xy`" with the span.
 //!
 //! Constants and builtins cannot be redefined globally (they can be
-//! shadowed by parameters and `let`).
+//! shadowed by parameters and `let`). Neither can the plot variables
+//! [`PLOT_VARS`] (`x y r θ t`): they are always free in statement analysis
+//! unless bound by a parameter, a binder (`∑`, `∫`, comprehension) or an
+//! explicit `let`.
 //!
 //! **Call vs multiply.** `name(args)` calls `name` if it resolves to a
 //! function; otherwise it multiplies (`a(b + 1)` = `a·(b + 1)`,
@@ -105,10 +114,16 @@
 //! | `x^2 + y^2 = 4`, `xy = 1` | implicit relation |
 //! | `a = 3`, `t^2 = 2` | equation without plot coordinates ([`StatementKind::Equation`], future solve target) |
 //! | `x^2 + y^2 < 4` | inequality |
+//! | `r < 2`, `0 < θ < π/2` | polar inequality |
+//! | `θ = π/4` | polar angle relation |
 //!
 //! At top level ([`exec_statement`], [`Session`]) every `=` statement is a
-//! relation ([`Outcome::Relation`]); [`Session::eval`] reports it as having
-//! no value. With `DefinitionOp::Eq` (set [`Session::parse`] or use
+//! relation ([`Outcome::Relation`]) — except `v = ...` for a visible `let`
+//! variable `v`, which reassigns it; [`Session::eval`] reports a relation
+//! as having no value. [`Session::run`] returns one [`Outcome`] per
+//! statement, and the session keeps its `let` locals between inputs. In
+//! approx mode only the *returned* value is converted to decimals; stored
+//! definitions stay exact. With `DefinitionOp::Eq` (set [`Session::parse`] or use
 //! [`crate::syntax::parse_statement_with`]) `name = ...` / `f(x) = ...`
 //! define as before, except for `x`, `y`, `r` and prefix functions. See
 //! [`StatementKind`] for the classification rules.
@@ -125,7 +140,11 @@
 //! # Budgets and cancellation
 //!
 //! Every visited node costs one step ([`EvalOptions::max_steps`], default
-//! 10 million). Nesting (expression depth + calls) is limited by
+//! 10 million); list operations, matrix products and ranges charge per
+//! element, and ranges/comprehensions share an element budget
+//! ([`EvalOptions::max_elements`], default 10 million). Lists and points
+//! may nest at most 32 levels, which keeps every recursive walk over
+//! values (clone, drop, display, broadcasting) shallow. Nesting (expression depth + calls) is limited by
 //! [`EvalOptions::max_depth`] (default 10 000) *and* by a measured stack
 //! budget, [`EvalOptions::max_stack`] (default 1 MiB of machine stack below
 //! the frame that created the evaluator — safe on 2 MiB threads even in

@@ -14,9 +14,12 @@
 
 use std::sync::Arc;
 
+use num_traits::ToPrimitive;
+
 use super::builtins;
-use super::env::{AngleUnit, Env, EvalOptions, canonical_name};
+use super::env::{AngleUnit, CONSTANTS, Env, EvalOptions, canonical_name};
 use super::error::{EvalError, EvalResult};
+use super::eval_expr;
 use super::interp::{Evaluator, split_with, unknown_name};
 use super::value::{FnBody, Function, Value};
 use crate::number::{Number, Precision, parse_literal};
@@ -53,9 +56,33 @@ enum Node {
     Restrict(Box<Node>, Box<[Node]>),
 }
 
+/// "Undefined" (failed restriction, no matching branch, false condition
+/// outcome): a quiet NaN with payload 1. Every other NaN is an *error*
+/// (domain error, division by zero, ...). In conditions undefined counts
+/// as false, while an error makes the whole result an error, matching the
+/// general evaluator. Both are NaN for the plot layer.
+const UNDEF_BITS: u64 = 0x7ff8_0000_0000_0001;
+const PAYLOAD: u64 = 0x000f_ffff_ffff_ffff;
+
 #[inline]
-fn truth(x: f64) -> bool {
-    x != 0.0 && !x.is_nan()
+fn undef() -> f64 {
+    f64::from_bits(UNDEF_BITS)
+}
+
+#[inline]
+fn is_undef(x: f64) -> bool {
+    x.is_nan() && x.to_bits() & PAYLOAD == UNDEF_BITS & PAYLOAD
+}
+
+#[inline]
+fn is_error(x: f64) -> bool {
+    x.is_nan() && !is_undef(x)
+}
+
+/// Infinite results (overflow, `ln 0`, `0^-1`) are errors.
+#[inline]
+fn fin(x: f64) -> f64 {
+    if x.is_infinite() { f64::NAN } else { x }
 }
 
 #[inline]
@@ -75,37 +102,60 @@ impl Node {
                     let x = t.eval(v);
                     if *neg { acc -= x } else { acc += x }
                 }
-                acc
+                fin(acc)
             }
             Node::Mul(factors) => {
                 let mut acc = 1.0;
                 for (div, f) in factors.iter() {
                     let x = f.eval(v);
-                    if *div { acc /= x } else { acc *= x }
+                    if *div {
+                        if x == 0.0 {
+                            return f64::NAN;
+                        }
+                        acc /= x
+                    } else {
+                        acc *= x
+                    }
                 }
-                acc
+                fin(acc)
             }
-            Node::Pow(a, b) => a.eval(v).powf(b.eval(v)),
-            Node::PowI(a, n) => a.eval(v).powi(*n),
+            Node::Pow(a, b) => fin(a.eval(v).powf(b.eval(v))),
+            Node::PowI(a, n) => fin(a.eval(v).powi(*n)),
             Node::OddRoot(a, p, q) => {
                 let x = a.eval(v);
                 let r = x.abs().powf(1.0 / q).powf(*p);
-                if x < 0.0 && (*p as i64) % 2 != 0 {
+                fin(if x < 0.0 && (*p as i64) % 2 != 0 {
                     -r
                 } else {
                     r
-                }
+                })
             }
             Node::Mod(a, b) => {
                 let (x, y) = (a.eval(v), b.eval(v));
-                x - y * (x / y).floor()
+                if y == 0.0 {
+                    return f64::NAN;
+                }
+                fin(x - y * (x / y).floor())
             }
-            Node::F1(f, a) => f(a.eval(v)),
-            Node::F2(f, a, b) => f(a.eval(v), b.eval(v)),
+            Node::F1(f, a) => {
+                let x = a.eval(v);
+                if is_undef(x) { x } else { fin(f(x)) }
+            }
+            Node::F2(f, a, b) => {
+                let (x, y) = (a.eval(v), b.eval(v));
+                if is_undef(x) || is_undef(y) {
+                    undef()
+                } else {
+                    fin(f(x, y))
+                }
+            }
             Node::Cmp(op, a, b) => {
                 let (x, y) = (a.eval(v), b.eval(v));
-                if x.is_nan() || y.is_nan() {
+                if is_error(x) || is_error(y) {
                     return f64::NAN;
+                }
+                if x.is_nan() || y.is_nan() {
+                    return undef();
                 }
                 bool_f(match op {
                     CmpOp::Lt => x < y,
@@ -116,29 +166,20 @@ impl Node {
                     CmpOp::Ne => x != y,
                 })
             }
-            Node::And(items) => {
+            Node::And(items) | Node::Or(items) => {
+                let is_and = matches!(self, Node::And(_));
                 let mut undefined = false;
                 for it in items.iter() {
                     let x = it.eval(v);
-                    if x.is_nan() {
+                    if is_error(x) {
+                        return f64::NAN;
+                    } else if x.is_nan() {
                         undefined = true;
-                    } else if x == 0.0 {
-                        return 0.0;
+                    } else if (x != 0.0) != is_and {
+                        return bool_f(!is_and);
                     }
                 }
-                if undefined { f64::NAN } else { 1.0 }
-            }
-            Node::Or(items) => {
-                let mut undefined = false;
-                for it in items.iter() {
-                    let x = it.eval(v);
-                    if x.is_nan() {
-                        undefined = true;
-                    } else if x != 0.0 {
-                        return 1.0;
-                    }
-                }
-                if undefined { f64::NAN } else { 0.0 }
+                if undefined { undef() } else { bool_f(is_and) }
             }
             Node::Not(a) => {
                 let x = a.eval(v);
@@ -146,18 +187,27 @@ impl Node {
             }
             Node::Select(branches, otherwise) => {
                 for (c, val) in branches.iter() {
-                    if truth(c.eval(v)) {
+                    let t = c.eval(v);
+                    if is_error(t) {
+                        return f64::NAN;
+                    }
+                    if t != 0.0 && !t.is_nan() {
                         return val.eval(v);
                     }
                 }
                 otherwise.eval(v)
             }
             Node::Restrict(a, conds) => {
-                if conds.iter().all(|c| truth(c.eval(v))) {
-                    a.eval(v)
-                } else {
-                    f64::NAN
+                for c in conds.iter() {
+                    let t = c.eval(v);
+                    if is_error(t) {
+                        return f64::NAN;
+                    }
+                    if t == 0.0 || t.is_nan() {
+                        return undef();
+                    }
                 }
+                a.eval(v)
             }
         }
     }
@@ -212,6 +262,8 @@ struct Compiler<'a> {
     locals: Vec<(String, Node)>,
     degrees: bool,
     inline_depth: usize,
+    /// Exact-mode options for evaluating constant exponents.
+    exact_opts: EvalOptions,
 }
 
 const DEG: f64 = std::f64::consts::PI / 180.0;
@@ -275,11 +327,22 @@ impl Compiler<'_> {
             .map(|(_, v)| v.clone())
     }
 
+    /// Plot variable index; inside inlined function bodies the plot
+    /// variables are not visible (a global function body cannot see them in
+    /// the general evaluator either).
+    fn var_index(&self, name: &str) -> Option<usize> {
+        if self.inline_depth > 0 {
+            return None;
+        }
+        self.vars.iter().position(|v| v == name)
+    }
+
     fn is_known(&self, name: &str) -> bool {
         self.locals.iter().any(|(n, _)| n == name)
-            || self.vars.iter().any(|v| v == name)
-            || matches!(name, "π" | "τ" | "e" | "φ")
-            || self.env.lookup(name).is_some()
+            || self.var_index(name).is_some()
+            || CONSTANTS.contains(&name)
+            || builtins::lookup(name).is_some()
+            || self.env.has(name)
     }
 
     fn ident(&mut self, name: &str, e: &Expr) -> CResult {
@@ -287,7 +350,7 @@ impl Compiler<'_> {
         if let Some(n) = self.lookup_local(name) {
             return Ok(n);
         }
-        if let Some(i) = self.vars.iter().position(|v| v == name) {
+        if let Some(i) = self.var_index(name) {
             return Ok(Node::Var(i));
         }
         let pi = std::f64::consts::PI;
@@ -342,7 +405,14 @@ impl Compiler<'_> {
                 BinOp::Pow => {
                     let base = self.compile(lhs)?;
                     let exp = self.compile(rhs)?;
-                    power(base, exp)
+                    // Decide integer / odd-root exponents from the exact value.
+                    let exact = match exp {
+                        Node::Const(_) => eval_expr(rhs, self.env, &self.exact_opts)
+                            .ok()
+                            .and_then(|v| v.as_number().cloned()),
+                        _ => None,
+                    };
+                    power(base, exp, exact.as_ref())
                 }
                 BinOp::Mod => Node::Mod(Box::new(self.compile(lhs)?), Box::new(self.compile(rhs)?)),
                 BinOp::To => return Err(Fail::Unsupported),
@@ -411,7 +481,7 @@ impl Compiler<'_> {
                 }
                 let o = match otherwise {
                     Some(o) => self.compile(o)?,
-                    None => Node::Const(f64::NAN),
+                    None => Node::Const(undef()),
                 };
                 Node::Select(out.into(), Box::new(o))
             }
@@ -434,7 +504,7 @@ impl Compiler<'_> {
         };
         let name = canonical_name(name);
         // A local or plot variable followed by `(...)` is a product.
-        if self.lookup_local(name).is_some() || self.vars.iter().any(|v| v == name) {
+        if self.lookup_local(name).is_some() || self.var_index(name).is_some() {
             return self.product(callee, args);
         }
         if let Some(b) = builtins::lookup(name) {
@@ -559,17 +629,19 @@ impl Compiler<'_> {
 }
 
 /// `base^exp` with special cases for constant exponents.
-fn power(base: Node, exp: Node) -> Node {
+/// `base^exp`. Integer and odd-root (`p/q`, odd `q`) exponents are decided
+/// from the *exact* exponent value when it is known (`x^(1/3)` is a real
+/// cube root, `x^0.3333` is not).
+fn power(base: Node, exp: Node, exact: Option<&Number>) -> Node {
     if let Node::Const(c) = exp {
         if c.fract() == 0.0 && c.abs() < i32::MAX as f64 {
             return Node::PowI(Box::new(base), c as i32);
         }
-        for q in (3..100u32).step_by(2) {
-            let t = c * q as f64;
-            let p = t.round();
-            if (t - p).abs() < 1e-9 * t.abs().max(1.0) {
-                return Node::OddRoot(Box::new(base), p, q as f64);
-            }
+        if let Some(r) = exact.and_then(Number::to_rational)
+            && let (Some(p), Some(q)) = (r.numer().to_i64(), r.denom().to_u32())
+            && q % 2 == 1
+        {
+            return Node::OddRoot(Box::new(base), p as f64, q as f64);
         }
     }
     Node::Pow(Box::new(base), Box::new(exp))
@@ -631,7 +703,9 @@ impl PlotFn {
                     .collect();
                 ev.push_scope(scope);
                 match ev.eval(&fb.expr) {
-                    Ok(Value::Number(n)) if n.is_real() => n.to_f64(),
+                    Ok(Value::Number(n)) if n.is_real() => fin(n.to_f64()),
+                    Ok(Value::Bool(b)) => bool_f(b),
+                    Ok(Value::Undefined) => undef(),
                     _ => f64::NAN,
                 }
             }
@@ -673,6 +747,12 @@ pub fn compile_plot_fn(
         locals: Vec::new(),
         degrees: opts.angle == AngleUnit::Degrees,
         inline_depth: 0,
+        exact_opts: EvalOptions {
+            float64: false,
+            approx: false,
+            max_steps: 100_000,
+            ..opts.clone()
+        },
     };
     let arity = vars.len();
     match c.compile(expr) {

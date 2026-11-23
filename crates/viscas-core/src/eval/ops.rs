@@ -70,6 +70,7 @@ impl Evaluator<'_> {
                         span,
                     ));
                 }
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for (x, y) in xs.into_iter().zip(ys) {
                     out.push(self.arith(op, x, y, span)?);
@@ -77,6 +78,7 @@ impl Evaluator<'_> {
                 Ok(Value::List(out))
             }
             (Value::List(xs), b) => {
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for x in xs {
                     out.push(self.arith(op, x, b.clone(), span)?);
@@ -84,6 +86,7 @@ impl Evaluator<'_> {
                 Ok(Value::List(out))
             }
             (a, Value::List(ys)) => {
+                self.charge(ys.len() as u64, span)?;
                 let mut out = Vec::with_capacity(ys.len());
                 for y in ys {
                     out.push(self.arith(op, a.clone(), y, span)?);
@@ -115,6 +118,7 @@ impl Evaluator<'_> {
                         span,
                     ));
                 }
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for (x, y) in xs.into_iter().zip(ys) {
                     out.push(self.arith(op, x, y, span)?);
@@ -122,6 +126,7 @@ impl Evaluator<'_> {
                 Ok(Value::Tuple(out))
             }
             (Value::Tuple(xs), y @ Value::Number(_)) if matches!(op, Arith::Mul | Arith::Div) => {
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for x in xs {
                     out.push(self.arith(op, x, y.clone(), span)?);
@@ -129,6 +134,7 @@ impl Evaluator<'_> {
                 Ok(Value::Tuple(out))
             }
             (x @ Value::Number(_), Value::Tuple(ys)) if op == Arith::Mul => {
+                self.charge(ys.len() as u64, span)?;
                 let mut out = Vec::with_capacity(ys.len());
                 for y in ys {
                     out.push(self.arith(op, x.clone(), y, span)?);
@@ -212,6 +218,7 @@ impl Evaluator<'_> {
                 Ok(Value::Number(r))
             }
             Value::List(items) => {
+                self.charge(items.len() as u64, span)?;
                 let mut out = Vec::with_capacity(items.len());
                 for it in items {
                     out.push(self.map_num(it, span, f)?);
@@ -256,6 +263,7 @@ impl Evaluator<'_> {
                 if xs.len() != ys.len() {
                     return Err(EvalError::other("list lengths differ", span));
                 }
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for (x, y) in xs.iter().zip(ys) {
                     out.push(self.zip_num(x, y, span, f)?);
@@ -263,6 +271,7 @@ impl Evaluator<'_> {
                 Ok(Value::List(out))
             }
             (Value::List(xs), y) => {
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for x in xs {
                     out.push(self.zip_num(x, y, span, f)?);
@@ -270,6 +279,7 @@ impl Evaluator<'_> {
                 Ok(Value::List(out))
             }
             (x, Value::List(ys)) => {
+                self.charge(ys.len() as u64, span)?;
                 let mut out = Vec::with_capacity(ys.len());
                 for y in ys {
                     out.push(self.zip_num(x, y, span, f)?);
@@ -329,7 +339,10 @@ impl Evaluator<'_> {
                     data,
                 }))
             }
-            Arith::Mul => mat_mul(m, n, span).map(Value::Matrix),
+            Arith::Mul => {
+                self.charge((m.rows * m.cols * n.cols) as u64, span)?;
+                mat_mul(m, n, span).map(Value::Matrix)
+            }
             _ => Err(EvalError::ty(
                 format!("cannot {} two matrices", op.verb()),
                 span,
@@ -338,6 +351,7 @@ impl Evaluator<'_> {
     }
 
     fn mat_vec(&mut self, m: &Matrix, v: &[Value], span: Span) -> EvalResult<Value> {
+        self.charge((m.rows * m.cols) as u64, span)?;
         if v.len() != m.cols {
             return Err(EvalError::other(
                 format!(
@@ -384,10 +398,12 @@ impl Evaluator<'_> {
         while k > 0 {
             self.tick(span)?;
             if k & 1 == 1 {
+                self.charge((m.rows * m.rows * m.rows) as u64, span)?;
                 result = mat_mul(&result, &base, span)?;
             }
             k >>= 1;
             if k > 0 {
+                self.charge((m.rows * m.rows * m.rows) as u64, span)?;
                 base = mat_mul(&base, &base, span)?;
             }
         }
@@ -409,6 +425,7 @@ impl Evaluator<'_> {
                 if xs.len() != ys.len() {
                     return Err(EvalError::other("list lengths differ", span));
                 }
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for (x, y) in xs.iter().zip(ys) {
                     out.push(self.compare(x, op, y, span)?);
@@ -416,6 +433,7 @@ impl Evaluator<'_> {
                 Ok(Value::List(out))
             }
             (Value::List(xs), y) => {
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for x in xs {
                     out.push(self.compare(x, op, y, span)?);
@@ -423,6 +441,7 @@ impl Evaluator<'_> {
                 Ok(Value::List(out))
             }
             (x, Value::List(ys)) => {
+                self.charge(ys.len() as u64, span)?;
                 let mut out = Vec::with_capacity(ys.len());
                 for y in ys {
                     out.push(self.compare(x, op, y, span)?);
@@ -470,6 +489,7 @@ impl Evaluator<'_> {
                 if xs.len() != ys.len() {
                     return Err(EvalError::other("list lengths differ", span));
                 }
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for (x, y) in xs.into_iter().zip(ys) {
                     out.push(self.logic2(x, y, is_and, span)?);
@@ -477,6 +497,7 @@ impl Evaluator<'_> {
                 Ok(Value::List(out))
             }
             (Value::List(xs), y) => {
+                self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for x in xs {
                     out.push(self.logic2(x, y.clone(), is_and, span)?);
@@ -484,6 +505,7 @@ impl Evaluator<'_> {
                 Ok(Value::List(out))
             }
             (x, Value::List(ys)) => {
+                self.charge(ys.len() as u64, span)?;
                 let mut out = Vec::with_capacity(ys.len());
                 for y in ys {
                     out.push(self.logic2(x.clone(), y, is_and, span)?);

@@ -281,7 +281,7 @@ fn prefix_function_application() {
 #[test]
 fn ascii_alias_theta() {
     let mut s = session();
-    ev_with(&mut s, "theta := 2");
+    ev_with(&mut s, "let theta = 2");
     assert_eq!(ev_with(&mut s, "θ + 1"), "3");
 }
 
@@ -776,9 +776,9 @@ fn infinite_recursion_hits_depth_limit() {
 #[test]
 fn deep_expression_recursion_is_error_not_crash() {
     let mut s = session();
-    ev_with(&mut s, "r(n) := {n <= 0: 0, 1 + r(n - 1)}");
-    assert_eq!(ev_with(&mut s, "r(20)"), "20");
-    let e = s.eval("r(100000)").unwrap_err();
+    ev_with(&mut s, "rec(n) := {n <= 0: 0, 1 + rec(n - 1)}");
+    assert_eq!(ev_with(&mut s, "rec(20)"), "20");
+    let e = s.eval("rec(100000)").unwrap_err();
     assert_eq!(e.kind, ErrorKind::DepthLimit);
 }
 
@@ -933,7 +933,10 @@ fn format_exact_and_approx() {
 #[test]
 fn format_float_uses_digits() {
     let v = session().eval("π").unwrap();
-    assert_eq!(format_value(&v, &FormatOptions::default()), "3.14159265359");
+    assert_eq!(
+        format_value(&v, &FormatOptions::default()),
+        "≈3.14159265359"
+    );
     assert_eq!(format_value(&v, &FormatOptions::approx(5)), "3.1416");
 }
 
@@ -1407,9 +1410,16 @@ fn eq_mode_keeps_equals_definitions() {
 #[test]
 fn script_reassignment_of_let_with_equals() {
     assert_eq!(ev("let v = 1\nv = v + 1\nv"), "2");
-    let mut s = session();
-    let e = s.eval("let v = 1\nw = 2").unwrap_err();
+    // In a script an `=` that is not a reassignment is an error ...
+    let prog = crate::syntax::parse_program("let v = 1\nw = 2").unwrap();
+    let e = run_program(&prog, &mut Env::new(), &EvalOptions::default()).unwrap_err();
     assert_eq!(e.kind, ErrorKind::Definition);
+    // ... and in a block of a session too; at session top level it is a
+    // relation.
+    let mut s = session();
+    let e = s.eval("let v = 1\nif true { w = 2 }").unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Definition);
+    assert!(matches!(s.run("w = 2").unwrap()[0], Outcome::Relation(_)));
 }
 
 #[test]
@@ -1425,6 +1435,217 @@ fn script_top_level_colon_eq_defines_global() {
 fn definition_prints_colon_eq() {
     let st = parse_statement("f(x) := x^2 {x > 0}").unwrap();
     assert_eq!(st.to_string(), "f(x) := x^2 {x > 0}");
+}
+
+// ----- review regressions (PR #10) ---------------------------------------------
+
+#[test]
+fn r01_deep_nested_lists_are_an_error_not_a_crash() {
+    let h = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            let mut s = session();
+            s.eval("let v = [1]\nfor i in range(1, 2000) { v = [v] }\nv")
+                .unwrap_err()
+                .kind
+        })
+        .unwrap();
+    assert_eq!(h.join().unwrap(), ErrorKind::DepthLimit);
+    // Moderate nesting is fine.
+    assert_eq!(ev("[[[[1]]]]"), "[[[[1]]]]");
+}
+
+#[test]
+fn r02_plot_split_with_builtin_piece() {
+    let f = plot("sinx", &["x"], &Env::new());
+    assert!(close(f.eval1(0.5), 0.5f64.sin(), 1e-12));
+}
+
+#[test]
+fn r03_plot_error_in_condition_is_not_false() {
+    // sqrt(-1) is an error: the result is NaN, not the `otherwise` branch.
+    let f = plot("{sqrt(x) > 1: 1, 2}", &["x"], &Env::new());
+    assert!(f.is_compiled());
+    assert!(f.eval1(-1.0).is_nan());
+    assert_eq!(f.eval1(4.0), 1.0);
+    assert_eq!(f.eval1(0.25), 2.0);
+    // An *undefined* condition counts as false.
+    let g = plot("{(x {x > 0}) > 1: 1, 2}", &["x"], &Env::new());
+    assert_eq!(g.eval1(-1.0), 2.0);
+}
+
+#[test]
+fn r04_list_piecewise_is_lazy() {
+    // The `otherwise` branch would fail but no element needs it.
+    assert_eq!(ev("{[1, 2] > 0: 1, 1/0}"), "[1, 1]");
+    // A branch nobody selects is not evaluated either.
+    assert_eq!(ev("{[1, 2] < 0: 1/0, 5}"), "[5, 5]");
+    // Later conditions are not evaluated once every element is resolved.
+    assert_eq!(ev("{[1, 2] > 0: 7, 1/0 > 0: 8}"), "[7, 7]");
+    assert_eq!(ev("{[-1, 2] > 0: 7, [1, 1] > 0: 8}"), "[8, 7]");
+}
+
+#[test]
+fn r05_restriction_mask_length_mismatch_is_error() {
+    let e = err("([1, 2, 3] {[1, 2] > 0})");
+    assert_eq!(e.kind, ErrorKind::Other);
+    assert_eq!(ev("(5 {[1, -1] > 0})"), "[5, undefined]");
+}
+
+#[test]
+fn r06_approx_mode_stores_exact_definitions() {
+    let mut s = session();
+    s.opts.approx = true;
+    assert_eq!(s.eval_to_string("a := 1/3").unwrap(), "0.333333333333");
+    s.opts.approx = false;
+    assert_eq!(ev_with(&mut s, "a"), "1/3");
+}
+
+#[test]
+fn r07_fallback_booleans_are_one_and_zero() {
+    let f = plot("[x][1] > 0", &["x"], &Env::new());
+    assert!(!f.is_compiled());
+    assert_eq!(f.eval1(1.0), 1.0);
+    assert_eq!(f.eval1(-1.0), 0.0);
+}
+
+#[test]
+fn r08_inlined_bodies_do_not_see_plot_vars() {
+    let mut s = session();
+    ev_with(&mut s, "f(t) := t + x");
+    // The general evaluator cannot resolve `x` in the body either.
+    assert!(s.eval("let x = 1\nf(2)").is_err());
+    let e = parse_expr("f(x)").unwrap();
+    let r = compile_plot_fn(&e, &["x"], &s.env, &EvalOptions::default());
+    assert!(matches!(r.unwrap_err().kind, ErrorKind::UnknownName(_)));
+}
+
+#[test]
+fn r09_plot_infinities_are_errors() {
+    for src in ["1/x", "ln(x)", "x^-1", "1/(1/x)", "x mod 0"] {
+        let f = plot(src, &["x"], &Env::new());
+        assert!(f.eval1(0.0).is_nan(), "{src}");
+    }
+    let f = plot("1/0 + x", &["x"], &Env::new());
+    assert!(f.eval1(1.0).is_nan());
+}
+
+#[test]
+fn r10_plot_odd_root_needs_exact_exponent() {
+    let f = plot("x^(1/3)", &["x"], &Env::new());
+    assert!(close(f.eval1(-8.0), -2.0, 1e-12));
+    let g = plot("x^0.3333333333", &["x"], &Env::new());
+    assert!(g.eval1(-8.0).is_nan());
+    let h = plot("x^(2/3)", &["x"], &Env::new());
+    assert!(close(h.eval1(-8.0), 4.0, 1e-12));
+}
+
+#[test]
+fn r11_plot_variables_are_never_globals() {
+    for name in ["x", "y", "r", "t", "theta"] {
+        let e = err(&format!("{name} := 3"));
+        assert_eq!(e.kind, ErrorKind::Definition, "{name}");
+        assert!(e.message.contains("plot variable"), "{}", e.message);
+    }
+    let mut env = Env::new();
+    assert!(env.define("t", Value::num(Number::from(1))).is_err());
+    let i = classify_src("x + 1", &env);
+    assert_eq!(i.free_vars, vec!["x".to_string()]);
+}
+
+#[test]
+fn r12_multi_statement_run_routes_outcomes() {
+    let mut s = session();
+    let out = s.run("let k = 2\na := k\ny = x^2\nk + a").unwrap();
+    assert_eq!(out.len(), 4);
+    assert!(matches!(out[1], Outcome::Defined { ref name, .. } if name == "a"));
+    assert!(matches!(out[2], Outcome::Relation(_)));
+    assert_eq!(out[3], Outcome::Value(Value::num(Number::from(4))));
+    // `let` locals persist across inputs of the session.
+    assert_eq!(ev_with(&mut s, "k * 10"), "20");
+}
+
+#[test]
+fn r13_script_function_definition_is_global_and_captures() {
+    let mut s = session();
+    assert_eq!(ev_with(&mut s, "let q = 1\nf(x) := x + q\nf(2)"), "3");
+    ev_with(&mut s, "q = 100");
+    assert_eq!(ev_with(&mut s, "f(5)"), "6");
+    assert!(s.env.contains("f"));
+    assert!(!s.env.contains("q"));
+}
+
+#[test]
+fn r15_vector_ops_charge_per_element() {
+    let mut s = session();
+    s.opts.max_steps = 2_500;
+    let e = s.eval("[1..1000] * [1..1000]").unwrap_err();
+    assert_eq!(e.kind, ErrorKind::StepLimit);
+    let mut s = session();
+    s.opts.max_steps = 5_000;
+    let e = s.eval("M := [[1..20] for i = [1..20]]\nM^5").unwrap_err();
+    assert_eq!(e.kind, ErrorKind::StepLimit);
+}
+
+#[test]
+fn r16_element_budget_across_comprehensions() {
+    let mut s = session();
+    s.opts.max_elements = 50_000;
+    let e = s.eval("[len([1..10000]) for k = [1..10]]").unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Other);
+    assert!(e.message.contains("elements"));
+}
+
+#[test]
+fn r17_split_backtracking_is_fast() {
+    let mut s = session();
+    ev_with(&mut s, "a := 1");
+    ev_with(&mut s, "aa := 2");
+    ev_with(&mut s, "aaa := 3");
+    let start = std::time::Instant::now();
+    let e = s.eval("aaaaaaaaaaaaaaaaaaaaaaq").unwrap_err();
+    assert!(matches!(e.kind, ErrorKind::UnknownName(_)));
+    assert!(start.elapsed().as_millis() < 500);
+}
+
+#[test]
+fn r18_min_max_of_empty_list() {
+    assert!(matches!(err("min([])").kind, ErrorKind::Number(_)));
+    assert!(matches!(err("max([])").kind, ErrorKind::Number(_)));
+}
+
+#[test]
+fn polar_inequalities_and_angles() {
+    let env = Env::new();
+    assert!(matches!(
+        classify_src("r < 2", &env).kind,
+        StatementKind::PolarInequality { .. }
+    ));
+    assert!(matches!(
+        classify_src("0 < θ < π/2", &env).kind,
+        StatementKind::PolarInequality { .. }
+    ));
+    assert_eq!(
+        classify_src("θ = π/4", &env).kind,
+        StatementKind::PolarAngle
+    );
+    assert_eq!(classify_src("r = 2θ", &env).kind, StatementKind::Polar);
+}
+
+#[test]
+fn numeric_calculus_results_are_marked_approximate() {
+    assert!(ev("∫(0, 1) x^2 dx").starts_with('≈'));
+    assert_eq!(ev("∑(k = 1, 3) k"), "6");
+}
+
+#[test]
+fn y1_equation_is_a_relation_and_colon_eq_defines() {
+    let env = Env::new();
+    assert_eq!(classify_src("y1 = x^2", &env).kind, StatementKind::Implicit);
+    assert!(matches!(
+        classify_src("y1 := x^2", &env).kind,
+        StatementKind::Definition { .. }
+    ));
 }
 
 #[test]

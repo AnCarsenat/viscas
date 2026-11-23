@@ -117,7 +117,8 @@ pub struct UserFn {
     /// Local variables visible where the function was defined (lexical
     /// capture by value). Global names are looked up at call time, so a
     /// global function sees later redefinitions of the names it uses.
-    pub captured: Vec<(String, Value)>,
+    /// Shared (`Arc`) so calls and copies of the closure never clone it.
+    pub captured: Arc<Vec<(String, Value)>>,
 }
 
 /// Body of a user function.
@@ -204,7 +205,9 @@ impl From<bool> for Value {
 /// How numbers are shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumberStyle {
-    /// Exact values exactly (`1/3`, `2 + 3i`); floats as decimals.
+    /// Exact values exactly (`1/3`, `2 + 3i`); inexact values as decimals
+    /// marked with `≈` (`≈3.14159265359`), so numeric results (π, `∫`,
+    /// `d/dx`, `f'`) never look exact.
     Exact,
     /// Everything as decimals (`0.3333333333`).
     Approx,
@@ -247,7 +250,9 @@ pub fn format_value(value: &Value, opts: &FormatOptions) -> String {
 fn format_number(n: &Number, opts: &FormatOptions) -> String {
     match opts.style {
         NumberStyle::Exact if n.is_exact() => n.to_string(),
-        _ => n.to_decimal_string(opts.digits),
+        // Exactness is never claimed for floats (π, numeric ∫, d/dx ...).
+        NumberStyle::Exact => format!("≈{}", n.to_decimal_string(opts.digits)),
+        NumberStyle::Approx => n.to_decimal_string(opts.digits),
     }
 }
 

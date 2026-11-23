@@ -5,14 +5,11 @@ use std::collections::BTreeSet;
 
 use super::env::{Env, EvalOptions, canonical_name};
 use super::error::{ErrorKind, EvalError, EvalResult};
-use super::interp::{
-    Evaluator, function_signature, is_builtin_name, split_with, with_restrictions,
-};
+use super::interp::{Evaluator, Flow, function_signature, is_builtin_name, split_with};
 use super::value::{FnBody, Value};
 use crate::syntax::{AddOp, CmpOp, Expr, ExprKind, Program, Span, Stmt, StmtKind, Term};
 
-/// Names that act as plot coordinates in top-level relations.
-pub const PLOT_VARS: &[&str] = &["x", "y", "r", "θ", "t"];
+pub use super::env::PLOT_VARS;
 
 /// What a statement is, for the plot layer and the scene.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,6 +24,11 @@ pub enum StatementKind {
     ExplicitX,
     /// `r = f(θ)`. [`StatementInfo::expr`] is `f`.
     Polar,
+    /// `θ = g(r)` (e.g. a ray `θ = π/4`). [`StatementInfo::expr`] is `g`.
+    PolarAngle,
+    /// A comparison in `r`/`θ` without `x`/`y` (`r < 2`,
+    /// `0 < θ < π/2`). [`StatementInfo::expr`] is the comparison.
+    PolarInequality { ops: Vec<CmpOp> },
     /// Any other equation in `x`/`y`; [`StatementInfo::expr`] is
     /// `lhs - rhs` (plot its zero set).
     Implicit,
@@ -67,10 +69,22 @@ pub struct StatementInfo {
     pub deps: Vec<String>,
 }
 
-/// Classifies a statement against the current environment.
+/// Classifies a statement against the current environment. Plot variables
+/// (`x y r θ t`) are always free unless bound inside the statement (they
+/// can never be globals).
 pub fn classify(stmt: &Stmt, env: &Env) -> StatementInfo {
+    classify_in(stmt, env, &[])
+}
+
+/// [`classify`] with extra known local names (session `let` variables).
+pub(crate) fn classify_in(stmt: &Stmt, env: &Env, locals: &[String]) -> StatementInfo {
+    let free_vars = |e: &Expr, env: &Env| {
+        let mut fv = FreeVars::new(env, locals);
+        fv.expr(e);
+        fv.free.into_iter().collect::<Vec<_>>()
+    };
     let info = |kind, expr: Option<Expr>, restrictions: &[Expr], bound: &[String]| {
-        let mut fv = FreeVars::new(env);
+        let mut fv = FreeVars::new(env, locals);
         fv.bound.extend(bound.iter().cloned());
         if let Some(e) = &expr {
             fv.expr(e);
@@ -92,7 +106,7 @@ pub fn classify(stmt: &Stmt, env: &Env) -> StatementInfo {
             rhs,
             restrictions,
         } => {
-            let (kind, expr) = classify_equation(lhs, rhs, env);
+            let (kind, expr) = classify_equation(lhs, rhs, &|e| free_vars(e, env));
             info(kind, Some(expr), restrictions, &[])
         }
         StmtKind::Definition {
@@ -122,6 +136,11 @@ pub fn classify(stmt: &Stmt, env: &Env) -> StatementInfo {
                         ops: rest.iter().map(|(op, _)| *op).collect(),
                     }
                 }
+                ExprKind::Compare { rest, .. } if has("r") || has("θ") => {
+                    StatementKind::PolarInequality {
+                        ops: rest.iter().map(|(op, _)| *op).collect(),
+                    }
+                }
                 ExprKind::Tuple(_) if free.is_empty() => StatementKind::Point,
                 ExprKind::Tuple(_) if free.len() == 1 => StatementKind::Parametric {
                     param: free[0].clone(),
@@ -145,12 +164,16 @@ pub fn classify(stmt: &Stmt, env: &Env) -> StatementInfo {
 }
 
 /// `(kind, expr)` of an equation `lhs = rhs` (never a definition).
-fn classify_equation(lhs: &Expr, rhs: &Expr, env: &Env) -> (StatementKind, Expr) {
+fn classify_equation(
+    lhs: &Expr,
+    rhs: &Expr,
+    free_vars: &dyn Fn(&Expr) -> Vec<String>,
+) -> (StatementKind, Expr) {
     let ident = |e: &Expr| match &*e.kind {
         ExprKind::Ident(n) => Some(canonical_name(n).to_string()),
         _ => None,
     };
-    let mentions = |e: &Expr, v: &str| free_vars(e, env).iter().any(|f| f == v);
+    let mentions = |e: &Expr, v: &str| free_vars(e).iter().any(|f| f == v);
     let explicit = |name: &str, other: &Expr| -> Option<StatementKind> {
         if mentions(other, name) {
             return None;
@@ -159,6 +182,7 @@ fn classify_equation(lhs: &Expr, rhs: &Expr, env: &Env) -> (StatementKind, Expr)
             "y" => Some(StatementKind::ExplicitY),
             "x" => Some(StatementKind::ExplicitX),
             "r" => Some(StatementKind::Polar),
+            "θ" => Some(StatementKind::PolarAngle),
             _ => None,
         }
     };
@@ -173,7 +197,7 @@ fn classify_equation(lhs: &Expr, rhs: &Expr, env: &Env) -> (StatementKind, Expr)
         return (kind, lhs.clone());
     }
     let diff = sub(lhs, rhs);
-    let fv = free_vars(&diff, env);
+    let fv = free_vars(&diff);
     if fv.iter().any(|v| v == "x" || v == "y") {
         (StatementKind::Implicit, diff)
     } else {
@@ -201,22 +225,27 @@ fn sub(lhs: &Expr, rhs: &Expr) -> Expr {
 /// Unbound names of an expression (sorted). Unknown multi-letter names are
 /// split when every piece is known or a single letter (`xy` → `x`, `y`).
 pub fn free_vars(e: &Expr, env: &Env) -> Vec<String> {
-    let mut fv = FreeVars::new(env);
+    let mut fv = FreeVars::new(env, &[]);
     fv.expr(e);
     fv.free.into_iter().collect()
 }
 
 struct FreeVars<'a> {
     env: &'a Env,
+    /// Session/script `let` locals (bound, even when named like a plot
+    /// variable).
+    locals: &'a [String],
+    /// Names bound inside the statement (parameters, comprehension, ∑, ∫).
     bound: Vec<String>,
     free: BTreeSet<String>,
     deps: BTreeSet<String>,
 }
 
 impl<'a> FreeVars<'a> {
-    fn new(env: &'a Env) -> Self {
+    fn new(env: &'a Env, locals: &'a [String]) -> Self {
         FreeVars {
             env,
+            locals,
             bound: Vec::new(),
             free: BTreeSet::new(),
             deps: BTreeSet::new(),
@@ -225,8 +254,10 @@ impl<'a> FreeVars<'a> {
 
     fn known(&self, name: &str) -> bool {
         self.bound.iter().any(|b| b == name)
+            || PLOT_VARS.contains(&name)
+            || self.locals.iter().any(|b| b == name)
             || is_builtin_name(name)
-            || self.env.lookup(name).is_some()
+            || self.env.has(name)
     }
 
     fn name(&mut self, raw: &str) {
@@ -234,7 +265,15 @@ impl<'a> FreeVars<'a> {
         if self.bound.iter().any(|b| b == name) || is_builtin_name(name) {
             return;
         }
-        if self.env.lookup(name).is_some() {
+        // An explicit `let` local binds even a plot variable.
+        if self.locals.iter().any(|b| b == name) {
+            return;
+        }
+        if PLOT_VARS.contains(&name) {
+            self.free.insert(name.to_string());
+            return;
+        }
+        if self.env.has(name) {
             self.deps.insert(name.to_string());
             return;
         }
@@ -373,55 +412,74 @@ pub enum Outcome {
 
 /// Executes a top-level statement (console / expression-list line):
 /// definitions are stored in `env`, relations are reported, expressions and
-/// script statements are evaluated. In approx mode the value is converted
-/// to decimals.
+/// script statements are evaluated. In approx mode the *returned* value is
+/// converted to decimals (stored definitions stay exact).
 pub fn exec_statement(stmt: &Stmt, env: &mut Env, opts: &EvalOptions) -> EvalResult<Outcome> {
-    let info = classify(stmt, env);
+    let mut ev = Evaluator::new(env, opts);
+    exec_top(&mut ev, stmt).map(|(o, _)| o)
+}
+
+/// One top-level statement; the flag is `true` after a `return`.
+fn exec_top(ev: &mut Evaluator<'_>, stmt: &Stmt) -> EvalResult<(Outcome, bool)> {
+    let locals = ev.local_names();
+    // `v = ...` with a visible `let` variable `v` is a reassignment.
+    if let StmtKind::Equation { lhs, .. } = &stmt.kind
+        && let ExprKind::Ident(n) = &*lhs.kind
+        && locals.iter().any(|l| l == canonical_name(n))
+    {
+        let v = ev.exec_stmt(stmt)?.into_value();
+        return Ok((Outcome::Value(finish(ev, v)?), false));
+    }
+    let info = classify_in(stmt, ev.env(), &locals);
     match (&info.kind, &stmt.kind) {
         (
-            StatementKind::Definition { name, params },
+            StatementKind::Definition { .. },
             StmtKind::Definition {
-                rhs, restrictions, ..
+                lhs,
+                rhs,
+                restrictions,
             },
         ) => {
-            let mut ev = Evaluator::new(env, opts);
-            let value = if params.is_empty() {
-                let body = with_restrictions(rhs, restrictions);
-                let v = ev.eval(&body)?;
-                finish(&mut ev, v)?
-            } else {
-                let body = with_restrictions(rhs, restrictions);
-                ev.make_fn(name, params, FnBody::Expr(body))
-            };
-            ev.define_global(name, value.clone(), stmt.span)?;
-            Ok(Outcome::Defined {
-                name: name.clone(),
-                value,
-            })
+            let (name, value) = ev.exec_definition(lhs, rhs, restrictions)?;
+            let value = finish(ev, value)?;
+            Ok((Outcome::Defined { name, value }, false))
         }
         (
             StatementKind::ExplicitY
             | StatementKind::ExplicitX
             | StatementKind::Polar
+            | StatementKind::PolarAngle
+            | StatementKind::PolarInequality { .. }
             | StatementKind::Implicit
             | StatementKind::Equation
             | StatementKind::Inequality { .. }
             | StatementKind::Parametric { .. },
             _,
-        ) => Ok(Outcome::Relation(info)),
+        ) => Ok((Outcome::Relation(info), false)),
         (StatementKind::Regression, _) => Err(EvalError::unsupported(
             "regression (`~`) is not implemented yet",
             stmt.span,
         )),
-        _ => {
-            let mut ev = Evaluator::new(env, opts);
-            let v = ev.exec_stmt(stmt)?.into_value();
-            Ok(Outcome::Value(finish(&mut ev, v)?))
+        (_, StmtKind::Fn { name, params, body }) => {
+            // A top-level `fn` defines a global even inside a session scope.
+            let f = ev.make_fn(name, params, FnBody::Block(body.clone()));
+            ev.define_global(name, f.clone(), stmt.span)?;
+            Ok((
+                Outcome::Defined {
+                    name: canonical_name(name).to_string(),
+                    value: f,
+                },
+                false,
+            ))
         }
+        _ => match ev.exec_stmt(stmt)? {
+            Flow::Value(v) => Ok((Outcome::Value(finish(ev, v)?), false)),
+            Flow::Return(v) => Ok((Outcome::Value(finish(ev, v)?), true)),
+        },
     }
 }
 
-/// Approx mode: convert the final value to decimals.
+/// Approx mode: convert a value to decimals.
 fn finish(ev: &mut Evaluator<'_>, v: Value) -> EvalResult<Value> {
     if !ev.opts.approx {
         return Ok(v);
@@ -464,8 +522,7 @@ fn approx_value(
 
 /// Runs a script: statements execute in a fresh local scope (`let` is
 /// local and reassigned with `x = v`; `name := value` and `fn` define
-/// globals). Returns the value of the
-/// last statement (or of `return`).
+/// globals). Returns the value of the last statement (or of `return`).
 pub fn run_program(program: &Program, env: &mut Env, opts: &EvalOptions) -> EvalResult<Value> {
     let mut ev = Evaluator::new(env, opts);
     ev.push_scope(Vec::new());
@@ -486,21 +543,23 @@ fn run_top(ev: &mut Evaluator<'_>, stmts: &[Stmt]) -> EvalResult<Value> {
             continue;
         }
         match ev.exec_stmt(s)? {
-            super::interp::Flow::Value(v) => last = v,
-            super::interp::Flow::Return(v) => return Ok(v),
+            Flow::Value(v) => last = v,
+            Flow::Return(v) => return Ok(v),
         }
     }
     Ok(last)
 }
 
-/// Convenience bundle of an [`Env`] and [`EvalOptions`] for console-style
-/// use and tests.
+/// Console-style session: an [`Env`], [`EvalOptions`], parser options and
+/// the session's `let` locals (which persist between inputs; plot
+/// variables such as `x` may be `let` locals but never globals).
 #[derive(Debug, Default)]
 pub struct Session {
     pub env: Env,
     pub opts: EvalOptions,
     /// Parser options (definition operator `:=` vs `=`).
     pub parse: crate::syntax::ParseOptions,
+    locals: Vec<(String, Value)>,
 }
 
 impl Session {
@@ -532,30 +591,32 @@ impl Session {
         Ok(last)
     }
 
-    /// Parses and executes every statement of `src`, top-level semantics.
-    /// Multi-line scripts with `let` share one scope.
+    /// Parses and executes every statement of `src` with top-level
+    /// semantics, one [`Outcome`] per statement (stopping after `return`).
+    /// `let` locals live in the session scope and persist between calls.
     pub fn run(&mut self, src: &str) -> EvalResult<Vec<Outcome>> {
         let program = crate::syntax::parse_program_with(src, &self.parse)
             .map_err(|e| EvalError::from_parse(&e))?;
-        let scripted = program.stmts.iter().any(|s| {
-            matches!(
-                s.kind,
-                StmtKind::Let { .. }
-                    | StmtKind::If { .. }
-                    | StmtKind::For { .. }
-                    | StmtKind::While { .. }
-                    | StmtKind::Return(_)
-            )
-        });
-        if scripted && program.stmts.len() > 1 {
-            let v = run_program(&program, &mut self.env, &self.opts)?;
-            return Ok(vec![Outcome::Value(v)]);
-        }
+        let mut ev = Evaluator::new(&mut self.env, &self.opts);
+        ev.push_scope(std::mem::take(&mut self.locals));
         let mut out = Vec::with_capacity(program.stmts.len());
+        let mut result = Ok(());
         for s in &program.stmts {
-            out.push(exec_statement(s, &mut self.env, &self.opts)?);
+            match exec_top(&mut ev, s) {
+                Ok((o, stop)) => {
+                    out.push(o);
+                    if stop {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
         }
-        Ok(out)
+        self.locals = ev.take_scope();
+        result.map(|()| out)
     }
 
     /// Evaluates `src` and formats the result according to the session's
