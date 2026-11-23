@@ -50,11 +50,34 @@ fn console_definitions_stay_in_the_console() {
 }
 
 #[test]
-fn console_definition_shadows_node() {
+fn console_definition_of_node_name_updates_the_node() {
     let mut e = engine();
-    var(&mut e, "a", "2");
-    e.console_eval("a := 10");
-    assert_eq!(first(&e.console_eval("a")).exact, "10");
+    let a = var(&mut e, "a", "2");
+    let b = var(&mut e, "b", "a + 1");
+    let out = e.console_eval("a := 10");
+    assert_eq!(
+        first(&out).kind,
+        ItemKind::UpdatedNode {
+            node: a,
+            name: "a".into()
+        }
+    );
+    assert_eq!(first(&out).exact, "10");
+    assert_eq!(exact(&e, b), "11");
+    assert!(e.console_names().is_empty(), "never shadows a node");
+    assert!(e.undo());
+    assert_eq!(exact(&e, a), "2");
+    assert_eq!(first(&e.console_eval("a")).exact, "2");
+}
+
+#[test]
+fn console_function_redefines_node_function() {
+    let mut e = engine();
+    let f = func(&mut e, "f", &["x"], "x");
+    e.console_eval("f(x) := 3x");
+    let v = var(&mut e, "v", "f(2)");
+    assert_eq!(exact(&e, v), "6");
+    assert_eq!(e.scene().get(f).unwrap().kind.tag(), KindTag::Function);
 }
 
 #[test]
@@ -138,11 +161,13 @@ fn pin_definition_creates_node_and_undo_removes_it() {
     };
     assert_eq!(e.scene().get(node).unwrap().name.as_deref(), Some("a"));
     assert_eq!(exact(&e, node), "3");
-    assert!(e.console_names().is_empty(), "console shadow dropped");
+    assert!(e.console_names().is_empty(), "the node provides `a` now");
     assert_eq!(first(&e.console_eval("a + 1")).exact, "4");
     assert!(e.undo());
     assert!(!e.scene().contains(node));
-    assert!(e.console_eval("a").error.is_some());
+    // The console definition is back, consistently with the undo.
+    assert_eq!(first(&e.console_eval("a")).exact, "3");
+    assert_eq!(e.console_names(), vec!["a".to_string()]);
 }
 
 #[test]
@@ -174,7 +199,7 @@ fn pin_value_and_relation() {
     };
     let n = e.scene().get(node).unwrap();
     assert_eq!(n.kind.tag(), KindTag::Plot);
-    assert!(n.style.color.is_some());
+    assert!(e.node_color(node).is_some());
     assert!(e.plot_of(node).is_some());
 }
 
@@ -211,8 +236,8 @@ fn pin_twice_errors() {
 #[test]
 fn pin_existing_name_errors() {
     let mut e = engine();
-    var(&mut e, "a", "1");
     e.console_eval("a := 3");
+    var(&mut e, "a", "1");
     let out = e.console_eval(":pin");
     assert!(out.error.unwrap().message.contains("already exists"));
 }
@@ -378,4 +403,101 @@ fn console_does_not_touch_undo_history() {
     e.console_eval("b := 5");
     e.console_eval("2 + 2");
     assert!(!e.scene().can_undo());
+}
+
+// ----------------------------------------------------------------------
+// Review regressions
+// ----------------------------------------------------------------------
+
+#[test]
+fn pin_also_pins_console_dependencies_in_one_undo_step() {
+    let mut e = engine();
+    e.console_eval("b := 2");
+    e.console_eval("g(x) := b x");
+    e.console_eval("c := g(3) + 1");
+    let out = e.console_eval(":pin");
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let pinned: Vec<NodeId> = out
+        .results
+        .iter()
+        .filter_map(|r| match r.kind {
+            ItemKind::Pinned { node } => Some(node),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pinned.len(), 3, "b, g and c");
+    let c = *pinned.last().unwrap();
+    assert_eq!(exact(&e, c), "7");
+    for name in ["b", "g", "c"] {
+        assert!(e.scene().lookup(name).is_some(), "{name}");
+    }
+    assert!(e.undo());
+    assert!(e.scene().is_empty(), "one undo removes the whole pin");
+    assert_eq!(first(&e.console_eval("c")).exact, "7");
+}
+
+#[test]
+fn pin_refuses_console_values_without_definition() {
+    let mut e = engine();
+    e.console_eval("5");
+    e.console_eval("ans + 1");
+    let out = e.console_eval(":pin");
+    assert!(out.error.unwrap().message.contains("ans"));
+    assert!(e.scene().is_empty());
+}
+
+#[test]
+fn spans_are_offset_per_statement() {
+    let mut e = engine();
+    let input = "q1 := 1; 2 + qq";
+    let out = e.console_eval(input);
+    let span = out.error.unwrap().span.unwrap();
+    assert_eq!(&input[span.start..span.end], "qq");
+    assert_eq!(out.results.len(), 1, "the first statement ran");
+}
+
+#[test]
+fn spans_respect_char_boundaries() {
+    let mut e = engine();
+    let input = "√(4) + π + qq";
+    let out = e.console_eval(input);
+    let span = out.error.unwrap().span.unwrap();
+    assert!(input.is_char_boundary(span.start) && input.is_char_boundary(span.end));
+    assert_eq!(&input[span.start..span.end], "qq");
+}
+
+#[test]
+fn spans_from_called_function_bodies_are_dropped() {
+    let mut e = engine();
+    e.console_eval("h(x) := 1/(x - 2)");
+    let out = e.console_eval("h(2) + 100000000");
+    let err = out.error.unwrap();
+    assert!(err.message.contains("zero"), "{}", err.message);
+    assert_eq!(err.span, None);
+}
+
+#[test]
+fn eq_rule_reads_plot_variables_as_relations() {
+    let mut e = engine();
+    e.set_settings(EngineSettings {
+        definition_op: DefinitionOp::Eq,
+        ..*e.settings()
+    });
+    assert!(matches!(
+        first(&e.console_eval("a = x^2")).kind,
+        ItemKind::Relation { .. }
+    ));
+    assert!(e.console_names().is_empty());
+    assert_eq!(
+        first(&e.console_eval("k = 3")).kind,
+        ItemKind::Definition { name: "k".into() }
+    );
+    assert_eq!(
+        first(&e.console_eval("sq(x) = x^2")).kind,
+        ItemKind::Definition { name: "sq".into() }
+    );
+    assert!(matches!(
+        first(&e.console_eval("t = 3")).kind,
+        ItemKind::Relation { .. }
+    ));
 }

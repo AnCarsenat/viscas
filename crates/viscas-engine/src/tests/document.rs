@@ -69,7 +69,7 @@ fn new_document_clears_everything() {
     let mut e = engine();
     sample(&mut e);
     e.set_layout(Some(serde_json::json!(1)));
-    let vp = ViewportId(1);
+    let vp = e.create_viewport();
     let job = e.prepare_job(vp, view());
     e.run_job_now(&job);
     e.new_document();
@@ -104,11 +104,15 @@ fn save_and_open_files() {
 fn colors_survive_roundtrip() {
     let mut e = engine();
     let p = plot(&mut e, "y = x");
-    let c = e.scene().get(p).unwrap().style.color;
+    let c = e.node_color(p);
     let text = e.save_string().unwrap();
+    assert!(
+        !text.contains(&DEFAULT_PALETTE[0].to_string()),
+        "auto colors are not saved"
+    );
     let mut f = engine();
     f.open_str(&text).unwrap();
-    assert_eq!(f.scene().get(p).unwrap().style.color, c);
+    assert_eq!(f.node_color(p), c);
 }
 
 #[test]
@@ -119,4 +123,28 @@ fn errors_survive_roundtrip() {
     let mut f = engine();
     f.open_str(&text).unwrap();
     assert!(f.scene().status(b).is_error());
+}
+
+#[test]
+fn save_is_atomic_and_leaves_no_temp_files() {
+    let dir = std::env::temp_dir().join(format!("viscas-engine-atomic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("doc.viscas");
+    std::fs::write(&path, "old contents").unwrap();
+    let mut e = engine();
+    sample(&mut e);
+    e.save_path(&path).unwrap();
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|d| d.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["doc.viscas".to_string()]);
+    let mut f = engine();
+    f.open_path(&path).unwrap();
+    assert_eq!(f.scene().len(), 3);
+    assert!(
+        e.save_path(dir.join("missing-dir").join("x.viscas"))
+            .is_err()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

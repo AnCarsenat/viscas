@@ -68,7 +68,7 @@ pub(crate) fn error(
 
 /// Render the node synchronously in viewport 1 and return its layer.
 pub(crate) fn layer(e: &mut Engine, id: NodeId) -> PlotLayer {
-    let vp = ViewportId(1);
+    let vp = e.create_viewport();
     let job = e.prepare_job(vp, view());
     assert!(e.run_job_now(&job));
     e.layers(vp)

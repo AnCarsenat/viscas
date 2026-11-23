@@ -6,7 +6,7 @@ use super::*;
 
 fn plotted(e: &mut Engine, rels: &[&str]) -> (Vec<NodeId>, ViewportId) {
     let ids = rels.iter().map(|r| plot(e, r)).collect();
-    let vp = ViewportId(1);
+    let vp = e.create_viewport();
     let job = e.prepare_job(vp, view());
     e.run_job_now(&job);
     (ids, vp)
@@ -76,13 +76,11 @@ fn nothing_far_away() {
 }
 
 #[test]
-fn unknown_viewport_has_no_features() {
+fn unplotted_viewport_has_no_features() {
     let mut e = engine();
     plot(&mut e, "y = x^2 - 1");
-    assert!(
-        e.features_near(ViewportId(99), Vec2::new(1.0, 0.0), 1.0)
-            .is_empty()
-    );
+    let vp = e.create_viewport();
+    assert!(e.features_near(vp, Vec2::new(1.0, 0.0), 1.0).is_empty());
 }
 
 #[test]

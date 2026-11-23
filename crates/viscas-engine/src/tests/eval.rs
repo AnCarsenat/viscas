@@ -362,6 +362,7 @@ fn unnamed_expression_does_not_define() {
     let x = e.add_node(None, NodeContent::expression("2 + 3")).unwrap();
     assert_eq!(exact(&e, x), "5");
     assert_eq!(e.evaluator().lookup("2 + 3"), None);
+    assert!(!e.evaluator().defines("2 + 3"));
 }
 
 #[test]
@@ -486,4 +487,67 @@ fn interrupt_flag_is_shared() {
         e.interrupt_flag()
             .load(std::sync::atomic::Ordering::Relaxed)
     );
+}
+
+// ----------------------------------------------------------------------
+// Review regressions
+// ----------------------------------------------------------------------
+
+#[test]
+fn error_spans_from_other_bodies_are_dropped() {
+    let mut e = engine();
+    func(&mut e, "h", &["x"], "1/(x - 2)");
+    let v = var(&mut e, "v", "h(2) + 1000000000");
+    let (msg, _, span) = error(&e, v);
+    assert!(msg.contains("zero"), "{msg}");
+    assert_eq!(span, None);
+}
+
+#[test]
+fn snapshot_is_reused_until_definitions_change() {
+    let mut e = engine();
+    let a = var(&mut e, "a", "1");
+    let s1 = e.defs_snapshot();
+    let s2 = e.defs_snapshot();
+    assert!(std::sync::Arc::ptr_eq(&s1, &s2));
+    set(&mut e, a, "2");
+    let s3 = e.defs_snapshot();
+    assert!(!std::sync::Arc::ptr_eq(&s1, &s3));
+    assert_eq!(s3.get("a").map(|v| v.to_string()), Some("2".into()));
+}
+
+#[test]
+fn plots_compile_against_the_finished_pass() {
+    let mut e = engine();
+    // The plot is created before its input: both evaluate in one pass.
+    let p = e
+        .scene_mut()
+        .add(None, NodeContent::plot("y = m x"))
+        .unwrap();
+    e.scene_mut()
+        .add(None, NodeContent::variable("m", "3"))
+        .unwrap();
+    e.update();
+    match &e.plot_of(p).unwrap().shape {
+        PlotShape::ExplicitY(f) => assert_eq!(f(2.0), 6.0),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn eq_rule_for_add_line_and_plot_nodes() {
+    let mut e = engine();
+    e.set_settings(EngineSettings {
+        definition_op: DefinitionOp::Eq,
+        ..*e.settings()
+    });
+    var(&mut e, "a", "4");
+    let rel = e.add_line(None, "a = x^2").unwrap();
+    assert_eq!(e.scene().get(rel).unwrap().kind.tag(), KindTag::Plot);
+    assert!(e.plot_of(rel).is_some());
+    let f = e.add_line(None, "sq(x) = x^2").unwrap();
+    assert_eq!(e.scene().get(f).unwrap().kind.tag(), KindTag::Function);
+    // A plot node whose text reads as a definition under `=`.
+    let p = plot(&mut e, "k = 3");
+    assert!(e.scene().status(p).is_error());
 }
