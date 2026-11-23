@@ -6,6 +6,8 @@ mod app;
 mod areas;
 mod commands;
 mod ctx;
+mod doc;
+mod doc_ui;
 mod editors;
 mod fuzzy;
 mod layout;

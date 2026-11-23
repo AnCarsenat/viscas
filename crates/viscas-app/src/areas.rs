@@ -207,6 +207,73 @@ impl Areas {
         }
     }
 
+    /// The layout of every workspace plus the current workspace, as the
+    /// document's layout blob.
+    pub fn to_blob(&self) -> serde_json::Value {
+        // Make sure the current workspace has a layout entry.
+        self.with_layout(|_, _| ());
+        let layouts = self.inner.layouts.borrow();
+        let blob = LayoutBlob {
+            version: LayoutBlob::VERSION,
+            workspace: self.workspace().id().to_owned(),
+            layouts: layouts
+                .iter()
+                .map(|(ws, l)| (ws.id().to_owned(), l.clone()))
+                .collect(),
+        };
+        serde_json::to_value(blob).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Restores a blob written by [`Areas::to_blob`]. Unknown workspaces
+    /// are skipped; returns `false` (and changes nothing) when the blob is
+    /// not a valid layout.
+    pub fn restore_blob(&self, value: &serde_json::Value) -> bool {
+        let Ok(blob) = serde_json::from_value::<LayoutBlob>(value.clone()) else {
+            return false;
+        };
+        let Some((workspace, layouts)) = blob.into_layouts() else {
+            return false;
+        };
+        let mut ids = IdGen::default();
+        for l in layouts.values() {
+            ids.reserve(l);
+        }
+        *self.inner.ids.borrow_mut() = ids;
+        *self.inner.layouts.borrow_mut() = layouts;
+        // Area ids restart: cached editors would be matched to the wrong
+        // areas. Dispose them outside the borrow.
+        let dropped: Vec<Editor> = self
+            .inner
+            .editors
+            .borrow_mut()
+            .drain()
+            .map(|(_, e)| e)
+            .collect();
+        drop(dropped);
+        self.inner.workspace.set(workspace);
+        self.inner.active.set(None);
+        self.schedule_rebuild();
+        true
+    }
+
+    /// Back to the default layouts, in the Graph workspace (new document,
+    /// or a document without a usable layout).
+    pub fn reset_default(&self) {
+        *self.inner.ids.borrow_mut() = IdGen::default();
+        self.inner.layouts.borrow_mut().clear();
+        let dropped: Vec<Editor> = self
+            .inner
+            .editors
+            .borrow_mut()
+            .drain()
+            .map(|(_, e)| e)
+            .collect();
+        drop(dropped);
+        self.inner.workspace.set(Workspace::Graph);
+        self.inner.active.set(None);
+        self.schedule_rebuild();
+    }
+
     /// Rebuilds on idle. Structural edits are often triggered by widgets
     /// inside the tree, which must not be destroyed while handling an event.
     fn schedule_rebuild(&self) {
@@ -622,6 +689,41 @@ impl Areas {
     }
 }
 
+/// Serialized layouts of a document (see [`Areas::to_blob`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LayoutBlob {
+    pub version: u32,
+    pub workspace: String,
+    pub layouts: std::collections::BTreeMap<String, Layout>,
+}
+
+impl LayoutBlob {
+    pub const VERSION: u32 = 1;
+
+    /// Validated workspace and layouts; `None` for a future version, an
+    /// unknown current workspace or ids shared between workspaces (ids are
+    /// global, editors are cached by area id).
+    pub fn into_layouts(self) -> Option<(Workspace, HashMap<Workspace, Layout>)> {
+        if self.version > Self::VERSION {
+            return None;
+        }
+        let mut ids: Vec<u32> = self.layouts.values().flat_map(|l| l.ids()).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() != n {
+            return None;
+        }
+        let workspace = Workspace::from_id(&self.workspace)?;
+        let layouts = self
+            .layouts
+            .into_iter()
+            .filter_map(|(id, l)| Some((Workspace::from_id(&id)?, l)))
+            .collect();
+        Some((workspace, layouts))
+    }
+}
+
 #[derive(Clone)]
 struct WeakAreas(Weak<Inner>);
 
@@ -701,4 +803,56 @@ fn paned_span(paned: &gtk::Paned) -> Option<f64> {
     }
     let span = extent(paned.upcast_ref()) - handle;
     (span > 0).then_some(f64::from(span))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_blob_round_trips_and_rejects_bad_input() {
+        let mut ids = IdGen::default();
+        let mut layouts = std::collections::BTreeMap::new();
+        for ws in Workspace::ALL {
+            layouts.insert(ws.id().to_owned(), ws.default_layout(&mut ids));
+        }
+        let blob = LayoutBlob {
+            version: LayoutBlob::VERSION,
+            workspace: "data".into(),
+            layouts,
+        };
+        let json = serde_json::to_value(&blob).unwrap();
+        let back: LayoutBlob = serde_json::from_value(json).unwrap();
+        let (ws, map) = back.into_layouts().unwrap();
+        assert_eq!(ws, Workspace::Data);
+        assert_eq!(map.len(), 4);
+        assert_eq!(
+            map[&Workspace::Graph],
+            Workspace::Graph.default_layout(&mut IdGen::default())
+        );
+
+        let future = LayoutBlob {
+            version: 99,
+            workspace: "graph".into(),
+            layouts: Default::default(),
+        };
+        assert!(future.into_layouts().is_none());
+        let unknown = LayoutBlob {
+            version: 1,
+            workspace: "nope".into(),
+            layouts: Default::default(),
+        };
+        assert!(unknown.into_layouts().is_none());
+
+        // The same layout (same ids) in two workspaces is rejected.
+        let l = Workspace::Graph.default_layout(&mut IdGen::default());
+        let dup = LayoutBlob {
+            version: 1,
+            workspace: "graph".into(),
+            layouts: [("graph".to_owned(), l.clone()), ("data".to_owned(), l)]
+                .into_iter()
+                .collect(),
+        };
+        assert!(dup.into_layouts().is_none());
+    }
 }

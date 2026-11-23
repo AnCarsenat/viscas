@@ -57,6 +57,48 @@ fn open_emits_refresh_events() {
 }
 
 #[test]
+fn replacing_drops_queued_events_of_the_old_document() {
+    let mut e = engine();
+    sample(&mut e);
+    let text = e.save_string().unwrap();
+    // Events of the old scene are still queued.
+    plot(&mut e, "y = 5");
+    e.open_str(&text).unwrap();
+    let ev = e.drain_events();
+    let added_old = e.scene().len() + 1;
+    assert!(
+        !ev.iter()
+            .any(|x| matches!(x, SceneEvent::NodeAdded(id) if id.0 as usize >= added_old))
+    );
+    assert!(ev.contains(&SceneEvent::HistoryChanged));
+}
+
+#[test]
+fn background_load_and_save() {
+    let dir = std::env::temp_dir().join(format!("viscas-engine-bg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bg.viscas");
+    let mut e = engine();
+    sample(&mut e);
+    let task = e.save_task(path.clone());
+    std::thread::spawn(task).join().unwrap().unwrap();
+    e.set_document_path(Some(path.clone()));
+    let scene = std::thread::spawn({
+        let p = path.clone();
+        move || Engine::load_file(&p)
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    let mut f = engine();
+    f.install_document(scene, Some(path.clone()));
+    assert_eq!(f.scene().len(), 3);
+    assert_eq!(f.document_path(), Some(path.as_path()));
+    assert!(Engine::load_file(&dir.join("missing.viscas")).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn invalid_document_leaves_scene_untouched() {
     let mut e = engine();
     sample(&mut e);

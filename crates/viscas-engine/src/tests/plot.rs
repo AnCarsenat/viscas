@@ -711,7 +711,45 @@ fn error_layers_are_retried() {
         layer,
     }));
     assert_eq!(e.layers(vp)[0].error.as_deref(), Some("boom"));
+    // Not a replot trigger for the same view and revision (no loop)...
+    assert!(e.needs_replot().is_empty());
+    // ...but an explicit request retries it.
     assert_eq!(e.prepare_job(vp, view()).items.len(), 1, "retried");
+}
+
+#[test]
+fn needs_replot_without_views_is_empty_and_pending_work_tracks_jobs() {
+    let mut e = engine();
+    plot(&mut e, "y = x");
+    assert!(e.needs_replot().is_empty());
+    assert!(!e.has_pending_work());
+    let vp = e.create_viewport();
+    assert!(e.request_plots(vp, view()) > 0);
+    assert!(e.has_pending_work());
+    assert!(e.wait_for_plots(std::time::Duration::from_secs(10)));
+    assert!(!e.has_pending_work());
+    assert!(e.needs_replot().is_empty());
+}
+
+#[test]
+fn approx_toggle_does_not_reevaluate() {
+    let mut e = engine();
+    let p = plot(&mut e, "y = x");
+    let rev = e.evaluator().revision(p);
+    e.drain_events();
+    let s = EngineSettings {
+        approx: true,
+        ..*e.settings()
+    };
+    e.set_settings(s);
+    assert!(e.settings().approx);
+    assert_eq!(e.evaluator().revision(p), rev);
+    let s = EngineSettings {
+        angle: viscas_core::eval::AngleUnit::Degrees,
+        ..*e.settings()
+    };
+    e.set_settings(s);
+    assert_ne!(e.evaluator().revision(p), rev, "angle changes re-evaluate");
 }
 
 #[test]

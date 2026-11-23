@@ -56,6 +56,14 @@ impl CommandProvider for WindowCommands {
 pub fn specs() -> Vec<(String, String, &'static str)> {
     let mut list: Vec<(String, String, &'static str)> = [
         ("win.palette", "Command Palette", "General"),
+        ("win.new", "New Document", "File"),
+        ("win.open", "Open Document…", "File"),
+        ("win.save", "Save Document", "File"),
+        ("win.save-as", "Save Document As…", "File"),
+        ("win.undo", "Undo", "Edit"),
+        ("win.redo", "Redo", "Edit"),
+        ("win.toggle-approx", "Toggle Exact / Approx", "Mode"),
+        ("win.toggle-angle", "Toggle Radians / Degrees", "Mode"),
         ("app.preferences", "Preferences…", "General"),
         ("app.shortcuts", "Keyboard Shortcuts", "Help"),
         ("app.about", "About Viscas", "Help"),
@@ -146,9 +154,6 @@ mod tests {
     fn every_shortcut_has_a_command() {
         let ids: Vec<String> = specs().into_iter().map(|(a, _, _)| a).collect();
         for s in crate::shortcuts::all() {
-            if s.action.starts_with("win.undo") || s.action.starts_with("win.redo") {
-                continue; // placeholders until the scene has an undo stack
-            }
             assert!(ids.contains(&s.action), "{} has no command", s.action);
         }
     }

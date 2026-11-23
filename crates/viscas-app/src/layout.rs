@@ -180,7 +180,6 @@ impl IdGen {
 
     /// Makes sure future ids are greater than every id of `layout`, e.g.
     /// after loading it from disk.
-    #[allow(dead_code, reason = "used once layouts are persisted (M8)")]
     pub fn reserve(&mut self, layout: &Layout) {
         self.next = self.next.max(layout.max_id().saturating_add(1));
     }
@@ -446,6 +445,13 @@ impl Layout {
     }
 
     /// Largest id used by the layout.
+    /// Every area and split id of the tree.
+    pub fn ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        self.root.collect_ids(&mut ids);
+        ids
+    }
+
     pub fn max_id(&self) -> u32 {
         let mut ids = Vec::new();
         self.root.collect_ids(&mut ids);

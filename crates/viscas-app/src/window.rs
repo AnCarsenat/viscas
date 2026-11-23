@@ -13,7 +13,7 @@ use crate::workspace::Workspace;
 /// Builds and returns the main window for `app`.
 pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     let areas = Areas::new(ctx, Workspace::Graph);
-    let (statusbar, selection_info, area_info) = build_statusbar();
+    let (statusbar, selection_info, area_info, status_widgets) = build_statusbar();
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -37,6 +37,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     palette.contain_focus(&window);
     install_space_key(&window);
     install_actions(&window, &areas, &palette);
+    crate::doc_ui::install(&window, ctx, &areas, status_widgets);
     ctx.add_command_provider(WindowCommands::new(&window));
     ctx.add_command_provider(AreaCommands::new(&areas));
 
@@ -58,15 +59,21 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
         );
     }
 
+    let engine = ctx.engine().clone();
     let update_selection = move |sel: &crate::ctx::Selection| {
+        let name = |id: crate::ctx::NodeId| {
+            engine
+                .with(|e| e.scene().get(id).and_then(|n| n.name.clone()))
+                .unwrap_or_else(|| format!("node {id}"))
+        };
         let selected = sel.selected();
         let text = match selected.len() {
             0 => "Nothing selected".to_owned(),
-            1 => format!("Node #{}", selected[0]),
+            1 => name(selected[0]),
             n => format!("{n} nodes selected"),
         };
         let text = match sel.hovered() {
-            Some(id) => format!("{text}  ·  hover #{id}"),
+            Some(id) => format!("{text}  ·  hover {}", name(id)),
             None => text,
         };
         selection_info.set_label(&text);
@@ -277,8 +284,14 @@ fn menubar() -> gio::Menu {
     bar
 }
 
-/// Status bar; returns it with the selection and active-area labels.
-fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label) {
+/// Status bar; returns it with the selection and active-area labels and
+/// the widgets the document code updates (clickable mode chips, status).
+fn build_statusbar() -> (
+    gtk::Box,
+    gtk::Label,
+    gtk::Label,
+    crate::doc_ui::StatusWidgets,
+) {
     let bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
@@ -296,17 +309,11 @@ fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label) {
         }
         label
     };
-    // Static until the evaluator exists (M1).
-    bar.append(&chip(
-        "EXACT",
-        "Results stay exact (switch: :mode approx)",
-        true,
-    ));
-    bar.append(&chip(
-        "RAD",
-        "Angle unit: radians (switch: :mode deg)",
-        false,
-    ));
+    // Labels and tooltips follow the engine settings (see `doc_ui`).
+    let mode_chip = chip("EXACT", "Results stay exact", true);
+    let angle_chip = chip("RAD", "Angle unit: radians", false);
+    bar.append(&mode_chip);
+    bar.append(&angle_chip);
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     let selection_info = gtk::Label::builder().css_classes(["dim"]).build();
     bar.append(&selection_info);
@@ -327,12 +334,11 @@ fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label) {
             .css_classes(["status-dot"])
             .build(),
     );
-    status.append(
-        &gtk::Label::builder()
-            .label("ready")
-            .css_classes(["mono"])
-            .build(),
-    );
+    let status_label = gtk::Label::builder()
+        .label("ready")
+        .css_classes(["mono"])
+        .build();
+    status.append(&status_label);
     bar.append(&status);
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bar.append(
@@ -341,7 +347,12 @@ fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label) {
             .css_classes(["mono", "faint"])
             .build(),
     );
-    (bar, selection_info, area_info)
+    let widgets = crate::doc_ui::StatusWidgets {
+        mode_chip,
+        angle_chip,
+        status: status_label,
+    };
+    (bar, selection_info, area_info, widgets)
 }
 
 /// Space opens the palette like Blender's search, unless focus is in a
@@ -465,11 +476,15 @@ fn install_actions(window: &gtk::ApplicationWindow, areas: &Areas, palette: &Pal
         }
     ));
     window.add_action(&workspace);
-
-    // Placeholders until the scene model provides an undo stack.
-    for name in ["undo", "redo"] {
-        let action = gio::SimpleAction::new(name, None);
-        action.set_enabled(false);
-        window.add_action(&action);
-    }
+    // Keep the tabs in sync when the workspace changes from elsewhere
+    // (e.g. opening a document restores its workspace).
+    let weak_action = workspace.downgrade();
+    areas.connect_changed(move |areas| {
+        if let Some(action) = weak_action.upgrade() {
+            let id = areas.workspace().id().to_variant();
+            if action.state().as_ref() != Some(&id) {
+                action.set_state(&id);
+            }
+        }
+    });
 }
