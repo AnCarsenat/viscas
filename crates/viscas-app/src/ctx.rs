@@ -2,19 +2,20 @@
 //!
 //! [`AppCtx`] is created once in `app.rs` and passed down; cloning is cheap.
 //! It holds application state that is *not* layout: observable preferences
-//! (see [`PrefsStore`]), the shared
-//! selection/hover model, and the command providers the palette queries.
+//! (see [`PrefsStore`]), the document engine and its event hub (see
+//! [`crate::doc`]), the shared selection/hover model, and the command
+//! providers the palette queries.
 //! The area layout itself stays pure UI state owned by `Areas`.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+pub use viscas_scene::NodeId;
+
 use crate::commands::{Command, CommandProvider};
+use crate::doc::EngineHandle;
 use crate::prefs::Preferences;
 use crate::theme::model::{self, Theme};
-
-/// Placeholder node id until `viscas-scene` provides real node handles.
-pub type NodeId = u64;
 
 type SelectionListener = Rc<dyn Fn(&Selection)>;
 
@@ -40,7 +41,6 @@ impl Selection {
     }
 
     /// Replaces the selection (duplicates are dropped, order kept).
-    #[allow(dead_code, reason = "driven by the scene tree and viewport from M2")]
     pub fn set_selected(&self, ids: impl IntoIterator<Item = NodeId>) {
         let mut unique: Vec<NodeId> = Vec::new();
         for id in ids {
@@ -54,7 +54,7 @@ impl Selection {
         }
     }
 
-    #[allow(dead_code, reason = "driven by the scene tree and viewport from M2")]
+    #[allow(dead_code, reason = "driven by the viewport and scene tree")]
     pub fn set_hovered(&self, id: Option<NodeId>) {
         if self.hovered.replace(id) != id {
             self.notify();
@@ -220,17 +220,23 @@ impl PrefsStore {
     }
 }
 
-#[derive(Default)]
 struct Inner {
     preferences: PrefsStore,
     selection: Selection,
+    engine: EngineHandle,
     providers: RefCell<Vec<Rc<dyn CommandProvider>>>,
 }
 
 /// Shared application context. Cloning yields a handle to the same state.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AppCtx {
     inner: Rc<Inner>,
+}
+
+impl Default for AppCtx {
+    fn default() -> Self {
+        Self::with_engine(EngineHandle::default())
+    }
 }
 
 /// Weak handle to an [`AppCtx`], for closures owned by the context itself.
@@ -246,6 +252,40 @@ impl WeakCtx {
 impl AppCtx {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A context around `engine`. Scene deletions prune the selection and
+    /// clear a hover on a removed node.
+    pub fn with_engine(engine: EngineHandle) -> Self {
+        let ctx = Self {
+            inner: Rc::new(Inner {
+                preferences: PrefsStore::default(),
+                selection: Selection::default(),
+                engine,
+                providers: RefCell::default(),
+            }),
+        };
+        let weak = ctx.downgrade();
+        ctx.engine().set_pre_broadcast(move |events| {
+            let Some(ctx) = weak.upgrade() else {
+                return;
+            };
+            let sel = ctx.selection();
+            if let Some(kept) = crate::doc::prune_removed(&sel.selected(), events) {
+                sel.set_selected(kept);
+            }
+            if let Some(h) = sel.hovered()
+                && crate::doc::prune_removed(&[h], events).is_some()
+            {
+                sel.set_hovered(None);
+            }
+        });
+        ctx
+    }
+
+    /// The document engine (scene, evaluation, plotting) and event hub.
+    pub fn engine(&self) -> &EngineHandle {
+        &self.inner.engine
     }
 
     pub fn downgrade(&self) -> WeakCtx {
@@ -286,15 +326,15 @@ mod tests {
         let c = count.clone();
         sel.connect_changed(move |_| c.set(c.get() + 1));
 
-        sel.set_selected([3, 1, 3]);
-        assert_eq!(sel.selected(), vec![3, 1]);
+        sel.set_selected([NodeId(3), NodeId(1), NodeId(3)]);
+        assert_eq!(sel.selected(), vec![NodeId(3), NodeId(1)]);
         assert_eq!(count.get(), 1);
-        sel.set_selected([3, 1]);
+        sel.set_selected([NodeId(3), NodeId(1)]);
         assert_eq!(count.get(), 1);
 
-        sel.set_hovered(Some(7));
-        sel.set_hovered(Some(7));
-        assert_eq!(sel.hovered(), Some(7));
+        sel.set_hovered(Some(NodeId(7)));
+        sel.set_hovered(Some(NodeId(7)));
+        assert_eq!(sel.hovered(), Some(NodeId(7)));
         assert_eq!(count.get(), 2);
     }
 
@@ -302,7 +342,7 @@ mod tests {
     fn listeners_may_connect_listeners() {
         let sel = Rc::new(Selection::default());
         sel.connect_changed(|s| s.connect_changed(|_| {}));
-        sel.set_hovered(Some(1));
+        sel.set_hovered(Some(NodeId(1)));
         sel.set_hovered(None);
     }
 

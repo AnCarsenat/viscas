@@ -748,6 +748,10 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "viscas-core",
+ "viscas-engine",
+ "viscas-plot",
+ "viscas-scene",
 ]
 
 [[package]]

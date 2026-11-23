@@ -29,9 +29,16 @@ pub fn build() -> gtk::Application {
 
 fn setup(app: &gtk::Application, ctx: &AppCtx) {
     settings::init(ctx);
+    crate::doc_ui::connect_prefs(ctx);
 
+    // Closing the windows (instead of `app.quit()`) lets each one ask to
+    // save a modified document; the app exits with the last window.
     let quit = gio::ActionEntry::builder("quit")
-        .activate(|app: &gtk::Application, _, _| app.quit())
+        .activate(|app: &gtk::Application, _, _| {
+            for w in app.windows() {
+                w.close();
+            }
+        })
         .build();
     let about = gio::ActionEntry::builder("about")
         .activate(|app: &gtk::Application, _, _| show_about(app))

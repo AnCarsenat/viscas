@@ -32,6 +32,10 @@ pub fn all() -> Vec<Shortcut> {
         ),
         ("app.quit", "<Control>q", "Quit"),
         ("app.shortcuts", "<Control>question", "Keyboard shortcuts"),
+        ("win.new", "<Control>n", "New document"),
+        ("win.open", "<Control>o", "Open document"),
+        ("win.save", "<Control>s", "Save document"),
+        ("win.save-as", "<Control><Shift>s", "Save document as"),
         ("win.undo", "<Control>z", "Undo"),
         ("win.redo", "<Control><Shift>z", "Redo"),
     ];

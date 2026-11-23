@@ -180,7 +180,6 @@ impl IdGen {
 
     /// Makes sure future ids are greater than every id of `layout`, e.g.
     /// after loading it from disk.
-    #[allow(dead_code, reason = "used once layouts are persisted (M8)")]
     pub fn reserve(&mut self, layout: &Layout) {
         self.next = self.next.max(layout.max_id().saturating_add(1));
     }
