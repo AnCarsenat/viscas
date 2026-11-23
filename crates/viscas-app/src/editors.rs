@@ -95,24 +95,13 @@ impl Editor {
 
     /// Editor-specific widgets for the area header (menus, tools).
     pub fn header_content(&self) -> Vec<gtk::Widget> {
-        let mut widgets: Vec<gtk::Widget> = header_menus(self.kind)
+        if let Some(viewport) = &self.viewport {
+            return viewport.header_widgets();
+        }
+        header_menus(self.kind)
             .iter()
             .map(|(title, items)| header_menu(title, items).upcast())
-            .collect();
-        if let Some(viewport) = &self.viewport {
-            let reset = gtk::Button::builder()
-                .icon_name(pick_icon(&[
-                    "zoom-original-symbolic",
-                    "view-refresh-symbolic",
-                ]))
-                .tooltip_text("Reset View")
-                .css_classes(["area-tool"])
-                .build();
-            let vp = viewport.clone();
-            reset.connect_clicked(move |_| vp.reset_view());
-            widgets.push(reset.upcast());
-        }
-        widgets
+            .collect()
     }
 }
 
@@ -120,10 +109,7 @@ impl Editor {
 /// no action yet, so they render insensitive.
 fn header_menus(kind: EditorKind) -> &'static [(&'static str, &'static [&'static str])] {
     match kind {
-        EditorKind::Viewport => &[
-            ("View", &["Frame All", "Lock Aspect", "Polar Grid"]),
-            ("Add", &["Function", "Point", "Slider"]),
-        ],
+        EditorKind::Viewport => &[], // built by the viewport itself
         EditorKind::SceneTree => &[("Node", &["New Folder", "Rename", "Delete"])],
         EditorKind::Inspector => &[("Edit", &["Copy Style", "Paste Style"])],
         EditorKind::Console => &[("Session", &["Clear", "Copy Result", "Pin as Node"])],
