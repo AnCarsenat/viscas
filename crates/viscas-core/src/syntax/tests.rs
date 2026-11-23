@@ -209,6 +209,12 @@ fn sx_stmt(s: &Stmt) -> String {
             rhs,
             restrictions,
         } => format!("(= {} {}{})", sx(lhs), sx(rhs), sx_conds(restrictions)),
+        StmtKind::Definition {
+            lhs,
+            rhs,
+            restrictions,
+            ..
+        } => format!("(:= {} {}{})", sx(lhs), sx(rhs), sx_conds(restrictions)),
         StmtKind::Regression {
             lhs,
             rhs,
@@ -1625,4 +1631,59 @@ fn property_print_parse_roundtrip() {
         checked += 1;
     }
     assert!(checked * 3 > iters * 2, "only {checked} trees checked");
+}
+
+// ---------------------------------------------------------------------------
+// Definition operator
+// ---------------------------------------------------------------------------
+
+#[test]
+fn colon_eq_definitions() {
+    for (src, want) in [
+        ("a := 3", "(:= a 3)"),
+        ("a ≔ 3", "(:= a 3)"),
+        ("f(x) := x^2", "(:= (call f x) (^ x 2))"),
+        (
+            "g(x, y) := x y {x > 0}",
+            "(:= (call g x y) (* x y) {(> x 0)})",
+        ),
+        ("a = 3", "(= a 3)"),
+        ("x = 3", "(= x 3)"),
+    ] {
+        let s = stmt_ok(src);
+        assert_eq!(sx_stmt(&s), want, "{src}");
+        roundtrip_stmt(src, &s);
+    }
+    assert_eq!(stmt_ok("f(x) := x^2").to_string(), "f(x) := x^2");
+}
+
+#[test]
+fn colon_eq_rejects_bad_heads() {
+    for src in ["a + b := 1", "f(1) := 2", "f(x, x) := 1", "(a, b) := 1"] {
+        assert!(parse_statement(src).is_err(), "{src}");
+    }
+}
+
+#[test]
+fn colon_in_piecewise_unaffected() {
+    let e = parse_expr("{x < 0: -x, x}").unwrap();
+    assert!(matches!(&*e.kind, ExprKind::Piecewise { .. }));
+}
+
+#[test]
+fn eq_mode_definitions() {
+    let opts = ParseOptions {
+        definition_op: DefinitionOp::Eq,
+    };
+    let p = |src: &str| sx_stmt(&parse_statement_with(src, &opts).unwrap());
+    assert_eq!(p("a = 3"), "(:= a 3)");
+    assert_eq!(p("f(x) = x^2"), "(:= (call f x) (^ x 2))");
+    assert_eq!(p("y = x^2"), "(= y (^ x 2))");
+    assert_eq!(p("x = 3"), "(= x 3)");
+    assert_eq!(p("r = θ"), "(= r θ)");
+    assert_eq!(p("sin(x) = y"), "(= (call sin x) y)");
+    assert_eq!(p("x^2 + y^2 = 4"), "(= (+ (^ x 2) (^ y 2)) 4)");
+    assert_eq!(p("b := 1"), "(:= b 1)");
+    let prog = parse_program_with("for k in L { s = s + k }", &opts).unwrap();
+    assert!(sx_stmt(&prog.stmts[0]).contains("(:= s"));
 }

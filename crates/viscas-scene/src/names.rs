@@ -202,52 +202,15 @@ pub fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
     unreachable!()
 }
 
-/// Variables that make a line a plot rather than a definition.
-const PLOT_LHS: &[&str] = &["x", "y", "r", "θ", "theta"];
+/// Which operator introduces a definition in expression-list lines — the
+/// core parser's setting: [`DefinitionOp::ColonEq`] (default: `a := 3`,
+/// `f(x) := x^2`; a plain `=` is always a relation) or
+/// [`DefinitionOp::Eq`] (`a = 3` defines, `y = …` plots).
+pub use viscas_core::syntax::DefinitionOp;
 
-/// Which operator introduces a definition in expression-list lines.
-///
-/// `Equals` is the current grammar (`a = 3` defines, `y = …` plots).
-/// `ColonEquals` is the planned syntax (`a := 3`, `f(x) := x^2`), where a
-/// plain `=` is always a relation; it will switch to the core parser's
-/// `ParseOptions::definition_op` once that lands.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DefinitionOp {
-    #[default]
-    Equals,
-    ColonEquals,
-}
-
-/// Options for [`parse_definition_with`] / [`definition_line_with`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LineOptions {
-    pub definition_op: DefinitionOp,
-}
-
-/// Byte offset of the first top-level `:=` (outside strings and brackets).
-fn find_colon_equals(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
-    let (mut depth, mut in_str, mut escaped) = (0i32, false, false);
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_str {
-            match b {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_str = false,
-                _ => {}
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b':' if depth == 0 && bytes.get(i + 1) == Some(&b'=') => return Some(i),
-            _ => {}
-        }
-    }
-    None
-}
+/// Options for [`parse_definition_with`] / [`definition_line_with`]: the
+/// core parser options.
+pub type LineOptions = viscas_core::syntax::ParseOptions;
 
 /// [`parse_definition_with`] using the default options.
 pub fn parse_definition(line: &str) -> Result<NodeContent, Vec<ParseError>> {
@@ -256,39 +219,29 @@ pub fn parse_definition(line: &str) -> Result<NodeContent, Vec<ParseError>> {
 
 /// Classify one expression-list / console line into node content:
 ///
-/// - `a = 3` → Variable `a`; `P = (1, 2)` → Point; `L = [1..5]` → List
-/// - `f(x, y) = body` → Function
-/// - `y = …`, `x = …`, `r = …`, implicit equations, inequalities and
-///   tuples → Plot
+/// - `a := 3` → Variable `a`; `P := (1, 2)` → Point; `L := [1..5]` → List
+/// - `f(x, y) := body` → Function
+/// - every `=` line (`y = …`, `x = …`, `r = …`, implicit equations),
+///   inequalities and tuples → Plot
 /// - `lhs ~ rhs` → Regression (no parameters; the caller fills them in)
 /// - `a -> …` → Action
 /// - any other expression → unnamed Variable (anonymous expression)
 ///
-/// With [`DefinitionOp::ColonEquals`] only `name := …` / `f(x) := …`
-/// define (any name) and every `=` line is a relation (Plot).
+/// With [`DefinitionOp::Eq`] the parser also turns `name = …` /
+/// `f(x) = …` into definitions (except for `x`, `y`, `r`, `θ` and prefix
+/// functions such as `sin`).
 pub fn parse_definition_with(
     line: &str,
     options: LineOptions,
 ) -> Result<NodeContent, Vec<ParseError>> {
-    let colon = options.definition_op == DefinitionOp::ColonEquals;
-    let assign = if colon { find_colon_equals(line) } else { None };
-    // `:=` → ` =` keeps every byte offset intact.
-    let parsed_text = match assign {
-        Some(i) => format!("{} ={}", &line[..i], &line[i + 2..]),
-        None => line.to_string(),
-    };
-    let stmt = syntax::parse_statement(&parsed_text)?;
+    let stmt = syntax::parse_statement_with(line, &options)?;
     let text = line.trim().to_string();
-    let defining = !colon || assign.is_some();
-    let reserved = |name: &str| !colon && PLOT_LHS.contains(&name);
     Ok(match &stmt.kind {
-        StmtKind::Equation { .. } if !defining => NodeContent::plot(text),
-        StmtKind::Equation { lhs, rhs, .. } => {
-            let body = parsed_text[rhs.span.start..stmt.span.end]
-                .trim()
-                .to_string();
+        StmtKind::Equation { .. } => NodeContent::plot(text),
+        StmtKind::Definition { lhs, rhs, .. } => {
+            let body = line[rhs.span.start..stmt.span.end].trim().to_string();
             match &*lhs.kind {
-                ExprKind::Ident(name) if !reserved(name) => match &*rhs.kind {
+                ExprKind::Ident(name) => match &*rhs.kind {
                     ExprKind::Tuple(items) if items.len() == 2 => NodeContent::point(name, body),
                     ExprKind::List(_) | ExprKind::Range { .. } | ExprKind::Comprehension { .. } => {
                         NodeContent::list(name, body)
@@ -304,7 +257,7 @@ pub fn parse_definition_with(
                         })
                         .collect();
                     match (&*callee.kind, params) {
-                        (ExprKind::Ident(f), Some(params)) if !reserved(f) => {
+                        (ExprKind::Ident(f), Some(params)) => {
                             NodeContent::function(f, &params, body)
                         }
                         _ => NodeContent::plot(text),
@@ -329,13 +282,13 @@ pub fn definition_line(content: &NodeContent) -> Option<String> {
     definition_line_with(content, LineOptions::default())
 }
 
-/// Render a node back to an expression-list line (`f(x) = x^2`), the
+/// Render a node back to an expression-list line (`f(x) := x^2`), the
 /// inverse of [`parse_definition_with`] for expression-like kinds.
 pub fn definition_line_with(content: &NodeContent, options: LineOptions) -> Option<String> {
     let name = content.name.as_deref();
     let op = match options.definition_op {
-        DefinitionOp::Equals => "=",
-        DefinitionOp::ColonEquals => ":=",
+        DefinitionOp::Eq => "=",
+        DefinitionOp::ColonEq => ":=",
     };
     Some(match (&content.kind, name) {
         (NodeKind::Variable { expr }, Some(n))

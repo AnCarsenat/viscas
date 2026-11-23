@@ -260,13 +260,27 @@ pub enum StmtKind {
         expr: Expr,
         restrictions: Vec<Expr>,
     },
-    /// `lhs = rhs {restrictions}`: definition (`a = 3`, `f(x) = x^2`) or
-    /// equation (`y = sin x`, `x^2 + y^2 = 4`). A later pass classifies it.
-    /// Restrictions apply to the whole relation.
+    /// `lhs = rhs {restrictions}`: an equation or relation (`y = sin x`,
+    /// `x^2 + y^2 = 4`, `a = 3`). Only with
+    /// [`DefinitionOp::Eq`](super::DefinitionOp::Eq) does the evaluator
+    /// treat `name = ...` / `f(x) = ...` as a definition. Restrictions apply
+    /// to the whole relation.
     Equation {
         lhs: Expr,
         rhs: Expr,
         restrictions: Vec<Expr>,
+    },
+    /// `lhs := rhs {restrictions}`: definition of a global variable
+    /// (`a := 3`) or function (`f(x, y) := ...`). The parser guarantees that
+    /// `lhs` is a name or a call with distinct plain-name arguments.
+    Definition {
+        lhs: Expr,
+        rhs: Expr,
+        restrictions: Vec<Expr>,
+        /// Written with `=` under [`DefinitionOp::Eq`](super::DefinitionOp)
+        /// (printed with `=`; reassigns a visible `let` of the same name).
+        /// `false` for `:=`, which always defines a global.
+        with_eq: bool,
     },
     /// `lhs ~ rhs {restrictions}`
     Regression {
@@ -437,6 +451,12 @@ impl Stmt {
                 lhs,
                 rhs,
                 restrictions,
+            }
+            | StmtKind::Definition {
+                lhs,
+                rhs,
+                restrictions,
+                ..
             }
             | StmtKind::Regression {
                 lhs,
@@ -929,16 +949,23 @@ fn write_stmt_body(f: &mut fmt::Formatter<'_>, stmt: &Stmt, depth: usize) -> fmt
             rhs,
             restrictions,
         }
+        | StmtKind::Definition {
+            lhs,
+            rhs,
+            restrictions,
+            ..
+        }
         | StmtKind::Regression {
             lhs,
             rhs,
             restrictions,
         } => {
             top(f, lhs)?;
-            f.write_str(if matches!(stmt.kind, StmtKind::Equation { .. }) {
-                " = "
-            } else {
-                " ~ "
+            f.write_str(match stmt.kind {
+                StmtKind::Equation { .. } => " = ",
+                StmtKind::Definition { with_eq: true, .. } => " = ",
+                StmtKind::Definition { .. } => " := ",
+                _ => " ~ ",
             })?;
             top(f, rhs)?;
             write_restrictions(f, restrictions)

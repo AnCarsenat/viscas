@@ -3,9 +3,9 @@
 //! See the [module docs](super) for the grammar and the implicit
 //! multiplication rules.
 
-use super::ParseError;
 use super::ast::*;
 use super::token::{Keyword, Span, Token, TokenKind as T};
+use super::{DefinitionOp, ParseError, ParseOptions};
 
 type PResult<X> = Result<X, ParseError>;
 
@@ -29,6 +29,41 @@ pub const PREFIX_FUNCTIONS: &[&str] = &[
 const TRIG: &[&str] = &[
     "sin", "cos", "tan", "csc", "sec", "cot", "sinh", "cosh", "tanh", "csch", "sech", "coth",
 ];
+
+/// A valid left side of a definition: `name` or `f(a, b, ...)` with
+/// distinct plain parameter names.
+pub fn is_definition_head(lhs: &Expr) -> bool {
+    match &*lhs.kind {
+        ExprKind::Ident(_) => true,
+        ExprKind::Call { callee, args } => {
+            matches!(&*callee.kind, ExprKind::Ident(_))
+                && args.iter().enumerate().all(|(i, a)| match &*a.kind {
+                    ExprKind::Ident(p) => !args[..i]
+                        .iter()
+                        .any(|b| matches!(&*b.kind, ExprKind::Ident(q) if q == p)),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+/// In [`DefinitionOp::Eq`] mode, `lhs = rhs` is a definition when `lhs` is a
+/// definition head whose name is not a plot coordinate (`x`, `y`, `r`, `θ`) or a
+/// prefix function (`sin(x) = y` stays a relation).
+fn is_eq_mode_definition(lhs: &Expr) -> bool {
+    let name = match &*lhs.kind {
+        ExprKind::Ident(n) => n,
+        ExprKind::Call { callee, .. } => match &*callee.kind {
+            ExprKind::Ident(n) => n,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    is_definition_head(lhs)
+        && !matches!(name.as_str(), "x" | "y" | "r" | "θ" | "theta")
+        && !is_prefix_function(name)
+}
 
 pub fn is_prefix_function(name: &str) -> bool {
     PREFIX_FUNCTIONS.contains(&name) || (name.starts_with("log_") && name.len() > 4)
@@ -97,10 +132,11 @@ pub(crate) struct Parser {
     prev: Option<usize>,
     prev_end: usize,
     pub(crate) errors: Vec<ParseError>,
+    opts: ParseOptions,
 }
 
 impl Parser {
-    pub(crate) fn new(tokens: Vec<Token>) -> Self {
+    pub(crate) fn new(tokens: Vec<Token>, opts: ParseOptions) -> Self {
         debug_assert!(matches!(tokens.last().map(|t| &t.kind), Some(T::Eof)));
         Parser {
             tokens,
@@ -110,6 +146,7 @@ impl Parser {
             prev: None,
             prev_end: 0,
             errors: Vec::new(),
+            opts,
         }
     }
 
@@ -453,7 +490,17 @@ impl Parser {
                         self.skip_newlines();
                         let rhs = self.parse_expr()?;
                         let restrictions = self.parse_restrictions()?;
-                        if is_eq {
+                        if is_eq
+                            && self.opts.definition_op == DefinitionOp::Eq
+                            && is_eq_mode_definition(&lhs)
+                        {
+                            StmtKind::Definition {
+                                lhs,
+                                rhs,
+                                restrictions,
+                                with_eq: true,
+                            }
+                        } else if is_eq {
                             StmtKind::Equation {
                                 lhs,
                                 rhs,
@@ -465,6 +512,24 @@ impl Parser {
                                 rhs,
                                 restrictions,
                             }
+                        }
+                    }
+                    T::ColonEq => {
+                        let op_span = self.bump().span;
+                        if !is_definition_head(&lhs) {
+                            return Err(ParseError::new(
+                                lhs.span.to(op_span),
+                                "the left side of `:=` must be a name or `f(x, ...)` with distinct parameter names",
+                            ));
+                        }
+                        self.skip_newlines();
+                        let rhs = self.parse_expr()?;
+                        let restrictions = self.parse_restrictions()?;
+                        StmtKind::Definition {
+                            lhs,
+                            rhs,
+                            restrictions,
+                            with_eq: false,
                         }
                     }
                     T::Arrow => {
