@@ -13,7 +13,7 @@ use crate::workspace::Workspace;
 /// Builds and returns the main window for `app`.
 pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     let areas = Areas::new(ctx, Workspace::Graph);
-    let (statusbar, selection_info, area_info, chips) = build_statusbar();
+    let (statusbar, selection_info, area_info, status_widgets) = build_statusbar();
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -37,7 +37,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     palette.contain_focus(&window);
     install_space_key(&window);
     install_actions(&window, &areas, &palette);
-    crate::doc_ui::install(&window, ctx, &areas, chips);
+    crate::doc_ui::install(&window, ctx, &areas, status_widgets);
     ctx.add_command_provider(WindowCommands::new(&window));
     ctx.add_command_provider(AreaCommands::new(&areas));
 
@@ -285,8 +285,13 @@ fn menubar() -> gio::Menu {
 }
 
 /// Status bar; returns it with the selection and active-area labels and
-/// the (clickable) exact/approx and angle-unit chips.
-fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label, (gtk::Label, gtk::Label)) {
+/// the widgets the document code updates (clickable mode chips, status).
+fn build_statusbar() -> (
+    gtk::Box,
+    gtk::Label,
+    gtk::Label,
+    crate::doc_ui::StatusWidgets,
+) {
     let bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
@@ -329,12 +334,11 @@ fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label, (gtk::Label, gtk::Lab
             .css_classes(["status-dot"])
             .build(),
     );
-    status.append(
-        &gtk::Label::builder()
-            .label("ready")
-            .css_classes(["mono"])
-            .build(),
-    );
+    let status_label = gtk::Label::builder()
+        .label("ready")
+        .css_classes(["mono"])
+        .build();
+    status.append(&status_label);
     bar.append(&status);
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bar.append(
@@ -343,7 +347,12 @@ fn build_statusbar() -> (gtk::Box, gtk::Label, gtk::Label, (gtk::Label, gtk::Lab
             .css_classes(["mono", "faint"])
             .build(),
     );
-    (bar, selection_info, area_info, (mode_chip, angle_chip))
+    let widgets = crate::doc_ui::StatusWidgets {
+        mode_chip,
+        angle_chip,
+        status: status_label,
+    };
+    (bar, selection_info, area_info, widgets)
 }
 
 /// Space opens the palette like Blender's search, unless focus is in a

@@ -11,6 +11,13 @@
 //!   scene events, polls plots and features, prunes the selection and then
 //!   broadcasts [`DocEvent`]s through [`DocEvents`] — after every engine
 //!   borrow is released.
+//! - The modified flag follows the undo history: undoing back to the saved
+//!   state makes the document clean again ([`track_saved`]). Layout-only
+//!   changes (areas, workspace) never dirty the document; they are stored
+//!   with the next save.
+//! - Selection and hover live in the app ([`crate::ctx::Selection`]), the
+//!   single source of truth; the scene's own selection is not used. Node
+//!   removal prunes them and a document replacement clears them.
 //! - [`settings_from_prefs`] and [`palette_for_theme`] map preferences to
 //!   the engine (pure, tested).
 
@@ -168,6 +175,38 @@ pub fn window_title(path: Option<&std::path::Path>, modified: bool) -> String {
     format!("{}{dot} — Viscas", document_name(path))
 }
 
+/// Where the saved state sits in the undo history after one pump tick.
+///
+/// `saved` is the undo depth at the last save/open/new (`None`: the saved
+/// state is unreachable, so the document stays modified until saved).
+/// `prev_depth`/`depth` are the undo depths before and after the tick,
+/// `navigated` says the change came from undo/redo, `edited` that the tick
+/// had document-changing events and `full` that the history is at its
+/// depth limit (its oldest step was dropped).
+pub fn track_saved(
+    saved: Option<usize>,
+    prev_depth: usize,
+    depth: usize,
+    navigated: bool,
+    edited: bool,
+    full: bool,
+) -> Option<usize> {
+    let saved = saved?;
+    if navigated || depth < prev_depth || !edited {
+        return Some(saved);
+    }
+    // A new edit: it replaces the redo branch, so a saved point that was
+    // only reachable by redo is gone; an edit that did not grow the
+    // history (truncated at the limit) shifts or drops the saved point.
+    if prev_depth < saved {
+        return None;
+    }
+    if depth == prev_depth && (full || prev_depth == saved) {
+        return None;
+    }
+    Some(saved)
+}
+
 /// Hook run on a tick's scene events before they are broadcast.
 type EventHook = Rc<dyn Fn(&[SceneEvent])>;
 
@@ -176,12 +215,24 @@ struct Inner {
     events: Rc<DocEvents>,
     /// A tick is queued (idle or timeout).
     scheduled: Cell<bool>,
+    /// A tick is running (re-entrant flushes are ignored).
+    ticking: Cell<bool>,
     /// Latest feature ticket not delivered yet.
     feature_pending: Cell<Option<u64>>,
     modified: Cell<bool>,
+    /// Undo depth of the saved state (see [`track_saved`]).
+    saved_depth: Cell<Option<usize>>,
+    /// Undo depth seen by the last tick.
+    last_depth: Cell<usize>,
+    /// Undo/redo ran since the last tick.
+    navigated: Cell<bool>,
     last_settings: Cell<EngineSettings>,
-    /// Viewports created through the handle (polled while rendering).
-    viewports: RefCell<Vec<ViewportId>>,
+    /// Settings to apply on the next tick (status-bar chips).
+    pending_settings: Cell<Option<EngineSettings>>,
+    /// Viewports whose close found the engine borrowed.
+    pending_close: RefCell<Vec<ViewportId>>,
+    /// Undo depth limit from the preferences (re-applied to new scenes).
+    history_limit: Cell<Option<usize>>,
     /// Run during each tick before broadcasting (selection pruning).
     pre_broadcast: RefCell<Option<EventHook>>,
 }
@@ -206,10 +257,16 @@ impl EngineHandle {
                 engine: RefCell::new(engine),
                 events: Rc::default(),
                 scheduled: Cell::new(false),
+                ticking: Cell::new(false),
                 feature_pending: Cell::new(None),
                 modified: Cell::new(false),
+                saved_depth: Cell::new(Some(0)),
+                last_depth: Cell::new(0),
+                navigated: Cell::new(false),
                 last_settings: Cell::new(settings),
-                viewports: RefCell::default(),
+                pending_settings: Cell::new(None),
+                pending_close: RefCell::default(),
+                history_limit: Cell::new(None),
                 pre_broadcast: RefCell::new(None),
             }),
         }
@@ -231,11 +288,40 @@ impl EngineHandle {
     }
 
     /// Mutates the engine and wakes the pump, which broadcasts the
-    /// resulting events. Do not call GTK or emit signals inside `f`.
+    /// resulting events. Do not call GTK or emit signals inside `f`. Use
+    /// [`EngineHandle::undo`]/[`EngineHandle::redo`] for history
+    /// navigation so the saved point is tracked exactly.
     pub fn edit<R>(&self, f: impl FnOnce(&mut Engine) -> R) -> R {
         let r = f(&mut self.inner.engine.borrow_mut());
         self.wake();
         r
+    }
+
+    /// Undo one step.
+    pub fn undo(&self) -> bool {
+        self.inner.navigated.set(true);
+        self.edit(|e| e.undo())
+    }
+
+    /// Redo one step.
+    pub fn redo(&self) -> bool {
+        self.inner.navigated.set(true);
+        self.edit(|e| e.redo())
+    }
+
+    /// Applies evaluation settings on the next pump tick (not inside the
+    /// caller's event handler). The latest call wins.
+    pub fn set_settings_deferred(&self, settings: EngineSettings) {
+        self.inner.pending_settings.set(Some(settings));
+        self.wake();
+    }
+
+    /// The settings that will be in effect after pending changes.
+    pub fn effective_settings(&self) -> EngineSettings {
+        self.inner
+            .pending_settings
+            .get()
+            .unwrap_or_else(|| self.with(|e| *e.settings()))
     }
 
     /// Requests features near a world point (see
@@ -258,19 +344,20 @@ impl EngineHandle {
     /// Allocates an engine viewport for a graph editor.
     #[allow(dead_code, reason = "used by viewport editors")]
     pub fn create_viewport(&self) -> ViewportId {
-        let id = self.inner.engine.borrow_mut().create_viewport();
-        self.inner.viewports.borrow_mut().push(id);
-        id
+        self.inner.engine.borrow_mut().create_viewport()
     }
 
-    /// Cancels and drops an engine viewport (editor destroyed).
+    /// Cancels and drops an engine viewport (editor destroyed). When the
+    /// engine is borrowed (an editor disposed during a tick) the close is
+    /// queued and done by the next tick.
     #[allow(dead_code, reason = "used by viewport editors")]
     pub fn close_viewport(&self, id: ViewportId) {
-        self.inner.viewports.borrow_mut().retain(|v| *v != id);
-        // The editor may be disposed while the engine is borrowed (e.g. a
-        // window closing during a tick): never panic here.
-        if let Ok(mut e) = self.inner.engine.try_borrow_mut() {
-            e.close_viewport(id);
+        match self.inner.engine.try_borrow_mut() {
+            Ok(mut e) => e.close_viewport(id),
+            Err(_) => {
+                self.inner.pending_close.borrow_mut().push(id);
+                self.wake();
+            }
         }
     }
 
@@ -281,15 +368,37 @@ impl EngineHandle {
         self.edit(|e| e.request_plots(viewport, view))
     }
 
+    /// Whether the document differs from its saved state. Pending events
+    /// are counted only after a tick; call [`EngineHandle::flush`] first
+    /// when the answer must be exact (save prompts).
     pub fn is_modified(&self) -> bool {
         self.inner.modified.get()
     }
 
-    /// Sets the modified flag; emits [`DocEvent::Document`] on change.
-    pub fn set_modified(&self, modified: bool) {
+    fn set_modified(&self, modified: bool) {
         if self.inner.modified.replace(modified) != modified {
             self.inner.events.emit(&DocEvent::Document);
         }
+    }
+
+    /// Starts a save: seals the undo history (the next edit becomes a new
+    /// step, so the saved point stays addressable by depth) and returns
+    /// the depth being saved. Call [`EngineHandle::flush`] first.
+    pub fn begin_save(&self) -> usize {
+        let mut e = self.inner.engine.borrow_mut();
+        e.scene_mut().seal_history();
+        e.scene().undo_depth()
+    }
+
+    /// Records the state of [`EngineHandle::begin_save`] as saved (edits
+    /// made while the file was written keep the document modified) and
+    /// emits [`DocEvent::Document`].
+    pub fn finish_save(&self, depth: usize) {
+        self.flush();
+        self.inner.saved_depth.set(Some(depth));
+        let current = self.with(|e| e.scene().undo_depth());
+        self.inner.modified.set(current != depth);
+        self.inner.events.emit(&DocEvent::Document);
     }
 
     pub fn path(&self) -> Option<PathBuf> {
@@ -313,38 +422,78 @@ impl EngineHandle {
         let weak = Rc::downgrade(&self.inner);
         glib::idle_add_local_once(move || {
             if let Some(inner) = weak.upgrade() {
-                EngineHandle { inner }.tick();
+                let h = EngineHandle { inner };
+                h.inner.scheduled.set(false);
+                h.tick();
             }
         });
     }
 
+    /// Runs a tick now, so the modified flag and listeners are up to date
+    /// (before save prompts and saves). No-op inside a tick.
+    pub fn flush(&self) {
+        self.tick();
+    }
+
     /// One pump step; reschedules itself while work is pending.
     pub fn tick(&self) {
-        self.inner.scheduled.set(false);
-        let (events, ready, replot, features, settings, pending) = {
+        if self.inner.ticking.replace(true) {
+            return;
+        }
+        let closes: Vec<ViewportId> = self.inner.pending_close.borrow_mut().drain(..).collect();
+        let pending_settings = self.inner.pending_settings.take();
+        let (events, ready, replot, features, settings, plotting, depth, full) = {
             let mut e = self.inner.engine.borrow_mut();
+            for id in closes {
+                e.close_viewport(id);
+            }
+            if let Some(s) = pending_settings {
+                e.set_settings(s);
+            }
             e.update();
             let events = e.drain_events();
             let ready = e.poll_plots();
             let features = e.poll_features();
-            let replot = e.needs_replot();
-            let settings = *e.settings();
-            let plotting = e.queued_tasks() > 0
-                || self
-                    .inner
-                    .viewports
-                    .borrow()
-                    .iter()
-                    .any(|v| e.pending_plots(*v) > 0);
-            (events, ready, replot, features, settings, plotting)
+            // Layers can only go missing after scene changes or arriving
+            // results; skip the scan otherwise.
+            let replot = if events.is_empty() && ready.is_empty() {
+                Vec::new()
+            } else {
+                e.needs_replot()
+            };
+            let scene = e.scene();
+            let depth = scene.undo_depth();
+            let limit = self.history_limit_hint();
+            (
+                events,
+                ready,
+                replot,
+                features,
+                *e.settings(),
+                e.has_pending_work(),
+                depth,
+                limit.is_some_and(|l| depth >= l),
+            )
         };
+        self.inner.ticking.set(false);
         let delivered = features
             .iter()
             .any(|f| Some(f.ticket) == self.inner.feature_pending.get());
         if delivered {
             self.inner.feature_pending.set(None);
         }
-        let pending = pending || self.inner.feature_pending.get().is_some();
+        let pending = plotting || self.inner.feature_pending.get().is_some();
+
+        let edited = events.iter().any(modifies_document);
+        let saved = track_saved(
+            self.inner.saved_depth.get(),
+            self.inner.last_depth.replace(depth),
+            depth,
+            self.inner.navigated.take(),
+            edited,
+            full,
+        );
+        self.inner.saved_depth.set(saved);
 
         if !events.is_empty() {
             let hook = self.inner.pre_broadcast.borrow().clone();
@@ -357,12 +506,9 @@ impl EngineHandle {
             hub.emit(&DocEvent::Settings(settings));
         }
         if !events.is_empty() {
-            let modifies = events.iter().any(modifies_document);
             hub.emit(&DocEvent::Scene(events.into()));
-            if modifies {
-                self.set_modified(true);
-            }
         }
+        self.set_modified(saved != Some(depth));
         if !ready.is_empty() {
             hub.emit(&DocEvent::PlotsReady(ready.into()));
         }
@@ -376,21 +522,50 @@ impl EngineHandle {
             let weak = Rc::downgrade(&self.inner);
             glib::timeout_add_local_once(PUMP_INTERVAL, move || {
                 if let Some(inner) = weak.upgrade() {
-                    EngineHandle { inner }.tick();
+                    let h = EngineHandle { inner };
+                    h.inner.scheduled.set(false);
+                    h.tick();
                 }
             });
         }
     }
 
-    /// Replaces the document (new/open) and broadcasts [`DocEvent::Replaced`].
-    pub fn replace_with<R>(&self, f: impl FnOnce(&mut Engine) -> R) -> R {
-        let r = f(&mut self.inner.engine.borrow_mut());
+    /// The undo depth limit, as set by [`EngineHandle::set_history_limit`].
+    fn history_limit_hint(&self) -> Option<usize> {
+        self.inner.history_limit.get()
+    }
+
+    /// Sets the scene's undo depth limit (kept across new/open).
+    pub fn set_history_limit(&self, limit: usize) {
+        self.inner.history_limit.set(Some(limit));
+        self.inner
+            .engine
+            .borrow_mut()
+            .scene_mut()
+            .set_history_limit(limit);
+    }
+
+    /// Replaces the document with an already loaded one (new/open after
+    /// the user confirmed and the file was read): flushes the old
+    /// document's events, installs the new one, resets the saved point
+    /// and broadcasts [`DocEvent::Replaced`] and [`DocEvent::Document`].
+    pub fn replace_with(&self, f: impl FnOnce(&mut Engine)) {
+        self.flush();
+        {
+            let mut e = self.inner.engine.borrow_mut();
+            f(&mut e);
+            if let Some(limit) = self.inner.history_limit.get() {
+                e.scene_mut().set_history_limit(limit);
+            }
+        }
         self.inner.modified.set(false);
+        self.inner.saved_depth.set(Some(0));
+        self.inner.last_depth.set(0);
+        self.inner.navigated.set(false);
         self.inner.feature_pending.set(None);
         self.inner.events.emit(&DocEvent::Replaced);
         self.inner.events.emit(&DocEvent::Document);
         self.wake();
-        r
     }
 }
 
@@ -488,6 +663,23 @@ mod tests {
         assert_eq!(window_title(None, false), "untitled — Viscas");
         let p = std::path::Path::new("/tmp/curves.viscas");
         assert_eq!(window_title(Some(p), true), "curves ● — Viscas");
+    }
+
+    #[test]
+    fn saved_point_follows_undo_history() {
+        // Saved at depth 2; edit → 3 (dirty), undo → 2 (clean).
+        assert_eq!(track_saved(Some(2), 2, 3, false, true, false), Some(2));
+        assert_eq!(track_saved(Some(2), 3, 2, true, true, false), Some(2));
+        // Undo below the saved point, then a new edit: branch lost.
+        assert_eq!(track_saved(Some(2), 1, 2, false, true, false), None);
+        // Redo back to it is fine.
+        assert_eq!(track_saved(Some(2), 1, 2, true, true, false), Some(2));
+        // An edit that did not grow a full history (oldest step dropped).
+        assert_eq!(track_saved(Some(2), 5, 5, false, true, true), None);
+        assert_eq!(track_saved(Some(5), 5, 5, false, true, false), None);
+        // Nothing edited: unchanged; unreachable stays unreachable.
+        assert_eq!(track_saved(Some(2), 3, 3, false, false, true), Some(2));
+        assert_eq!(track_saved(None, 2, 2, true, true, false), None);
     }
 
     #[test]

@@ -445,6 +445,13 @@ impl Layout {
     }
 
     /// Largest id used by the layout.
+    /// Every area and split id of the tree.
+    pub fn ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        self.root.collect_ids(&mut ids);
+        ids
+    }
+
     pub fn max_id(&self) -> u32 {
         let mut ids = Vec::new();
         self.root.collect_ids(&mut ids);

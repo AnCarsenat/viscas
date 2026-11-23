@@ -362,8 +362,41 @@ impl Engine {
 
     /// Change evaluation settings; re-evaluates everything when they
     /// differ.
+    ///
+    /// A change of [`EngineSettings::approx`] alone only switches the
+    /// display text (node values keep both forms), so nothing is
+    /// re-evaluated.
     pub fn set_settings(&mut self, settings: EngineSettings) {
-        if settings == *self.eval.settings() {
+        let current = *self.eval.settings();
+        if settings == current {
+            return;
+        }
+        let display_only = EngineSettings {
+            approx: current.approx,
+            ..settings
+        } == current;
+        if display_only {
+            self.eval.set_settings(settings);
+            // Swap the stored display text of every valued node (emits
+            // status events so editors refresh).
+            let ids = self.scene.dfs_ids();
+            for id in ids {
+                let Some(text) = self
+                    .eval
+                    .value(id)
+                    .map(|v| v.display(settings.approx).to_string())
+                else {
+                    continue;
+                };
+                if let Some(r) = self.scene.result(id) {
+                    let r = viscas_scene::NodeResult {
+                        status: r.status.clone(),
+                        display: Some(text),
+                    };
+                    self.scene.set_result(id, r);
+                }
+            }
+            self.events.extend(self.scene.drain_events());
             return;
         }
         self.eval.set_settings(settings);
@@ -720,6 +753,12 @@ impl Engine {
         }
     }
 
+    /// Whether background plot work is queued or running for any
+    /// viewport (keep polling while `true`).
+    pub fn has_pending_work(&self) -> bool {
+        self.pool.queued() > 0 || self.viewports.values().any(|s| !s.in_flight.is_empty())
+    }
+
     /// Background tasks waiting for a worker.
     pub fn queued_tasks(&self) -> usize {
         self.pool.queued()
@@ -735,7 +774,16 @@ impl Engine {
     /// Viewports with a view whose layers are missing or out of date and
     /// not being rendered: call [`Engine::request_plots`] for them (e.g.
     /// after [`Engine::update`]).
+    ///
+    /// A failed (error) layer computed for the viewport's current view and
+    /// the node's current revision does *not* count as missing here, so a
+    /// persistent failure does not cause a replot loop; it is retried by
+    /// the next explicit [`Engine::request_plots`] (new view or new
+    /// revision).
     pub fn needs_replot(&self) -> Vec<ViewportId> {
+        if self.viewports.values().all(|s| s.view.is_none()) {
+            return Vec::new();
+        }
         let items = self.plot_items();
         let mut out: Vec<ViewportId> = self
             .viewports
@@ -748,7 +796,7 @@ impl Engine {
                         !self
                             .cache
                             .get(&(it.node, *vp))
-                            .is_some_and(|e| e.fresh(view, it.revision))
+                            .is_some_and(|e| e.view == view && e.revision == it.revision)
                             && s.in_flight.get(&it.node) != Some(&it.revision)
                     })
                     .then_some(*vp)
@@ -913,6 +961,8 @@ impl Engine {
         self.auto_colors.clear();
         self.palette_next = 0;
         self.console.forget_pin();
+        // Events of the previous document must not leak into the new one.
+        self.events.clear();
         self.events.push(SceneEvent::GraphChanged {
             touched: Vec::new(),
         });
@@ -959,6 +1009,40 @@ impl Engine {
         atomic_write(path.as_ref(), text.as_bytes())?;
         self.path = Some(path.as_ref().to_path_buf());
         Ok(())
+    }
+
+    /// Read and parse a `.viscas` file without touching an engine (any
+    /// thread); install the result with [`Engine::install_document`].
+    pub fn load_file(path: &Path) -> Result<Scene, EngineError> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(Scene::load_from_str(&text)?)
+    }
+
+    /// Replace the document with a scene from [`Engine::load_file`].
+    pub fn install_document(&mut self, scene: Scene, path: Option<PathBuf>) {
+        self.path = None;
+        self.replace_scene(scene);
+        self.path = path;
+    }
+
+    /// A `Send` closure that serializes the current document and writes
+    /// it atomically to `path` (run it on any thread), then call
+    /// [`Engine::set_document_path`] on success.
+    pub fn save_task(
+        &self,
+        path: PathBuf,
+    ) -> impl FnOnce() -> Result<(), EngineError> + Send + use<> {
+        let doc = self.scene.to_document();
+        move || {
+            let text = viscas_scene::save_document(&doc)?;
+            atomic_write(&path, text.as_bytes())?;
+            Ok(())
+        }
+    }
+
+    /// Remember `path` as the document path (after a background save).
+    pub fn set_document_path(&mut self, path: Option<PathBuf>) {
+        self.path = path;
     }
 
     /// Path of the last opened/saved file.

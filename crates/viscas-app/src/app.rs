@@ -31,13 +31,16 @@ fn setup(app: &gtk::Application, ctx: &AppCtx) {
     settings::init(ctx);
     crate::doc_ui::connect_prefs(ctx);
 
-    // Closing the windows (instead of `app.quit()`) lets each one ask to
-    // save a modified document; the app exits with the last window.
+    // Quit goes through the window's close flow: one save prompt for the
+    // shared document; Cancel aborts the whole quit.
     let quit = gio::ActionEntry::builder("quit")
-        .activate(|app: &gtk::Application, _, _| {
-            for w in app.windows() {
-                w.close();
+        .activate(|app: &gtk::Application, _, _| match app.active_window() {
+            Some(w) => {
+                if WidgetExt::activate_action(&w, "win.quit-request", None).is_err() {
+                    app.quit();
+                }
             }
+            None => app.quit(),
         })
         .build();
     let about = gio::ActionEntry::builder("about")

@@ -256,6 +256,24 @@ impl Areas {
         true
     }
 
+    /// Back to the default layouts, in the Graph workspace (new document,
+    /// or a document without a usable layout).
+    pub fn reset_default(&self) {
+        *self.inner.ids.borrow_mut() = IdGen::default();
+        self.inner.layouts.borrow_mut().clear();
+        let dropped: Vec<Editor> = self
+            .inner
+            .editors
+            .borrow_mut()
+            .drain()
+            .map(|(_, e)| e)
+            .collect();
+        drop(dropped);
+        self.inner.workspace.set(Workspace::Graph);
+        self.inner.active.set(None);
+        self.schedule_rebuild();
+    }
+
     /// Rebuilds on idle. Structural edits are often triggered by widgets
     /// inside the tree, which must not be destroyed while handling an event.
     fn schedule_rebuild(&self) {
@@ -682,10 +700,18 @@ pub struct LayoutBlob {
 impl LayoutBlob {
     pub const VERSION: u32 = 1;
 
-    /// Validated workspace and layouts; `None` for a future version or an
-    /// unknown current workspace.
+    /// Validated workspace and layouts; `None` for a future version, an
+    /// unknown current workspace or ids shared between workspaces (ids are
+    /// global, editors are cached by area id).
     pub fn into_layouts(self) -> Option<(Workspace, HashMap<Workspace, Layout>)> {
         if self.version > Self::VERSION {
+            return None;
+        }
+        let mut ids: Vec<u32> = self.layouts.values().flat_map(|l| l.ids()).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() != n {
             return None;
         }
         let workspace = Workspace::from_id(&self.workspace)?;
@@ -817,5 +843,16 @@ mod tests {
             layouts: Default::default(),
         };
         assert!(unknown.into_layouts().is_none());
+
+        // The same layout (same ids) in two workspaces is rejected.
+        let l = Workspace::Graph.default_layout(&mut IdGen::default());
+        let dup = LayoutBlob {
+            version: 1,
+            workspace: "graph".into(),
+            layouts: [("graph".to_owned(), l.clone()), ("data".to_owned(), l)]
+                .into_iter()
+                .collect(),
+        };
+        assert!(dup.into_layouts().is_none());
     }
 }

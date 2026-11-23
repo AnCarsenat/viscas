@@ -22,6 +22,10 @@ type SelectionListener = Rc<dyn Fn(&Selection)>;
 /// Observable selection and hover state, shared by every editor so that
 /// selecting or hovering a node anywhere highlights it everywhere
 /// (REQUIREMENTS §2.1).
+///
+/// This is the single source of truth for the selection: the scene's own
+/// selection (`Scene::selection`) is not used by the app. Removed nodes
+/// are pruned and a new/opened document clears it.
 #[derive(Default)]
 pub struct Selection {
     selected: RefCell<Vec<NodeId>>,
@@ -280,6 +284,18 @@ impl AppCtx {
                 sel.set_hovered(None);
             }
         });
+        // A different document: nothing stays selected or hovered.
+        let weak = ctx.downgrade();
+        ctx.engine()
+            .subscribe(move |ev| {
+                if let crate::doc::DocEvent::Replaced = ev
+                    && let Some(ctx) = weak.upgrade()
+                {
+                    ctx.selection().set_selected([]);
+                    ctx.selection().set_hovered(None);
+                }
+            })
+            .forever();
         ctx
     }
 
