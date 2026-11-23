@@ -1,10 +1,13 @@
 //! Builds the application stylesheet from theme data and interface
 //! preferences. Pure string processing, no GTK.
 
-use super::model::{Theme, UiColors, trim_float};
+use super::model::{SceneTreeColors, Theme, UiColors, trim_float};
 
 /// The static rules, written against the `@vc_*` colors.
-pub const RULES: &str = include_str!("../../resources/theme.css");
+pub const RULES: &str = concat!(
+    include_str!("../../resources/theme.css"),
+    include_str!("../../resources/scene_panels.css"),
+);
 
 /// Placeholder in [`RULES`] replaced by the monospace font family list.
 pub const MONO_PLACEHOLDER: &str = "__MONO__";
@@ -46,6 +49,14 @@ pub fn palette_css(theme: &Theme) -> String {
     for field in UiColors::FIELDS {
         out.push_str(&format!(
             "@define-color vc_{} {};\n",
+            field.key,
+            (field.get)(theme).to_css()
+        ));
+    }
+    // Scene tree colors, as `@vc_tree_<field>`.
+    for field in SceneTreeColors::FIELDS {
+        out.push_str(&format!(
+            "@define-color vc_tree_{} {};\n",
             field.key,
             (field.get)(theme).to_css()
         ));
@@ -243,7 +254,7 @@ mod tests {
         let mut theme = viscas_dark();
         theme.name = "**//} window { background: red; } /*".to_owned();
         let css = palette_css(&theme);
-        assert!(!css.contains("red"));
+        assert!(!css.contains("background: red"));
         assert!(!css.contains("window"));
     }
 

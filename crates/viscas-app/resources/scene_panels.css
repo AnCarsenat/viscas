@@ -1,0 +1,160 @@
+
+/* ---- Scene tree ------------------------------------------------------ */
+
+.scene-tree-editor { background: @vc_tree_background; }
+
+.tree-toolbar {
+  padding: 3px 4px;
+  border-bottom: 1px solid @vc_line;
+  background: @vc_bg1;
+}
+
+.tree-toolbar button.tree-tool,
+.tree-toolbar menubutton.tree-tool > button {
+  min-height: 20px;
+  min-width: 22px;
+  padding: 0 3px;
+  background: none;
+  color: @vc_fg_dim;
+}
+
+.tree-toolbar button.tree-tool:hover,
+.tree-toolbar menubutton.tree-tool > button:hover { background: @vc_bg4; color: @vc_fg; }
+
+.tree-toolbar entry.tree-filter { min-height: 20px; }
+
+listview.scene-tree { background: @vc_tree_background; color: @vc_tree_text; }
+
+listview.scene-tree > row {
+  min-height: 22px;
+  padding: 0;
+  border-radius: 0;
+}
+
+listview.scene-tree > row:hover { background: @vc_tree_hovered; }
+listview.scene-tree > row:selected { background: @vc_tree_selected; }
+listview.scene-tree > row:selected:focus-within { background: @vc_tree_selected; }
+
+.tree-row { padding: 0 4px 0 2px; min-height: 22px; }
+.tree-row.ext-hover { background: @vc_tree_hovered; }
+.tree-row.hidden-node .tree-title,
+.tree-row.hidden-node .kind-glyph { opacity: 0.45; }
+
+/* Dependency tint (§2.1.1): inputs and dependents of the hovered node. */
+.tree-row.dep-up {
+  background: alpha(@vc_tree_upstream, 0.16);
+  box-shadow: inset 2px 0 @vc_tree_upstream;
+}
+.tree-row.dep-down {
+  background: alpha(@vc_tree_downstream, 0.16);
+  box-shadow: inset 2px 0 @vc_tree_downstream;
+}
+.tree-row.dep-focus { box-shadow: inset 2px 0 @vc_accent; }
+
+/* Drop indicators. */
+.tree-row.drop-before { box-shadow: inset 0 2px @vc_accent; }
+.tree-row.drop-after { box-shadow: inset 0 -2px @vc_accent; }
+.tree-row.drop-into {
+  background: alpha(@vc_accent, 0.14);
+  box-shadow: inset 0 0 0 1px @vc_accent;
+}
+
+.tree-row expander { min-width: 14px; min-height: 14px; color: @vc_tree_icon; }
+
+.kind-glyph {
+  min-width: 16px;
+  font-size: 12px;
+  font-weight: bold;
+  color: @vc_tree_icon;
+}
+image.kind-glyph { -gtk-icon-size: 13px; }
+
+.kind-folder { color: mix(@vc_tree_icon, #d8a657, 0.6); }
+.kind-variable { color: mix(@vc_tree_icon, #6cb4ee, 0.75); font-style: italic; }
+.kind-function { color: mix(@vc_tree_icon, #c678dd, 0.75); }
+.kind-plot { color: mix(@vc_tree_icon, #f0883e, 0.75); }
+.kind-point { color: mix(@vc_tree_icon, #e06c75, 0.75); }
+.kind-slider { color: mix(@vc_tree_icon, #56b6c2, 0.75); }
+.kind-list { color: mix(@vc_tree_icon, #98c379, 0.75); }
+.kind-table { color: mix(@vc_tree_icon, #98c379, 0.55); }
+.kind-script { color: mix(@vc_tree_icon, #e5c07b, 0.75); }
+.kind-note { color: @vc_tree_text_dim; }
+.kind-viewport { color: mix(@vc_tree_icon, #61afef, 0.55); }
+.kind-action { color: mix(@vc_tree_icon, #ec6fae, 0.75); }
+.kind-regression { color: mix(@vc_tree_icon, #a77ef0, 0.75); }
+
+.tree-title { color: @vc_tree_text; }
+.tree-title.mono { font-family: __MONO__; }
+.tree-detail { color: @vc_tree_text_dim; font-size: 11px; }
+
+entry.tree-rename { min-height: 18px; padding: 0 4px; }
+entry.tree-rename.error, .inspector entry.error { border-color: @vc_danger; }
+.rename-error { color: @vc_danger_text; font-size: 11px; }
+
+.status-dot-tree { font-size: 8px; margin: 0 2px; }
+.status-dot-tree.ok { color: @vc_ok; }
+.status-dot-tree.error { color: @vc_danger_text; }
+.status-dot-tree.pending { color: @vc_fg_faint; }
+
+button.tree-toggle {
+  min-height: 18px;
+  min-width: 18px;
+  padding: 0;
+  background: none;
+  color: @vc_fg_faint;
+}
+button.tree-toggle image { -gtk-icon-size: 12px; }
+button.tree-toggle.on { color: @vc_tree_icon; }
+button.tree-toggle:hover { color: @vc_fg_strong; background: @vc_bg4; }
+
+.tree-empty {
+  color: @vc_fg_dim;
+  margin: 24px 16px;
+}
+
+.tree-toast {
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: @vc_tooltip_bg;
+  color: @vc_tooltip_fg;
+  box-shadow: 0 2px 6px alpha(@vc_shadow, 0.4);
+}
+
+/* ---- Inspector ------------------------------------------------------- */
+
+.inspector { background: @vc_bg1; }
+.inspector-body { padding: 6px; }
+
+.inspector-header { padding: 2px 4px 4px 4px; }
+.inspector-title { font-weight: bold; color: @vc_fg_strong; }
+
+.inspector .field-error {
+  color: @vc_danger_text;
+  font-size: 11px;
+  margin: 0 0 2px 0;
+}
+
+.inspector .value-preview { color: @vc_ok; }
+.inspector .value-preview.error { color: @vc_danger_text; }
+
+.inspector-text-frame {
+  border: 1px solid @vc_border;
+  border-radius: 3px;
+  margin: 2px 0;
+}
+textview.inspector-text, textview.inspector-text > text { background: @vc_bg0; color: @vc_fg; }
+
+.inspector .mixed-mark { color: @vc_fg_strong; font-weight: bold; }
+.inspector button.auto-color { padding: 0 6px; min-height: 18px; color: @vc_fg_dim; }
+
+.inspector .deps-title { color: @vc_fg_dim; font-size: 11px; margin-top: 2px; }
+.inspector flowbox.chips > flowboxchild { padding: 0; }
+
+button.node-chip {
+  min-height: 18px;
+  padding: 0 8px;
+  border-radius: 9px;
+  font-size: 11px;
+}
+button.node-chip.dep-up { box-shadow: inset 2px 0 @vc_tree_upstream; }
+button.node-chip.dep-down { box-shadow: inset 2px 0 @vc_tree_downstream; }

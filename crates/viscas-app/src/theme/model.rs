@@ -287,6 +287,8 @@ section! {
         selected: "Selected Row",
         hovered: "Hovered Row",
         icon: "Icons",
+        upstream: "Upstream Tint",
+        downstream: "Downstream Tint",
     }
 }
 
@@ -571,6 +573,8 @@ pub fn viscas_dark() -> Theme {
             selected: ORANGE.with_alpha(0.16),
             hovered: Color::hexa(0xffffff, 0.05),
             icon: Color::hex(0x9a9a9a),
+            upstream: Color::hex(0x4fa3f0),
+            downstream: Color::hex(0x8fcf5f),
         },
         dep_graph: GraphColors {
             background: Color::hex(0x191919),
@@ -640,6 +644,8 @@ pub fn viscas_light() -> Theme {
             selected: ORANGE.with_alpha(0.3),
             hovered: Color::hexa(0x000000, 0.06),
             icon: Color::hex(0x404040),
+            upstream: Color::hex(0x1f6fc0),
+            downstream: Color::hex(0x3f8a1f),
         },
         dep_graph: GraphColors {
             background: Color::hex(0xd9d9d9),

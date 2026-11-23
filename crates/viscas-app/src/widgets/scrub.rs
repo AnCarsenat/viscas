@@ -104,7 +104,10 @@ struct Inner {
     suffix: RefCell<String>,
     drag_start: Cell<f64>,
     scrubbing: Cell<bool>,
+    /// Shows "—" instead of the value (multi-selection with mixed values).
+    mixed: Cell<bool>,
     listeners: RefCell<Vec<Listener>>,
+    finished: RefCell<Vec<Rc<dyn Fn()>>>,
 }
 
 /// A numeric field. Cloning yields a handle to the same widget.
@@ -165,7 +168,9 @@ impl ScrubField {
                 suffix: RefCell::default(),
                 drag_start: Cell::new(0.0),
                 scrubbing: Cell::new(false),
+                mixed: Cell::new(false),
                 listeners: RefCell::default(),
+                finished: RefCell::default(),
             }),
         };
         field.refresh();
@@ -174,12 +179,18 @@ impl ScrubField {
         left.connect_clicked(glib::clone!(
             #[strong]
             weak,
-            move |_| with(&weak, |f| f.user_set(f.inner.spec.stepped(f.value(), -1)))
+            move |_| with(&weak, |f| {
+                f.user_set(f.inner.spec.stepped(f.value(), -1));
+                f.finish();
+            })
         ));
         right.connect_clicked(glib::clone!(
             #[strong]
             weak,
-            move |_| with(&weak, |f| f.user_set(f.inner.spec.stepped(f.value(), 1)))
+            move |_| with(&weak, |f| {
+                f.user_set(f.inner.spec.stepped(f.value(), 1));
+                f.finish();
+            })
         ));
         field.install_drag(&weak);
         field.install_entry(&weak);
@@ -197,7 +208,33 @@ impl ScrubField {
     /// Sets the value without notifying listeners (external updates).
     pub fn set_value(&self, v: f64) {
         self.inner.value.set(self.inner.spec.normalize(v));
+        self.inner.mixed.set(false);
         self.refresh();
+    }
+
+    /// Shows "—" (mixed values) until the next value is set.
+    pub fn set_mixed(&self, mixed: bool) {
+        self.inner.mixed.set(mixed);
+        self.refresh();
+    }
+
+    /// Is the user dragging or typing in the field right now?
+    pub fn is_active(&self) -> bool {
+        self.inner.scrubbing.get()
+            || self.inner.stack.visible_child_name().as_deref() == Some("edit")
+    }
+
+    /// Calls `f` when an interaction ends: drag release, arrow click or
+    /// typed value committed (to close an undo step).
+    pub fn connect_finished(&self, f: impl Fn() + 'static) {
+        self.inner.finished.borrow_mut().push(Rc::new(f));
+    }
+
+    fn finish(&self) {
+        let listeners = self.inner.finished.borrow().clone();
+        for f in listeners {
+            f();
+        }
     }
 
     /// Text appended to the displayed value, e.g. `" px"`.
@@ -217,9 +254,10 @@ impl ScrubField {
 
     fn user_set(&self, v: f64) {
         let v = self.inner.spec.normalize(v);
-        if v == self.value() {
+        if v == self.value() && !self.inner.mixed.get() {
             return;
         }
+        self.inner.mixed.set(false);
         self.inner.value.set(v);
         self.refresh();
         let listeners = self.inner.listeners.borrow().clone();
@@ -229,6 +267,10 @@ impl ScrubField {
     }
 
     fn refresh(&self) {
+        if self.inner.mixed.get() {
+            self.inner.display.set_label("—");
+            return;
+        }
         let text = self.inner.spec.format(self.value());
         self.inner
             .display
@@ -267,7 +309,9 @@ impl ScrubField {
             weak,
             move |_, _, _| with(&weak, |f| {
                 f.inner.root.remove_css_class("scrubbing");
-                if !f.inner.scrubbing.replace(false) {
+                if f.inner.scrubbing.replace(false) {
+                    f.finish();
+                } else {
                     f.begin_edit();
                 }
             })
@@ -324,6 +368,7 @@ impl ScrubField {
         i.root.remove_css_class("editing");
         if commit && let Some(v) = i.spec.parse(&i.entry.text()) {
             self.user_set(v);
+            self.finish();
         }
     }
 }
