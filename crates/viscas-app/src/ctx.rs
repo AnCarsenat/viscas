@@ -89,6 +89,9 @@ pub struct PrefsStore {
     user_themes: RefCell<Vec<Theme>>,
     /// Desktop color scheme: `Some(true)` for dark, `None` when unknown.
     system_dark: Cell<Option<bool>>,
+    /// One-line message about the last load (e.g. settings were reset and
+    /// the original backed up), shown in the status bar.
+    load_notice: RefCell<Option<String>>,
 }
 
 impl PrefsStore {
@@ -103,18 +106,37 @@ impl PrefsStore {
     }
 
     /// Edits the preferences; listeners run if anything changed.
+    ///
+    /// Turning "follow system" on, or changing the theme paired with the
+    /// current desktop scheme while following, applies that theme now.
     pub fn update(&self, f: impl FnOnce(&mut Preferences)) {
         let changed = {
             let mut prefs = self.prefs.borrow_mut();
             let before = prefs.clone();
             f(&mut prefs);
             prefs.validate();
-            self.follow_system(&mut prefs);
+            let sys = &prefs.system;
+            let follow_on = sys.follow_system && !before.system.follow_system;
+            let pair_changed = sys.follow_system
+                && (sys.light_theme != before.system.light_theme
+                    || sys.dark_theme != before.system.dark_theme);
+            if follow_on || pair_changed {
+                self.apply_system_theme(&mut prefs);
+            }
             *prefs != before
         };
         if changed {
             self.notify();
         }
+    }
+
+    /// A manual theme change: edits the preferences and turns "follow
+    /// system" off, so the desktop scheme never overrides the choice.
+    pub fn update_theme(&self, f: impl FnOnce(&mut Preferences)) {
+        self.update(|p| {
+            f(p);
+            p.system.follow_system = false;
+        });
     }
 
     /// Replaces every preference (revert, factory settings).
@@ -130,9 +152,10 @@ impl PrefsStore {
     }
 
     fn notify(&self) {
-        let prefs = self.get();
         let listeners = self.listeners.borrow().clone();
-        let dead: Vec<PrefsListener> = listeners.into_iter().filter(|f| !f(&prefs)).collect();
+        // Each listener gets a fresh snapshot: an earlier listener may have
+        // changed the preferences again (which notifies on its own).
+        let dead: Vec<PrefsListener> = listeners.into_iter().filter(|f| !f(&self.get())).collect();
         if !dead.is_empty() {
             self.listeners
                 .borrow_mut()
@@ -155,29 +178,45 @@ impl PrefsStore {
         self.system_dark.get()
     }
 
-    /// Records the desktop color scheme and, when following it, switches
-    /// between the dark and light built-in themes.
+    /// Records the desktop color scheme. On a transition (including the
+    /// first report at startup), when following the system, switches to
+    /// the configured light or dark theme.
     pub fn set_system_dark(&self, dark: Option<bool>) {
         if self.system_dark.replace(dark) != dark {
-            self.update(|_| {});
+            self.update(|p| {
+                if p.system.follow_system {
+                    self.apply_system_theme(p);
+                }
+            });
         }
     }
 
-    fn follow_system(&self, prefs: &mut Preferences) {
+    /// Switches to the theme paired with the desktop scheme, if known and
+    /// installed. Leaves the theme alone otherwise.
+    fn apply_system_theme(&self, prefs: &mut Preferences) {
         let Some(dark) = self.system_dark.get() else {
             return;
         };
-        if prefs.system.follow_system && prefs.theme.dark != dark {
-            let name = if dark {
-                model::DARK_NAME
-            } else {
-                model::LIGHT_NAME
-            };
-            if let Some(theme) = model::builtin(name) {
-                prefs.theme = theme;
-                prefs.themes.preset = name.to_owned();
-            }
+        let name = if dark {
+            &prefs.system.dark_theme
+        } else {
+            &prefs.system.light_theme
+        };
+        if prefs.themes.preset == *name && prefs.theme.name == *name {
+            return; // already showing it (possibly with user edits)
         }
+        if let Some(theme) = self.themes().into_iter().find(|t| t.name == *name) {
+            prefs.themes.preset = theme.name.clone();
+            prefs.theme = theme;
+        }
+    }
+
+    pub fn load_notice(&self) -> Option<String> {
+        self.load_notice.borrow().clone()
+    }
+
+    pub fn set_load_notice(&self, notice: Option<String>) {
+        *self.load_notice.borrow_mut() = notice;
     }
 }
 
@@ -295,6 +334,75 @@ mod tests {
         assert_eq!(store.get().theme.name, model::LIGHT_NAME);
         store.set_system_dark(Some(true));
         assert_eq!(store.get().themes.preset, model::DARK_NAME);
+    }
+
+    #[test]
+    fn follow_system_only_acts_on_transitions() {
+        let store = PrefsStore::default();
+        store.update(|p| p.system.follow_system = true);
+        store.set_system_dark(Some(true));
+        // Unrelated updates never swap the theme back.
+        store.update(|p| p.theme.ui.bg1 = model::Color::hex(0x123456));
+        store.update(|p| p.interface.playful = false);
+        assert_eq!(store.get().theme.ui.bg1, model::Color::hex(0x123456));
+        // Same scheme reported again: no change.
+        store.set_system_dark(Some(true));
+        assert_eq!(store.get().theme.ui.bg1, model::Color::hex(0x123456));
+    }
+
+    #[test]
+    fn manual_theme_choice_turns_following_off() {
+        let store = PrefsStore::default();
+        store.update(|p| p.system.follow_system = true);
+        store.set_system_dark(Some(true));
+        store.update_theme(|p| p.theme = model::viscas_light());
+        assert!(!store.get().system.follow_system);
+        store.set_system_dark(Some(false));
+        store.set_system_dark(Some(true));
+        assert_eq!(store.get().theme, model::viscas_light());
+    }
+
+    #[test]
+    fn follow_system_uses_configured_pair() {
+        let store = PrefsStore::default();
+        let mut custom = model::viscas_light();
+        custom.name = "Paper".into();
+        store.set_user_themes(vec![custom.clone()]);
+        store.update(|p| {
+            p.system.follow_system = true;
+            p.system.light_theme = "Paper".into();
+            p.system.dark_theme = model::HIGH_CONTRAST_NAME.into();
+        });
+        store.set_system_dark(Some(false));
+        assert_eq!(store.get().theme, custom);
+        store.set_system_dark(Some(true));
+        assert_eq!(store.get().theme.name, model::HIGH_CONTRAST_NAME);
+        // A missing pair theme leaves the current theme alone.
+        store.update(|p| p.system.light_theme = "Gone".into());
+        store.set_system_dark(Some(false));
+        assert_eq!(store.get().theme.name, model::HIGH_CONTRAST_NAME);
+    }
+
+    #[test]
+    fn listeners_see_fresh_preferences() {
+        let store = Rc::new(PrefsStore::default());
+        let weak = Rc::downgrade(&store);
+        store.connect_changed(move |p| {
+            if p.interface.playful
+                && let Some(s) = weak.upgrade()
+            {
+                s.update(|q| q.interface.playful = false);
+            }
+            true
+        });
+        let seen = Rc::new(Cell::new(true));
+        let s = seen.clone();
+        store.connect_changed(move |p| {
+            s.set(p.interface.playful);
+            true
+        });
+        store.update(|p| p.interface.tooltips = false);
+        assert!(!seen.get(), "second listener saw a stale snapshot");
     }
 
     struct Fixed(&'static str);

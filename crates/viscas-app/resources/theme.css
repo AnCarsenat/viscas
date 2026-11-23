@@ -878,3 +878,12 @@ window.prefs-window {
   color: @vc_accent_text;
   font-size: 10px;
 }
+
+.statusbar .status-notice {
+  margin: 3px 4px;
+  padding: 0 6px;
+  border-radius: 3px;
+  border: 1px solid alpha(@vc_danger, 0.6);
+  background: alpha(@vc_danger, 0.12);
+  color: @vc_danger_text;
+}

@@ -120,6 +120,46 @@ impl Binder {
         }
     }
 
+    /// A manual theme change (turns "follow system" off).
+    fn update_theme(&self, f: impl FnOnce(&mut Preferences)) {
+        if !self.syncing.get() {
+            self.ctx.preferences().update_theme(f);
+        }
+    }
+
+    /// Drop-down over the installed theme names, bound to a name field.
+    fn theme_choice(
+        &self,
+        get: fn(&Preferences) -> String,
+        set: fn(&mut Preferences, String),
+    ) -> gtk::DropDown {
+        let names = gtk::StringList::new(&[]);
+        let dropdown = gtk::DropDown::builder().model(&names).build();
+        let b = self.clone();
+        dropdown.connect_selected_notify(move |d| {
+            if let Some(name) = d
+                .selected_item()
+                .and_downcast::<gtk::StringObject>()
+                .map(|s| s.string().to_string())
+            {
+                b.update(|p| set(p, name));
+            }
+        });
+        let ctx = self.ctx.clone();
+        let d = dropdown.clone();
+        self.on_refresh(move |p| {
+            let wanted = sync_theme_names(&names, &ctx);
+            let index = wanted
+                .iter()
+                .position(|n| *n == get(p))
+                .map_or(gtk::INVALID_LIST_POSITION, |i| i as u32);
+            if d.selected() != index {
+                d.set_selected(index);
+            }
+        });
+        dropdown
+    }
+
     fn scrub(
         &self,
         range: Range,
@@ -177,6 +217,24 @@ impl Binder {
         });
         dropdown
     }
+}
+
+/// Makes `names` list the installed themes; returns the names.
+fn sync_theme_names(names: &gtk::StringList, ctx: &AppCtx) -> Vec<String> {
+    let wanted: Vec<String> = ctx
+        .preferences()
+        .themes()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    let current: Vec<String> = (0..names.n_items())
+        .filter_map(|i| names.string(i).map(|s| s.to_string()))
+        .collect();
+    if wanted != current {
+        let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        names.splice(0, names.n_items(), &refs);
+    }
+    wanted
 }
 
 fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::Window {
@@ -497,7 +555,7 @@ fn themes_page(b: &Binder) -> gtk::Box {
             .into_iter()
             .find(|t| t.name == name)
         {
-            binder.update(|p| {
+            binder.update_theme(|p| {
                 p.theme = theme;
                 p.themes.preset = name;
             });
@@ -520,14 +578,7 @@ fn themes_page(b: &Binder) -> gtk::Box {
         let (preset, names, modified) = (preset.clone(), names.clone(), modified.clone());
         b.on_refresh(move |p| {
             let themes = ctx.preferences().themes();
-            let wanted: Vec<String> = themes.iter().map(|t| t.name.clone()).collect();
-            let current: Vec<String> = (0..names.n_items())
-                .filter_map(|i| names.string(i).map(|s| s.to_string()))
-                .collect();
-            if wanted != current {
-                let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
-                names.splice(0, names.n_items(), &refs);
-            }
+            let wanted = sync_theme_names(&names, &ctx);
             let index = wanted.iter().position(|n| *n == p.themes.preset);
             let index = index.map_or(gtk::INVALID_LIST_POSITION, |i| i as u32);
             if preset.selected() != index {
@@ -581,7 +632,7 @@ fn themes_page(b: &Binder) -> gtk::Box {
             let is_accent = *section == "ui" && field.key == "accent";
             let binder = b.clone();
             swatch.connect_changed(move |color| {
-                binder.update(|p| edit_theme_color(p, set, is_accent, color));
+                binder.update_theme(|p| edit_theme_color(p, set, is_accent, color));
             });
             let get = field.get;
             let s = swatch.clone();
@@ -639,9 +690,9 @@ fn import_theme(button: &gtk::Button, ctx: &AppCtx) {
             let loaded = path
                 .as_ref()
                 .ok_or_else(|| "not a local file".to_owned())
-                .and_then(|p| std::fs::read_to_string(p).map_err(|e| e.to_string()))
+                .and_then(|p| prefs::read_capped(p).map_err(|e| e.to_string()))
                 .and_then(|text| Theme::from_toml(&text));
-            let theme = match loaded {
+            let mut theme = match loaded {
                 Ok(t) => t,
                 Err(e) => {
                     if let Some(w) = &parent {
@@ -650,15 +701,33 @@ fn import_theme(button: &gtk::Button, ctx: &AppCtx) {
                     return;
                 }
             };
+            // Never shadow or overwrite an installed theme: rename on clash.
+            let taken: Vec<String> = ctx
+                .preferences()
+                .themes()
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
+            theme.name =
+                prefs::unique_name(&prefs::clean_name(&theme.name, prefs::MAX_NAME_LEN), &taken);
             // Install a copy so the theme shows up in the preset list.
             if let Some(dir) = prefs::themes_dir() {
-                let file = dir.join(prefs::theme_file_name(&theme.name));
-                if let Err(e) = prefs::write_atomic(&file, &theme.to_toml()) {
+                let stem = prefs::theme_file_name(&theme.name);
+                let stem = stem.trim_end_matches(".toml");
+                let file = std::iter::once(dir.join(format!("{stem}.toml")))
+                    .chain((2..).map(|n| dir.join(format!("{stem}_{n}.toml"))))
+                    .find(|f| !f.exists())
+                    .unwrap_or_else(|| dir.join(format!("{stem}.toml")));
+                if let Err(e) = theme
+                    .to_toml()
+                    .map_err(std::io::Error::other)
+                    .and_then(|text| prefs::write_atomic(&file, &text))
+                {
                     glib::g_warning!("viscas", "cannot install theme {}: {e}", file.display());
                 }
             }
             settings::reload_user_themes(&ctx);
-            ctx.preferences().update(|p| {
+            ctx.preferences().update_theme(|p| {
                 p.themes.preset = theme.name.clone();
                 p.themes.accent = Accent::Theme;
                 p.theme = theme;
@@ -684,7 +753,10 @@ fn export_theme(button: &gtk::Button, ctx: &AppCtx) {
             let Some(path) = result.ok().and_then(|f| f.path()) else {
                 return;
             };
-            if let Err(e) = prefs::write_atomic(&path, &theme.to_toml())
+            if let Err(e) = theme
+                .to_toml()
+                .map_err(std::io::Error::other)
+                .and_then(|text| prefs::write_atomic(&path, &text))
                 && let Some(w) = &parent
             {
                 alert(w, "Could not export theme", &e.to_string());
@@ -865,6 +937,26 @@ fn system_page(b: &Binder) -> gtk::Box {
         });
     });
     appearance.append(&property_row("Desktop Scheme", &scheme));
+    let light = b.theme_choice(
+        |p| p.system.light_theme.clone(),
+        |p, n| p.system.light_theme = n,
+    );
+    light.set_tooltip_text(Some("Theme used when the desktop is light"));
+    appearance.append(&property_row("Light Theme", &light));
+    let dark = b.theme_choice(
+        |p| p.system.dark_theme.clone(),
+        |p, n| p.system.dark_theme = n,
+    );
+    dark.set_tooltip_text(Some("Theme used when the desktop is dark"));
+    appearance.append(&property_row("Dark Theme", &dark));
     page.append(appearance.widget());
+    page.append(
+        &gtk::Label::builder()
+            .label("Choosing a theme by hand turns following the system off.")
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["prefs-note"])
+            .build(),
+    );
     page
 }
