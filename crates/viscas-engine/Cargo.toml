@@ -1,0 +1,13 @@
+[package]
+name = "viscas-engine"
+description = "Scene–evaluator–plot bridge for Viscas (GTK-free)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+viscas-core.workspace = true
+viscas-scene.workspace = true
+viscas-plot.workspace = true
+serde_json.workspace = true

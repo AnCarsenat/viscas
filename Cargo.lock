@@ -761,6 +761,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "viscas-engine"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "viscas-core",
+ "viscas-plot",
+ "viscas-scene",
+]
+
+[[package]]
 name = "viscas-plot"
 version = "0.1.0"
 
