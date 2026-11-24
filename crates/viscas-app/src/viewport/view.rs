@@ -93,11 +93,10 @@ impl View {
         let sx = w / bw;
         let sy = h / bh;
         if locked {
-            self.scale = sx.min(sy).clamp(MIN_SCALE, MAX_SCALE);
-            self.aspect = 1.0;
+            let s = sx.min(sy);
+            self.set_scales(s, s);
         } else {
-            self.scale = sx.clamp(MIN_SCALE, MAX_SCALE);
-            self.aspect = (sy / self.scale).clamp(1e-6, 1e6);
+            self.set_scales(sx, sy);
         }
         self.center = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
         self.clamp_center();
@@ -162,11 +161,33 @@ impl View {
             return;
         }
         let anchor = self.screen_to_world(sx, sy);
-        self.scale = (self.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+        let (x, y) = (self.scale * factor, self.scale_y() * factor);
+        // Keep the aspect when either axis hits a limit.
+        let k = (x.clamp(MIN_SCALE, MAX_SCALE) / x).min(y.clamp(MIN_SCALE, MAX_SCALE) / y);
+        let k = if factor >= 1.0 {
+            k.min(1.0)
+        } else {
+            k.max(1.0)
+        };
+        let k = if k.is_finite() { k } else { 1.0 };
+        self.set_scales(x * k, y * k);
         let moved = self.screen_to_world(sx, sy);
         self.center.0 += anchor.0 - moved.0;
         self.center.1 += anchor.1 - moved.1;
         self.clamp_center();
+    }
+
+    /// Sets both axis scales, each clamped to `MIN_SCALE..=MAX_SCALE`.
+    pub fn set_scales(&mut self, x: f64, y: f64) {
+        let fix = |v: f64| {
+            if v.is_finite() {
+                v.clamp(MIN_SCALE, MAX_SCALE)
+            } else {
+                MIN_SCALE
+            }
+        };
+        self.scale = fix(x);
+        self.aspect = fix(y) / self.scale;
     }
 
     fn clamp_center(&mut self) {
@@ -510,5 +531,25 @@ mod tests {
         assert!(approx(sy, 300.0 - 120.0));
         let (_, wy) = v.screen_to_world(0.0, sy);
         assert!(approx(wy, 1.0));
+    }
+
+    #[test]
+    fn repeated_box_zooms_keep_scales_in_range() {
+        let mut v = View::default();
+        for _ in 0..40 {
+            // Tall thin boxes push the y scale up much faster than x.
+            v.fit_screen_rect((100.0, 290.0), (700.0, 296.0), false);
+            assert!(v.scale >= MIN_SCALE && v.scale <= MAX_SCALE);
+            assert!(v.scale_y() >= MIN_SCALE && v.scale_y() <= MAX_SCALE * (1.0 + 1e-12));
+        }
+        for _ in 0..200 {
+            v.zoom_at(10.0, 400.0, 300.0);
+            assert!(v.scale_y() <= MAX_SCALE * (1.0 + 1e-12));
+        }
+        for _ in 0..400 {
+            v.zoom_at(0.1, 400.0, 300.0);
+            assert!(v.scale >= MIN_SCALE * (1.0 - 1e-12));
+            assert!(v.scale_y() >= MIN_SCALE * (1.0 - 1e-12));
+        }
     }
 }

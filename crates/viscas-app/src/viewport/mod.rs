@@ -14,7 +14,7 @@ use gtk::prelude::*;
 use gtk::{cairo, gdk, gio, glib};
 
 use self::draw::GridLayer;
-use self::plots::{FEATURE_RADIUS_PX, HOVER_PX, PlotState, PlotsLayer, nearest_curve};
+use self::plots::{FEATURE_RADIUS_PX, HOVER_PX, PlotState, PlotsLayer, filter_hits, nearest_curve};
 use self::view::View;
 use crate::ctx::AppCtx;
 use crate::doc::DocEvent;
@@ -53,11 +53,16 @@ pub trait Layer {
 
 type Layers = Rc<RefCell<Vec<Box<dyn Layer>>>>;
 
-/// Header widgets that follow the viewport state.
+/// Header widgets, built once per viewport and moved into each rebuilt
+/// area header (so the quick-input text survives layout changes).
 #[derive(Default)]
 struct HeaderRefs {
-    errors: glib::WeakRef<gtk::Label>,
+    widgets: Vec<gtk::Widget>,
+    errors: Option<gtk::Label>,
 }
+
+/// Drag distance (px) after which a press is a drag, not a click.
+const CLICK_SLOP: f64 = 4.0;
 
 /// The graph viewport widget and its shared view state.
 ///
@@ -129,6 +134,7 @@ impl Viewport {
         ctx.preferences()
             .connect_changed(move |p| match this.upgrade() {
                 Some(vp) => {
+                    vp.plots.invalidate_style();
                     if p.viewport.lock_aspect && vp.view.borrow().aspect != 1.0 {
                         vp.update_view(View::lock_aspect);
                     }
@@ -201,6 +207,7 @@ impl Viewport {
     }
 
     fn view_changed(&self) {
+        self.plots.last_hover.set(None);
         self.queue_draw();
         self.schedule_replot();
     }
@@ -224,6 +231,7 @@ impl Viewport {
             if let Some(vp) = this.upgrade() {
                 vp.plots.replot_queued.set(false);
                 vp.plots.request(&vp.view(), false);
+                vp.update_error_chip();
             }
         });
     }
@@ -256,9 +264,14 @@ impl Viewport {
                 }
                 DocEvent::Replot(vps) if vps.contains(&id) => {
                     vp.plots.request(&vp.view(), true);
+                    vp.update_error_chip();
                 }
                 DocEvent::Features(r) if r.viewport == id => {
-                    *vp.plots.features.borrow_mut() = r.hits.clone();
+                    let hits = match vp.plots.click_world.get() {
+                        Some(c) => filter_hits(&r.hits, &vp.view(), c, FEATURE_RADIUS_PX),
+                        None => r.hits.clone(),
+                    };
+                    *vp.plots.features.borrow_mut() = hits;
                     vp.queue_draw();
                 }
                 _ => {}
@@ -275,18 +288,46 @@ impl Viewport {
     }
 
     fn update_error_chip(&self) {
-        let Some(chip) = self.header.borrow().errors.upgrade() else {
+        let chip = self.header.borrow().errors.clone();
+        let Some(chip) = chip else {
             return;
         };
-        let errors = self.plots.errors.borrow();
-        chip.set_visible(!errors.is_empty());
-        chip.set_label(&format!("⚠ {}", errors.len()));
-        chip.set_tooltip_text(Some(&errors.join("\n")));
+        // Copy out, then touch GTK with no borrow held.
+        let (count, tip) = {
+            let errors = self.plots.errors.borrow();
+            let mut lines: Vec<String> = errors.clone();
+            if self.plots.view_error.get() {
+                lines.push("View: this zoom level cannot be sampled — press Home".to_owned());
+            }
+            (lines.len(), lines.join("\n"))
+        };
+        chip.set_visible(count > 0);
+        chip.set_label(&format!("⚠ {count}"));
+        chip.set_tooltip_text(Some(&tip));
     }
 
     /// Widgets for the area header: View and Add menus, the temporary
-    /// quick input, the error chip and the reset button.
+    /// quick input, the error chip and the reset button. Built once; later
+    /// calls move the same widgets out of the previous header.
     pub fn header_widgets(&self) -> Vec<gtk::Widget> {
+        let cached = self.header.borrow().widgets.clone();
+        if !cached.is_empty() {
+            for w in &cached {
+                if let Some(parent) = w.parent() {
+                    match parent.downcast::<gtk::Box>() {
+                        Ok(b) => b.remove(w),
+                        Err(_) => w.unparent(),
+                    }
+                }
+            }
+            return cached;
+        }
+        let widgets = self.build_header_widgets();
+        self.update_error_chip();
+        widgets
+    }
+
+    fn build_header_widgets(&self) -> Vec<gtk::Widget> {
         let view_menu = gio::Menu::new();
         view_menu.append(Some("Reset View"), Some("vp.reset"));
         view_menu.append(Some("Lock Aspect"), Some("vp.lock-aspect"));
@@ -378,9 +419,9 @@ impl Viewport {
         widgets.push(reset.upcast());
 
         *self.header.borrow_mut() = HeaderRefs {
-            errors: errors.downgrade(),
+            widgets: widgets.clone(),
+            errors: Some(errors),
         };
-        self.update_error_chip();
         widgets
     }
 
@@ -470,6 +511,7 @@ impl Viewport {
                     return;
                 };
                 last.set((0.0, 0.0));
+                vp.plots.dragged.set(false);
                 vp.area.grab_focus();
                 let shift = g
                     .current_event_state()
@@ -494,6 +536,9 @@ impl Viewport {
                 let Some(vp) = this.upgrade() else {
                     return;
                 };
+                if ox.hypot(oy) > CLICK_SLOP {
+                    vp.plots.dragged.set(true);
+                }
                 if boxing.get() {
                     if let Some((sx, sy)) = g.start_point() {
                         vp.plots.zoom_box.set(Some(((sx, sy), (sx + ox, sy + oy))));
@@ -503,6 +548,20 @@ impl Viewport {
                 }
                 let (lx, ly) = last.replace((ox, oy));
                 vp.update_view(|v| v.pan_by_pixels(ox - lx, oy - ly));
+            }
+        ));
+        drag.connect_cancel(glib::clone!(
+            #[strong]
+            this,
+            #[strong]
+            boxing,
+            move |_, _| {
+                boxing.set(false);
+                if let Some(vp) = this.upgrade() {
+                    vp.plots.zoom_box.set(None);
+                    vp.area.set_cursor(None::<&gdk::Cursor>);
+                    vp.queue_draw();
+                }
             }
         ));
         drag.connect_drag_end(glib::clone!(
@@ -595,6 +654,10 @@ impl Viewport {
                     return;
                 }
                 if let Some(vp) = this.upgrade() {
+                    // A pan or box release never selects or clears.
+                    if vp.plots.dragged.replace(false) {
+                        return;
+                    }
                     vp.click_at(x, y);
                 }
             }
@@ -604,13 +667,26 @@ impl Viewport {
 
     /// Hover: feature dot label, else nearest curve → shared hover model.
     fn hover_at(&self, p: Option<(f64, f64)>) {
+        // Sub-pixel moves keep the last result.
+        if let (Some(p), Some(q)) = (p, self.plots.last_hover.get())
+            && (p.0 - q.0).hypot(p.1 - q.1) < 1.0
+        {
+            return;
+        }
+        self.plots.last_hover.set(p);
         let view = self.view();
         let dot = p.and_then(|(x, y)| self.plots.dot_at(&view, x, y));
         let dot_pos = dot.map(|h| h.feature.pos);
         let dot_changed = self.plots.hover_dot.replace(dot_pos) != dot_pos;
         let node = match (p, dot) {
             (_, Some(h)) => Some(h.node),
-            (Some(p), None) => nearest_curve(&self.plots.layers.borrow(), &view, p, HOVER_PX),
+            (Some(p), None) => nearest_curve(
+                &self.plots.layers.borrow(),
+                &self.plots.boxes.borrow(),
+                &view,
+                p,
+                HOVER_PX,
+            ),
             (None, None) => None,
         };
         let sel = self.ctx().selection();
@@ -635,13 +711,24 @@ impl Viewport {
             self.queue_draw();
             return;
         }
-        let node = nearest_curve(&self.plots.layers.borrow(), &view, (x, y), HOVER_PX);
+        let node = nearest_curve(
+            &self.plots.layers.borrow(),
+            &self.plots.boxes.borrow(),
+            &view,
+            (x, y),
+            HOVER_PX,
+        );
         let sel = self.ctx().selection();
         match node {
             Some(id) => {
                 sel.set_selected([id]);
                 let (wx, wy) = view.screen_to_world(x, y);
+                // World radius covering the pixel radius on both axes;
+                // results are filtered by screen distance on arrival.
                 let radius = FEATURE_RADIUS_PX / view.scale.min(view.scale_y());
+                self.plots
+                    .click_world
+                    .set(Some(viscas_plot::Vec2::new(wx, wy)));
                 self.ctx().engine().request_features(
                     self.plots.id,
                     viscas_plot::Vec2::new(wx, wy),

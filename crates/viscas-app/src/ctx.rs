@@ -39,6 +39,11 @@ impl Selection {
         self.selected.borrow().clone()
     }
 
+    /// Whether `id` is selected (no allocation).
+    pub fn is_selected(&self, id: NodeId) -> bool {
+        self.selected.borrow().contains(&id)
+    }
+
     /// Node under the pointer in any editor.
     pub fn hovered(&self) -> Option<NodeId> {
         self.hovered.get()
