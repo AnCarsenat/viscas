@@ -40,6 +40,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     crate::doc_ui::install(&window, ctx, &areas, status_widgets);
     ctx.add_command_provider(WindowCommands::new(&window));
     ctx.add_command_provider(AreaCommands::new(&areas));
+    ctx.add_command_provider(crate::editors::scene_tree::ops::NodeCommands::new(ctx));
 
     if let Some(notice) = ctx.preferences().load_notice() {
         let label = gtk::Label::builder()

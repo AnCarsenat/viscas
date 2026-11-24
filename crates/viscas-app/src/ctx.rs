@@ -17,7 +17,15 @@ use crate::doc::EngineHandle;
 use crate::prefs::Preferences;
 use crate::theme::model::{self, Theme};
 
-type SelectionListener = Rc<dyn Fn(&Selection)>;
+/// A selection listener; returns `false` to disconnect.
+type SelectionListener = Rc<dyn Fn(&Selection) -> bool>;
+
+/// What changed in a [`Selection`] notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Topic {
+    Selected,
+    Hovered,
+}
 
 /// Observable selection and hover state, shared by every editor so that
 /// selecting or hovering a node anywhere highlights it everywhere
@@ -30,7 +38,7 @@ type SelectionListener = Rc<dyn Fn(&Selection)>;
 pub struct Selection {
     selected: RefCell<Vec<NodeId>>,
     hovered: Cell<Option<NodeId>>,
-    listeners: RefCell<Vec<SelectionListener>>,
+    listeners: RefCell<Vec<(Topic, SelectionListener)>>,
 }
 
 impl Selection {
@@ -59,29 +67,66 @@ impl Selection {
         }
         if *self.selected.borrow() != unique {
             *self.selected.borrow_mut() = unique;
-            self.notify();
+            self.notify(Topic::Selected);
         }
     }
 
-    #[allow(dead_code, reason = "driven by the viewport and scene tree")]
     pub fn set_hovered(&self, id: Option<NodeId>) {
         if self.hovered.replace(id) != id {
-            self.notify();
+            self.notify(Topic::Hovered);
         }
     }
 
-    /// Calls `f` after every change. Listeners get the selection as an
-    /// argument and must not capture the owning [`AppCtx`] strongly.
+    /// Calls `f` after every selection or hover change. Listeners get the
+    /// selection as an argument and must not capture the owning
+    /// [`AppCtx`] strongly.
     pub fn connect_changed(&self, f: impl Fn(&Selection) + 'static) {
-        self.listeners.borrow_mut().push(Rc::new(f));
+        let f = Rc::new(f);
+        for topic in [Topic::Selected, Topic::Hovered] {
+            let f = f.clone();
+            self.push(topic, move |s| {
+                f(s);
+                true
+            });
+        }
     }
 
-    fn notify(&self) {
+    /// Calls `f` after the selected set (or its order) changed — not on
+    /// hover. `f` returns `false` to disconnect (e.g. its editor is gone).
+    pub fn connect_selection_changed(&self, f: impl Fn(&Selection) -> bool + 'static) {
+        self.push(Topic::Selected, f);
+    }
+
+    /// Calls `f` after the hovered node changed; `f` returns `false` to
+    /// disconnect.
+    pub fn connect_hover_changed(&self, f: impl Fn(&Selection) -> bool + 'static) {
+        self.push(Topic::Hovered, f);
+    }
+
+    fn push(&self, topic: Topic, f: impl Fn(&Selection) -> bool + 'static) {
+        self.listeners.borrow_mut().push((topic, Rc::new(f)));
+    }
+
+    fn notify(&self, topic: Topic) {
         // Clone first so a listener may connect further listeners.
-        let listeners = self.listeners.borrow().clone();
-        for f in listeners {
-            f(self);
+        let listeners: Vec<SelectionListener> = self
+            .listeners
+            .borrow()
+            .iter()
+            .filter(|(t, _)| *t == topic)
+            .map(|(_, f)| f.clone())
+            .collect();
+        let dead: Vec<SelectionListener> = listeners.into_iter().filter(|f| !f(self)).collect();
+        if !dead.is_empty() {
+            self.listeners
+                .borrow_mut()
+                .retain(|(_, f)| !dead.iter().any(|d| Rc::ptr_eq(d, f)));
         }
+    }
+
+    #[cfg(test)]
+    fn listener_count(&self) -> usize {
+        self.listeners.borrow().len()
     }
 }
 
@@ -357,6 +402,28 @@ mod tests {
         sel.set_hovered(Some(NodeId(7)));
         assert_eq!(sel.hovered(), Some(NodeId(7)));
         assert_eq!(count.get(), 2);
+    }
+
+    #[test]
+    fn hover_and_selection_notify_separately_and_dead_listeners_drop() {
+        let sel = Selection::default();
+        let (s_count, h_count) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let c = s_count.clone();
+        sel.connect_selection_changed(move |_| {
+            c.set(c.get() + 1);
+            true
+        });
+        let c = h_count.clone();
+        sel.connect_hover_changed(move |_| {
+            c.set(c.get() + 1);
+            true
+        });
+        sel.connect_selection_changed(|_| false);
+        sel.set_hovered(Some(NodeId(1)));
+        assert_eq!((s_count.get(), h_count.get()), (0, 1));
+        sel.set_selected([NodeId(2)]);
+        assert_eq!((s_count.get(), h_count.get()), (1, 1));
+        assert_eq!(sel.listener_count(), 2, "the dead listener was dropped");
     }
 
     #[test]

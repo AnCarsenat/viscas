@@ -1,12 +1,15 @@
 //! Editor widgets hosted by areas (REQUIREMENTS §2).
 //!
-//! The Viewport, Console and Expressions editors are functional; every
-//! other editor shows an empty state describing what it will do and in
-//! which milestone.
+//! The Viewport, Scene Tree, Inspector, Console and Expressions editors are
+//! functional; every other editor shows an empty state describing what it
+//! will do and in which milestone.
 
 pub mod console;
 pub mod expressions;
+pub mod inspector;
+pub mod scene_tree;
 
+use std::any::Any;
 use std::f64::consts::PI;
 use std::rc::Rc;
 
@@ -73,6 +76,8 @@ pub struct Editor {
     pub viewport: Option<Viewport>,
     /// Builds editor-specific header widgets (fresh for every header).
     header: Option<Rc<dyn Fn() -> Vec<gtk::Widget>>>,
+    /// Keeps the editor's controller alive as long as the editor.
+    _state: Option<Rc<dyn Any>>,
 }
 
 impl Editor {
@@ -86,6 +91,7 @@ impl Editor {
                     widget: viewport.widget().clone(),
                     viewport: Some(viewport),
                     header: None,
+                    _state: None,
                 }
             }
             EditorKind::Console => {
@@ -96,6 +102,7 @@ impl Editor {
                     widget,
                     viewport: None,
                     header: Some(Rc::new(move || console.header_content())),
+                    _state: None,
                 }
             }
             EditorKind::Expressions => {
@@ -106,6 +113,27 @@ impl Editor {
                     widget,
                     viewport: None,
                     header: Some(Rc::new(move || list.header_content())),
+                    _state: None,
+                }
+            }
+            EditorKind::SceneTree => {
+                let tree = scene_tree::SceneTree::new(ctx);
+                Self {
+                    kind,
+                    widget: tree.widget().clone(),
+                    viewport: None,
+                    header: None,
+                    _state: Some(Rc::new(tree)),
+                }
+            }
+            EditorKind::Inspector => {
+                let inspector = inspector::Inspector::new(ctx);
+                Self {
+                    kind,
+                    widget: inspector.widget().clone(),
+                    viewport: None,
+                    header: None,
+                    _state: Some(Rc::new(inspector)),
                 }
             }
             EditorKind::DependencyGraph => Self {
@@ -113,12 +141,14 @@ impl Editor {
                 widget: canvas_placeholder(kind, ctx),
                 viewport: None,
                 header: None,
+                _state: None,
             },
             _ => Self {
                 kind,
                 widget: placeholder(kind, ctx),
                 viewport: None,
                 header: None,
+                _state: None,
             },
         }
     }
@@ -144,8 +174,8 @@ impl Editor {
 fn header_menus(kind: EditorKind) -> &'static [(&'static str, &'static [&'static str])] {
     match kind {
         EditorKind::Viewport => &[], // built by the viewport itself
-        EditorKind::SceneTree => &[("Node", &["New Folder", "Rename", "Delete"])],
-        EditorKind::Inspector => &[("Edit", &["Copy Style", "Paste Style"])],
+        // The scene tree and inspector have their own toolbars.
+        EditorKind::SceneTree | EditorKind::Inspector => &[],
         // Console and Expressions put their tools in the header directly.
         EditorKind::Console | EditorKind::Expressions => &[],
         EditorKind::Sheet => &[("Table", &["Add Column", "Import CSV", "Export CSV"])],

@@ -99,12 +99,19 @@ struct Inner {
     stack: gtk::Stack,
     display: gtk::Label,
     entry: gtk::Entry,
-    spec: ScrubSpec,
+    spec: Cell<ScrubSpec>,
+    /// Value an interaction started from (drag start, before an arrow step).
+    origin: Cell<f64>,
+    /// The current change was typed (absolute), not dragged or stepped.
+    typed: Cell<bool>,
     value: Cell<f64>,
     suffix: RefCell<String>,
     drag_start: Cell<f64>,
     scrubbing: Cell<bool>,
+    /// Shows "—" instead of the value (multi-selection with mixed values).
+    mixed: Cell<bool>,
     listeners: RefCell<Vec<Listener>>,
+    finished: RefCell<Vec<Rc<dyn Fn()>>>,
 }
 
 /// A numeric field. Cloning yields a handle to the same widget.
@@ -160,12 +167,16 @@ impl ScrubField {
                 stack,
                 display,
                 entry,
-                spec,
+                spec: Cell::new(spec),
+                origin: Cell::new(0.0),
+                typed: Cell::new(false),
                 value: Cell::new(spec.normalize(value)),
                 suffix: RefCell::default(),
                 drag_start: Cell::new(0.0),
                 scrubbing: Cell::new(false),
+                mixed: Cell::new(false),
                 listeners: RefCell::default(),
+                finished: RefCell::default(),
             }),
         };
         field.refresh();
@@ -174,12 +185,20 @@ impl ScrubField {
         left.connect_clicked(glib::clone!(
             #[strong]
             weak,
-            move |_| with(&weak, |f| f.user_set(f.inner.spec.stepped(f.value(), -1)))
+            move |_| with(&weak, |f| {
+                f.inner.origin.set(f.value());
+                f.user_set(f.inner.spec.get().stepped(f.value(), -1));
+                f.finish();
+            })
         ));
         right.connect_clicked(glib::clone!(
             #[strong]
             weak,
-            move |_| with(&weak, |f| f.user_set(f.inner.spec.stepped(f.value(), 1)))
+            move |_| with(&weak, |f| {
+                f.inner.origin.set(f.value());
+                f.user_set(f.inner.spec.get().stepped(f.value(), 1));
+                f.finish();
+            })
         ));
         field.install_drag(&weak);
         field.install_entry(&weak);
@@ -190,14 +209,70 @@ impl ScrubField {
         self.inner.root.upcast_ref()
     }
 
+    /// A weak handle, for the field's own callbacks.
+    pub fn downgrade(&self) -> WeakScrubField {
+        WeakScrubField(Rc::downgrade(&self.inner))
+    }
+
     pub fn value(&self) -> f64 {
         self.inner.value.get()
     }
 
     /// Sets the value without notifying listeners (external updates).
     pub fn set_value(&self, v: f64) {
-        self.inner.value.set(self.inner.spec.normalize(v));
+        self.inner.value.set(self.inner.spec.get().normalize(v));
+        self.inner.mixed.set(false);
         self.refresh();
+    }
+
+    /// Changes range, step and precision (e.g. slider bounds edited); the
+    /// value is re-normalized without notifying listeners.
+    pub fn set_spec(&self, spec: ScrubSpec) {
+        if self.inner.spec.replace(spec) != spec {
+            self.inner.value.set(spec.normalize(self.value()));
+            self.refresh();
+        }
+    }
+
+    pub fn spec(&self) -> ScrubSpec {
+        self.inner.spec.get()
+    }
+
+    /// The value the current interaction started from (drag start, or the
+    /// value before an arrow step): lets a mixed multi-edit move every
+    /// node by the same delta.
+    pub fn origin(&self) -> f64 {
+        self.inner.origin.get()
+    }
+
+    /// Was the change being notified typed in (an absolute value)?
+    pub fn is_typed(&self) -> bool {
+        self.inner.typed.get()
+    }
+
+    /// Shows "—" (mixed values) until the next value is set.
+    pub fn set_mixed(&self, mixed: bool) {
+        self.inner.mixed.set(mixed);
+        self.refresh();
+    }
+
+    /// Is the user dragging or typing in the field right now?
+    pub fn is_active(&self) -> bool {
+        self.inner.scrubbing.get()
+            || self.inner.stack.visible_child_name().as_deref() == Some("edit")
+    }
+
+    /// Calls `f` when an interaction ends: drag release, arrow click or
+    /// typed value committed (to close an undo step).
+    pub fn connect_finished(&self, f: impl Fn() + 'static) {
+        self.inner.finished.borrow_mut().push(Rc::new(f));
+    }
+
+    fn finish(&self) {
+        let listeners = self.inner.finished.borrow().clone();
+        for f in listeners {
+            f();
+        }
     }
 
     /// Text appended to the displayed value, e.g. `" px"`.
@@ -216,10 +291,11 @@ impl ScrubField {
     }
 
     fn user_set(&self, v: f64) {
-        let v = self.inner.spec.normalize(v);
-        if v == self.value() {
+        let v = self.inner.spec.get().normalize(v);
+        if v == self.value() && !self.inner.mixed.get() {
             return;
         }
+        self.inner.mixed.set(false);
         self.inner.value.set(v);
         self.refresh();
         let listeners = self.inner.listeners.borrow().clone();
@@ -229,7 +305,11 @@ impl ScrubField {
     }
 
     fn refresh(&self) {
-        let text = self.inner.spec.format(self.value());
+        if self.inner.mixed.get() {
+            self.inner.display.set_label("—");
+            return;
+        }
+        let text = self.inner.spec.get().format(self.value());
         self.inner
             .display
             .set_label(&format!("{text}{}", self.inner.suffix.borrow()));
@@ -242,6 +322,7 @@ impl ScrubField {
             weak,
             move |_, _, _| with(&weak, |f| {
                 f.inner.drag_start.set(f.value());
+                f.inner.origin.set(f.value());
                 f.inner.scrubbing.set(false);
             })
         ));
@@ -259,7 +340,7 @@ impl ScrubField {
                     .current_event_state()
                     .contains(gdk::ModifierType::SHIFT_MASK);
                 let start = f.inner.drag_start.get();
-                f.user_set(f.inner.spec.dragged(start, dx, fine));
+                f.user_set(f.inner.spec.get().dragged(start, dx, fine));
             })
         ));
         drag.connect_drag_end(glib::clone!(
@@ -267,8 +348,22 @@ impl ScrubField {
             weak,
             move |_, _, _| with(&weak, |f| {
                 f.inner.root.remove_css_class("scrubbing");
-                if !f.inner.scrubbing.replace(false) {
+                if f.inner.scrubbing.replace(false) {
+                    f.finish();
+                } else {
                     f.begin_edit();
+                }
+            })
+        ));
+        // A cancelled gesture (grab broken, window change) still ends the
+        // interaction, so listeners can close their undo step.
+        drag.connect_cancel(glib::clone!(
+            #[strong]
+            weak,
+            move |_, _| with(&weak, |f| {
+                f.inner.root.remove_css_class("scrubbing");
+                if f.inner.scrubbing.replace(false) {
+                    f.finish();
                 }
             })
         ));
@@ -307,8 +402,12 @@ impl ScrubField {
 
     fn begin_edit(&self) {
         let i = &self.inner;
-        i.entry
-            .set_text(&trim_float(self.value(), i.spec.digits as usize));
+        let text = if i.mixed.get() {
+            String::new()
+        } else {
+            trim_float(self.value(), i.spec.get().digits as usize)
+        };
+        i.entry.set_text(&text);
         i.stack.set_visible_child_name("edit");
         i.root.add_css_class("editing");
         i.entry.grab_focus();
@@ -322,9 +421,22 @@ impl ScrubField {
         }
         i.stack.set_visible_child_name("display");
         i.root.remove_css_class("editing");
-        if commit && let Some(v) = i.spec.parse(&i.entry.text()) {
+        if commit && let Some(v) = i.spec.get().parse(&i.entry.text()) {
+            i.typed.set(true);
             self.user_set(v);
+            i.typed.set(false);
+            self.finish();
         }
+    }
+}
+
+/// Weak handle to a [`ScrubField`].
+#[derive(Clone)]
+pub struct WeakScrubField(Weak<Inner>);
+
+impl WeakScrubField {
+    pub fn upgrade(&self) -> Option<ScrubField> {
+        self.0.upgrade().map(|inner| ScrubField { inner })
     }
 }
 
