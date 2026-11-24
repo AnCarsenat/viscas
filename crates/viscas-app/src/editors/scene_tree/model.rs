@@ -276,6 +276,25 @@ pub fn plan_drop(
     check_noop(scene, DropPlan { ids, anchor })
 }
 
+/// [`plan_drop`] for a drop on a row as displayed: "after" an expanded
+/// folder with children lands visually above its first child, so it means
+/// "before the first child" (the indicator and the result agree).
+pub fn plan_row_drop(
+    scene: &Scene,
+    dragged: &[NodeId],
+    target: NodeId,
+    pos: DropPos,
+    expanded: bool,
+) -> Result<DropPlan, DropError> {
+    if pos == DropPos::After
+        && expanded
+        && let Some(&first) = scene.children(Some(target)).first()
+    {
+        return plan_drop(scene, dragged, Some(first), DropPos::Before);
+    }
+    plan_drop(scene, dragged, Some(target), pos)
+}
+
 /// Refuses plans that leave the tree as it is.
 fn check_noop(scene: &Scene, plan: DropPlan) -> Result<DropPlan, DropError> {
     let mut sim = scene_order(scene, &plan);
@@ -498,6 +517,49 @@ pub fn duplicate_all(scene: &mut Scene, ids: &[NodeId]) -> Result<Vec<NodeId>, S
     })
 }
 
+/// Renames `id` to `text` (trimmed), rewriting references for defining
+/// nodes. Locked nodes are refused; clearing the name of a node others
+/// use is refused. Returns the toast message (`None`: unchanged) or the
+/// error to show.
+pub fn rename_node(scene: &mut Scene, id: NodeId, text: &str) -> Result<Option<String>, String> {
+    let text = text.trim();
+    let node = scene.get(id).ok_or_else(|| "node is gone".to_owned())?;
+    if node.name.as_deref().unwrap_or("") == text {
+        return Ok(None);
+    }
+    if node.locked {
+        return Err("locked — unlock it to rename".to_owned());
+    }
+    if text.is_empty() {
+        let users = if node.defined_name().is_some() {
+            scene.graph().direct_downstream(id).len()
+        } else {
+            0
+        };
+        if users > 0 {
+            let s = if users == 1 { "" } else { "s" };
+            return Err(format!("needs a name: {users} node{s} use it"));
+        }
+        return scene
+            .rename(id, None)
+            .map(|()| Some("Name cleared".to_owned()))
+            .map_err(|e| e.to_string());
+    }
+    scene
+        .rename_refactor(id, text)
+        .map(|r| Some(rename_message(r.rewritten)))
+        .map_err(|e| match e {
+            SceneError::NameCapture { node, name } => {
+                let who = scene
+                    .get(node)
+                    .map(|n| n.title())
+                    .unwrap_or_else(|| node.to_string());
+                format!("`{name}` would be captured in {who}")
+            }
+            other => other.to_string(),
+        })
+}
+
 /// Toast text after a rename.
 pub fn rename_message(rewritten: usize) -> String {
     match rewritten {
@@ -670,6 +732,51 @@ mod tests {
         s.undo();
         assert_eq!(s.roots(), &[a, f, g]);
         assert_eq!(s.children(Some(f)), &[b, c, d]);
+    }
+
+    #[test]
+    fn rename_rules() {
+        let (mut s, [a, f, b, _c, _d, _g]) = scene();
+        // `b := a + 1` follows the rename of `a`.
+        assert_eq!(
+            rename_node(&mut s, a, " alpha "),
+            Ok(Some("Renamed, 1 reference updated".into()))
+        );
+        assert!(
+            matches!(&s.get(b).unwrap().kind, NodeKind::Variable { expr } if expr == "alpha + 1")
+        );
+        assert_eq!(rename_node(&mut s, a, "alpha"), Ok(None));
+        // Used names cannot be cleared; labels can.
+        assert!(
+            rename_node(&mut s, a, "")
+                .unwrap_err()
+                .contains("1 node use")
+        );
+        assert_eq!(rename_node(&mut s, f, ""), Ok(Some("Name cleared".into())));
+        // Locked nodes refuse renames.
+        s.set_locked(b, true).unwrap();
+        assert!(
+            rename_node(&mut s, b, "beta")
+                .unwrap_err()
+                .contains("locked")
+        );
+        assert!(rename_node(&mut s, a, "1x").is_err());
+    }
+
+    #[test]
+    fn drop_after_expanded_folder_goes_to_first_child() {
+        let (s, [a, f, b, _c, d, g]) = scene();
+        // Expanded folder with children: before its first child.
+        let plan = plan_row_drop(&s, &[d], f, DropPos::After, true).unwrap();
+        assert_eq!(plan.anchor, Anchor::Before(b));
+        // Collapsed: after the folder among its siblings.
+        let plan = plan_row_drop(&s, &[a], f, DropPos::After, false).unwrap();
+        assert_eq!(plan.anchor, Anchor::Before(d));
+        // Expanded but empty folder: plain "after".
+        let plan = plan_row_drop(&s, &[a], g, DropPos::After, true).unwrap();
+        assert_eq!(plan.anchor, Anchor::End(None));
+        // Dragging the folder itself onto its own header stays refused.
+        assert!(plan_row_drop(&s, &[f], f, DropPos::After, true).is_err());
     }
 
     #[test]

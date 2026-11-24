@@ -3,6 +3,8 @@
 //! field-level diagnostics shown under each entry.
 
 use viscas_core::syntax::Span;
+
+use crate::widgets::scrub::ScrubSpec;
 use viscas_scene::{
     KindTag, LineStyle, Node, NodeId, PropValue, Scene, SourceField, Status, Style,
 };
@@ -190,13 +192,30 @@ pub fn clamp_span(text: &str, span: Span) -> Option<(usize, usize)> {
     }
 }
 
-/// Slider bound from its expression text, when it is a plain number.
-pub fn numeric(text: &str) -> Option<f64> {
-    text.trim()
-        .replace('−', "-")
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
+/// A node's new value in a relative scrub: its own start value moved by
+/// the field's change since the interaction began.
+pub fn shifted(base: f64, origin: f64, value: f64, spec: &ScrubSpec) -> f64 {
+    spec.normalize(base + (value - origin))
+}
+
+/// Scrub behaviour of a slider from its evaluated bounds; `step` is
+/// `None` for a continuous slider (100 steps over the range).
+pub fn slider_spec(min: f64, max: f64, step: Option<f64>) -> Result<ScrubSpec, String> {
+    if !(min.is_finite() && max.is_finite()) {
+        return Err("bounds must be finite".to_owned());
+    }
+    if min >= max {
+        return Err(format!("minimum {min} is not below maximum {max}"));
+    }
+    let step = match step {
+        Some(s) if s.is_finite() && s > 0.0 => s,
+        Some(s) => return Err(format!("step {s} must be positive")),
+        None => (max - min) / 100.0,
+    };
+    let digits = (-step.log10()).ceil().clamp(0.0, 6.0) as u32;
+    let mut spec = ScrubSpec::new(min, max, step, digits);
+    spec.px_per_step = (240.0 / ((max - min) / step)).clamp(1.0, 12.0);
+    Ok(spec)
 }
 
 #[cfg(test)]
@@ -251,8 +270,6 @@ mod tests {
         assert_eq!(prop_from_text(" 3 "), Some(PropValue::Float(3.0)));
         assert_eq!(prop_from_text("2pi"), Some(PropValue::Text("2pi".into())));
         assert_eq!(prop_from_text(""), None);
-        assert_eq!(numeric("−5"), Some(-5.0));
-        assert_eq!(numeric("a"), None);
     }
 
     #[test]
@@ -265,6 +282,27 @@ mod tests {
         let min = field_errors(&s, k, SourceField::Min);
         assert_eq!(min.len(), 1);
         assert!(min[0].span.is_some());
+    }
+
+    #[test]
+    fn relative_scrub_keeps_values_distinct() {
+        let spec = ScrubSpec::new(0.5, 12.0, 0.5, 1);
+        // Two nodes at 2 and 4; the field started at 2 and moved to 3.
+        assert_eq!(shifted(2.0, 2.0, 3.0, &spec), 3.0);
+        assert_eq!(shifted(4.0, 2.0, 3.0, &spec), 5.0);
+        // Clamped per node.
+        assert_eq!(shifted(11.5, 2.0, 3.0, &spec), 12.0);
+    }
+
+    #[test]
+    fn slider_specs_follow_bounds() {
+        let s = slider_spec(0.0, 5.0, None).unwrap();
+        assert_eq!((s.min, s.max, s.step, s.digits), (0.0, 5.0, 0.05, 2));
+        let s = slider_spec(-1.0, 1.0, Some(0.25)).unwrap();
+        assert_eq!((s.step, s.digits), (0.25, 1));
+        assert!(slider_spec(3.0, 3.0, None).is_err());
+        assert!(slider_spec(0.0, f64::INFINITY, None).is_err());
+        assert!(slider_spec(0.0, 1.0, Some(0.0)).is_err());
     }
 
     #[test]

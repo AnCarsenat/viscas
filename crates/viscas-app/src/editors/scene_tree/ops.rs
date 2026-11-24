@@ -77,41 +77,8 @@ pub fn drop_nodes(ctx: &AppCtx, plan: &DropPlan) -> Result<(), SceneError> {
 /// Returns the toast message, or the error to show inline.
 pub fn rename(ctx: &AppCtx, id: NodeId, text: &str) -> Result<Option<String>, String> {
     let text = text.trim();
-    ctx.engine().edit(|e| {
-        let scene = e.scene_mut();
-        let node = scene.get(id).ok_or_else(|| "node is gone".to_owned())?;
-        if node.name.as_deref().unwrap_or("") == text {
-            return Ok(None);
-        }
-        if text.is_empty() {
-            let users = if node.defined_name().is_some() {
-                scene.graph().direct_downstream(id).len()
-            } else {
-                0
-            };
-            if users > 0 {
-                let s = if users == 1 { "" } else { "s" };
-                return Err(format!("needs a name: {users} node{s} use it"));
-            }
-            return scene
-                .rename(id, None)
-                .map(|()| Some("Name cleared".to_owned()))
-                .map_err(|e| e.to_string());
-        }
-        scene
-            .rename_refactor(id, text)
-            .map(|r| Some(model::rename_message(r.rewritten)))
-            .map_err(|e| match e {
-                SceneError::NameCapture { node, name } => {
-                    let who = scene
-                        .get(node)
-                        .map(|n| n.title())
-                        .unwrap_or_else(|| node.to_string());
-                    format!("`{name}` would be captured in {who}")
-                }
-                other => other.to_string(),
-            })
-    })
+    ctx.engine()
+        .edit(|e| model::rename_node(e.scene_mut(), id, text))
 }
 
 /// Palette commands for nodes ("Scene" category).

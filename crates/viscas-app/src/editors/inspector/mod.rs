@@ -30,6 +30,8 @@ use crate::widgets::scrub::ScrubSpec;
 use crate::widgets::{ColorSwatch, Panel, ScrubField, check_row, property_row};
 
 type Refresher = Rc<dyn Fn(&Engine)>;
+/// Field origin and per-node start values of a scrub interaction.
+type ScrubBase = (f64, Vec<(NodeId, f64)>);
 
 struct Inner {
     ctx: AppCtx,
@@ -40,6 +42,9 @@ struct Inner {
     shape: RefCell<Vec<(NodeId, KindTag)>>,
     /// A scrub drag is open as an undo group.
     group_open: Cell<bool>,
+    /// Per-node start values of the current scrub interaction (relative
+    /// multi-edits) and the field value it started from.
+    scrub_base: RefCell<Option<ScrubBase>>,
     sub: RefCell<Option<Subscription>>,
 }
 
@@ -92,6 +97,7 @@ impl Inspector {
                 refreshers: RefCell::default(),
                 shape: RefCell::default(),
                 group_open: Cell::new(false),
+                scrub_base: RefCell::default(),
                 sub: RefCell::default(),
             }),
         };
@@ -101,8 +107,18 @@ impl Inspector {
         });
         *insp.inner.sub.borrow_mut() = Some(sub);
         let weak = insp.downgrade();
-        ctx.selection().connect_changed(move |_| {
-            Self::with_weak(&weak, |i| i.update(false));
+        ctx.selection().connect_selection_changed(move |_| {
+            let Some(inner) = weak.upgrade() else {
+                return false;
+            };
+            Inspector { inner }.update(false);
+            true
+        });
+        // A scrub interrupted by the editor going away (area change, window
+        // closing) must not leave its undo group open.
+        let weak = insp.downgrade();
+        insp.inner.root.connect_unmap(move |_| {
+            Self::with_weak(&weak, |i| i.close_group());
         });
         let weak = insp.downgrade();
         ctx.preferences().connect_changed(move |_| {
@@ -336,23 +352,36 @@ impl Inspector {
 
     /// Edits every selected node's content inside one open undo group,
     /// coalescing by `key` (scrub drags); closed by [`Self::close_group`].
-    fn scrub_all(&self, label: &str, key: &str, f: impl Fn(&mut NodeContent)) {
-        let ids = self.selected();
+    fn scrub_values(
+        &self,
+        label: &str,
+        key: &str,
+        targets: &[(NodeId, f64)],
+        f: &dyn Fn(&mut NodeContent, f64),
+    ) {
         let open = self.inner.group_open.replace(true);
         self.inner.ctx.engine().edit(|e| {
             let s = e.scene_mut();
             if !open {
                 s.begin_group(label);
             }
-            for id in ids {
+            for &(id, v) in targets {
                 if s.get(id).is_some_and(|n| !n.locked) {
-                    let _ = s.update_coalesced(id, key, &f);
+                    let _ = s.update_coalesced(id, key, |c| f(c, v));
                 }
             }
         });
     }
 
+    /// Mutates the engine for a non-scrub edit: any open scrub group is
+    /// closed first, so the edit never joins a drag's undo step.
+    fn edit<R>(&self, f: impl FnOnce(&mut Engine) -> R) -> R {
+        self.close_group();
+        self.inner.ctx.engine().edit(f)
+    }
+
     fn close_group(&self) {
+        self.inner.scrub_base.borrow_mut().take();
         if self.inner.group_open.replace(false) {
             self.inner.ctx.engine().edit(|e| {
                 let s = e.scene_mut();
@@ -371,19 +400,46 @@ impl Inspector {
         set: impl Fn(&mut NodeContent, f64) + 'static,
     ) -> ScrubField {
         let field = ScrubField::new(spec, 0.0);
+        let get = Rc::new(get);
         let weak = self.downgrade();
+        let weak_field = field.downgrade();
+        let ids = self.selected();
+        let (g, ids_c) = (get.clone(), ids.clone());
         field.connect_changed(move |v| {
-            Self::with_weak(&weak, |i| i.scrub_all("Edit", key, |c| set(c, v)));
+            let Some(f) = weak_field.upgrade() else {
+                return;
+            };
+            Self::with_weak(&weak, |i| {
+                // Dragging or stepping moves every node by the same delta
+                // from its own start value (mixed values stay distinct);
+                // a typed value is set as is.
+                if i.inner.scrub_base.borrow().is_none() {
+                    let bases = i.inner.ctx.engine().with(|e| {
+                        ids_c
+                            .iter()
+                            .filter_map(|id| e.scene().get(*id).map(|n| (*id, g(n))))
+                            .collect()
+                    });
+                    *i.inner.scrub_base.borrow_mut() = Some((f.origin(), bases));
+                }
+                let targets: Vec<(NodeId, f64)> = match &*i.inner.scrub_base.borrow() {
+                    Some((origin, bases)) if !f.is_typed() => bases
+                        .iter()
+                        .map(|(id, b)| (*id, model::shifted(*b, *origin, v, &f.spec())))
+                        .collect(),
+                    _ => ids_c.iter().map(|id| (*id, v)).collect(),
+                };
+                i.scrub_values("Edit", key, &targets, &set);
+            });
         });
         let weak = self.downgrade();
         field.connect_finished(move || Self::with_weak(&weak, |i| i.close_group()));
         let f = field.clone();
-        let ids = self.selected();
         self.add_refresher(move |e| {
             if f.is_active() {
                 return;
             }
-            let m = model::common(ids.iter().filter_map(|i| e.scene().get(*i)).map(&get));
+            let m = model::common(ids.iter().filter_map(|i| e.scene().get(*i)).map(&*get));
             match m {
                 Mixed::Same(v) => f.set_value(v),
                 _ => f.set_mixed(true),
@@ -538,7 +594,7 @@ impl Inspector {
             let focus = gtk::EventControllerFocus::new();
             focus.connect_leave(move |_| {
                 Self::with_weak(&weak, |i| {
-                    i.inner.ctx.engine().edit(|e| e.scene_mut().seal_history());
+                    i.edit(|e| e.scene_mut().seal_history());
                 });
             });
             entry.add_controller(focus);
@@ -618,10 +674,7 @@ impl Inspector {
                 None => Mixed::Empty,
             },
             move |i, text| {
-                i.inner
-                    .ctx
-                    .engine()
-                    .edit(|e| e.scene_mut().set_source(id, field, text))
+                i.edit(|e| e.scene_mut().set_source(id, field, text))
                     .map_err(|e| e.to_string())
             },
             Some((id, field)),
@@ -645,12 +698,22 @@ impl Inspector {
                 None => Mixed::Different,
             },
             move |i, text| match single {
-                Some(id) => ops::rename(&i.inner.ctx, id, text).map(|_| ()),
+                Some(id) => {
+                    i.close_group();
+                    ops::rename(&i.inner.ctx, id, text).map(|_| ())
+                }
                 None => Ok(()),
             },
             None,
         );
-        name.set_sensitive(single.is_some());
+        // Locked nodes cannot be renamed (ops::rename refuses too).
+        let n = name.clone();
+        self.add_refresher(move |e| {
+            let locked = single
+                .and_then(|id| e.scene().get(id))
+                .is_none_or(|n| n.locked);
+            n.set_sensitive(!locked);
+        });
         let kind = gtk::Label::builder()
             .xalign(0.0)
             .css_classes(["dim"])
@@ -706,17 +769,14 @@ impl Inspector {
                     },
                     move |i, text| {
                         let params = model::parse_params(text);
-                        i.inner
-                            .ctx
-                            .engine()
-                            .edit(|e| {
-                                e.scene_mut().update(id, |c| {
-                                    if let NodeKind::Function { params: p, .. } = &mut c.kind {
-                                        *p = params;
-                                    }
-                                })
+                        i.edit(|e| {
+                            e.scene_mut().update(id, |c| {
+                                if let NodeKind::Function { params: p, .. } = &mut c.kind {
+                                    *p = params;
+                                }
                             })
-                            .map_err(|e| e.to_string())
+                        })
+                        .map_err(|e| e.to_string())
                     },
                     None,
                 );
@@ -826,18 +886,14 @@ impl Inspector {
             }
             let text = b.text(&b.start_iter(), &b.end_iter(), false).to_string();
             Self::with_weak(&weak, |i| {
-                let _ = i
-                    .inner
-                    .ctx
-                    .engine()
-                    .edit(|e| e.scene_mut().set_source(id, SourceField::Main, &text));
+                let _ = i.edit(|e| e.scene_mut().set_source(id, SourceField::Main, &text));
             });
         });
         let weak = self.downgrade();
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(move |_| {
             Self::with_weak(&weak, |i| {
-                i.inner.ctx.engine().edit(|e| e.scene_mut().seal_history());
+                i.edit(|e| e.scene_mut().seal_history());
             });
         });
         view.add_controller(focus);
@@ -861,37 +917,52 @@ impl Inspector {
 
     fn slider_panel(&self, id: NodeId) -> Panel {
         let panel = Panel::new("Slider", true);
-        let bounds = |e: &Engine| -> (f64, f64, f64) {
-            match e.scene().get(id).map(|n| &n.kind) {
-                Some(NodeKind::Slider { min, max, step, .. }) => {
-                    let lo = model::numeric(min).unwrap_or(-10.0);
-                    let hi = model::numeric(max).unwrap_or(10.0).max(lo);
-                    let st = model::numeric(step)
-                        .filter(|s| *s > 0.0)
-                        .unwrap_or(((hi - lo) / 100.0).max(1e-9));
-                    (lo, hi, st)
-                }
-                _ => (-10.0, 10.0, 0.1),
+        // The scrub follows the *evaluated* bounds and step, updated on
+        // every refresh (bounds may be expressions such as `2a`). When they
+        // do not evaluate, the scrub is disabled and says why.
+        let value = ScrubField::new(ScrubSpec::new(0.0, 1.0, 0.01, 2), 0.0);
+        let weak = self.downgrade();
+        let weak_field = value.downgrade();
+        value.connect_changed(move |v| {
+            let Some(f) = weak_field.upgrade() else {
+                return;
+            };
+            let digits = f.spec().digits as usize;
+            Self::with_weak(&weak, |i| {
+                i.scrub_values("Slide", "source:main", &[(id, v)], &|c, v| {
+                    if let Some(slot) = c.kind.source_mut(SourceField::Main) {
+                        *slot = crate::theme::model::trim_float(v, digits);
+                    }
+                });
+            });
+        });
+        let weak = self.downgrade();
+        value.connect_finished(move || Self::with_weak(&weak, |i| i.close_group()));
+        let f = value.clone();
+        self.add_refresher(move |e| {
+            if f.is_active() {
+                return;
             }
-        };
-        let (lo, hi, st) = self.inner.ctx.engine().with(bounds);
-        let digits = (-st.log10()).ceil().clamp(0.0, 6.0) as u32;
-        let mut spec = ScrubSpec::new(lo, hi, st, digits);
-        spec.px_per_step = (240.0 / ((hi - lo) / st)).clamp(1.0, 12.0);
-        let value = self.scrub(
-            spec,
-            "source:main",
-            move |n| match &n.kind {
-                NodeKind::Slider { value, .. } => model::numeric(value).unwrap_or(0.0),
-                _ => 0.0,
-            },
-            move |c, v| {
-                if let Some(slot) = c.kind.source_mut(SourceField::Main) {
-                    *slot = crate::theme::model::trim_float(v, digits as usize);
+            match slider_bounds(e, id).and_then(|(lo, hi, st)| model::slider_spec(lo, hi, st)) {
+                Ok(spec) => {
+                    f.set_spec(spec);
+                    f.widget().set_sensitive(true);
+                    f.set_tooltip("Drag to scrub (Shift: fine)");
+                    match e
+                        .value(id)
+                        .and_then(|v| v.value.as_number().map(|_| v.value.to_f64()))
+                    {
+                        Some(v) if v.is_finite() => f.set_value(v),
+                        _ => f.set_mixed(true),
+                    }
                 }
-            },
-        );
-        value.set_tooltip("Drag to scrub (Shift: fine)");
+                Err(msg) => {
+                    f.widget().set_sensitive(false);
+                    f.set_mixed(true);
+                    f.set_tooltip(&format!("Cannot scrub: {msg}"));
+                }
+            }
+        });
         panel.append(&property_row("Value", value.widget()));
         self.source_entry(&panel, "Minimum", id, SourceField::Min);
         self.source_entry(&panel, "Maximum", id, SourceField::Max);
@@ -977,19 +1048,16 @@ impl Inspector {
                     move |i, text| {
                         let key = key.clone();
                         let v: Option<PropValue> = model::prop_from_text(text);
-                        i.inner
-                            .ctx
-                            .engine()
-                            .edit(|e| {
-                                let s = e.scene_mut();
-                                let r = match v {
-                                    Some(v) => s.set_prop(id, &key, v),
-                                    None => s.remove_prop(id, &key),
-                                };
-                                s.seal_history();
-                                r
-                            })
-                            .map_err(|e| e.to_string())
+                        i.edit(|e| {
+                            let s = e.scene_mut();
+                            let r = match v {
+                                Some(v) => s.set_prop(id, &key, v),
+                                None => s.remove_prop(id, &key),
+                            };
+                            s.seal_history();
+                            r
+                        })
+                        .map_err(|e| e.to_string())
                     },
                     None,
                 );
@@ -1336,4 +1404,54 @@ fn chip(weak: &Weak<Inner>, id: NodeId, node: &viscas_scene::Node, class: &str) 
     });
     button.add_controller(motion);
     button
+}
+
+/// Evaluated minimum, maximum and step (`None`: continuous) of a slider.
+fn slider_bounds(e: &Engine, id: NodeId) -> Result<(f64, f64, Option<f64>), String> {
+    let Some(NodeKind::Slider { min, max, step, .. }) = e.scene().get(id).map(|n| &n.kind) else {
+        return Err("not a slider".to_owned());
+    };
+    let lo = eval_number(e, min).map_err(|m| format!("minimum: {m}"))?;
+    let hi = eval_number(e, max).map_err(|m| format!("maximum: {m}"))?;
+    let st = if step.trim().is_empty() {
+        None
+    } else {
+        Some(eval_number(e, step).map_err(|m| format!("step: {m}"))?)
+    };
+    Ok((lo, hi, st))
+}
+
+/// Evaluates an expression against the scene's current definitions.
+fn eval_number(e: &Engine, text: &str) -> Result<f64, String> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use viscas_core::eval::{Env, Resolver, Value, eval_expr};
+
+    struct Defs(HashMap<String, Value>);
+    impl Resolver for Defs {
+        fn resolve(&self, name: &str) -> Option<Value> {
+            self.0.get(name).cloned()
+        }
+    }
+    if text.trim().is_empty() {
+        return Err("empty".to_owned());
+    }
+    let expr = viscas_core::syntax::parse_expr(text).map_err(|errs| {
+        errs.first()
+            .map_or_else(|| "parse error".to_owned(), |er| er.to_string())
+    })?;
+    let defs: HashMap<String, Value> = e
+        .scene()
+        .graph()
+        .defined_names()
+        .filter_map(|n| e.evaluator().lookup(n).map(|v| (n.to_owned(), v)))
+        .collect();
+    let mut env = Env::new();
+    env.set_resolver(Some(Arc::new(Defs(defs))));
+    let opts = e.settings().eval_options(None);
+    let v = eval_expr(&expr, &env, &opts).map_err(|er| er.message)?;
+    match v.as_number() {
+        Some(n) if n.is_real() => Ok(v.to_f64()),
+        _ => Err(format!("expected a real number, got a {}", v.type_name())),
+    }
 }

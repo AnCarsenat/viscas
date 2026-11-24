@@ -97,8 +97,10 @@ struct Inner {
     toast: gtk::Revealer,
     toast_label: gtk::Label,
     toast_timer: RefCell<Option<glib::SourceId>>,
-    /// Upstream / downstream of the focus node.
+    /// Upstream / downstream of the focus node (cached per focus).
     tint: RefCell<(Option<NodeId>, HashSet<NodeId>, HashSet<NodeId>)>,
+    /// The cached tint is outdated (graph or tree changed).
+    tint_dirty: Cell<bool>,
     /// Expanded nodes saved while filtering.
     saved_expanded: RefCell<Vec<NodeId>>,
     sub: RefCell<Option<Subscription>>,
@@ -216,6 +218,7 @@ impl SceneTree {
                 toast_label,
                 toast_timer: RefCell::default(),
                 tint: RefCell::default(),
+                tint_dirty: Cell::new(true),
                 saved_expanded: RefCell::default(),
                 sub: RefCell::default(),
             }),
@@ -230,7 +233,7 @@ impl SceneTree {
         tree_ed.install_listeners();
         tree_ed.sync_all();
         tree_ed.expand_all();
-        tree_ed.apply_selection_from_ctx();
+        tree_ed.apply_selection_from_ctx(true);
         tree_ed.update_tint();
         tree_ed
     }
@@ -381,6 +384,16 @@ impl SceneTree {
         let Some(row) = self.row_of(item) else {
             return;
         };
+        // A rename in progress is committed (not silently dropped) when
+        // the row is recycled; failures are reported in a toast.
+        if row.is_renaming() {
+            self.finish_rename(&row);
+        }
+        // A hover on the recycled row would otherwise stick.
+        let sel = self.inner.ctx.selection();
+        if row.id.get().is_some() && sel.hovered() == row.id.get() {
+            sel.set_hovered(None);
+        }
         if let Some(id) = row.id.take() {
             let mut bound = self.inner.bound.borrow_mut();
             if let Some(list) = bound.get_mut(&id) {
@@ -389,9 +402,6 @@ impl SceneTree {
                     bound.remove(&id);
                 }
             }
-        }
-        if row.is_renaming() {
-            row.end_rename();
         }
         row.set_class_from(&DROP_CLASSES, None);
         row.expander.set_list_row(None);
@@ -474,14 +484,11 @@ impl SceneTree {
         let focus = gtk::EventControllerFocus::new();
         let wr = with_row.clone();
         focus.connect_leave(move |_| {
-            wr(&|_, r| {
-                // Leaving with an error cancels; otherwise commit.
+            // Leaving commits; a refused name is discarded with a toast so
+            // the tree's keys never stay captured by a dead entry.
+            wr(&|t, r| {
                 if r.is_renaming() {
-                    let r2 = r.entry.clone();
-                    r2.emit_activate();
-                    if r.is_renaming() {
-                        r.end_rename();
-                    }
+                    t.finish_rename(r);
                 }
             });
         });
@@ -570,11 +577,16 @@ impl SceneTree {
         let target = row.id.get()?;
         let dragged = self.inner.drag_ids.borrow().clone();
         let h = f64::from(row.expander.height());
+        let expanded = row
+            .list_row
+            .borrow()
+            .as_ref()
+            .is_some_and(|r| r.is_expanded());
         self.inner.ctx.engine().with(|e| {
             let scene = e.scene();
             let folder = matches!(scene.get(target)?.kind, NodeKind::Folder);
             let pos = model::drop_position(y, h, folder);
-            model::plan_drop(scene, &dragged, Some(target), pos)
+            model::plan_row_drop(scene, &dragged, target, pos, expanded)
                 .ok()
                 .map(|p| (p, pos))
         })
@@ -614,27 +626,56 @@ impl SceneTree {
                 Self::with_weak(&weak, |t| t.push_selection_to_ctx());
             });
         // Drops on the empty space below the rows append at top level.
+        // Drops a row refused bubble up here too: those stay refused.
         let target = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
         let weak = self.downgrade();
-        target.connect_drop(move |_, _, _, _| {
+        let plan_at = move |x: f64, y: f64| -> Option<model::DropPlan> {
+            let t = SceneTree {
+                inner: weak.upgrade()?,
+            };
+            if t.inner.flat.get() || t.over_row(x, y) {
+                return None;
+            }
+            let dragged = t.inner.drag_ids.borrow().clone();
+            t.inner
+                .ctx
+                .engine()
+                .with(|e| model::plan_drop(e.scene(), &dragged, None, DropPos::After))
+                .ok()
+        };
+        let plan_at = Rc::new(plan_at);
+        let p = plan_at.clone();
+        target.connect_motion(move |_, x, y| {
+            if p(x, y).is_some() {
+                gdk::DragAction::MOVE
+            } else {
+                gdk::DragAction::empty()
+            }
+        });
+        let weak = self.downgrade();
+        target.connect_drop(move |_, _, x, y| {
             let mut done = false;
-            Self::with_weak(&weak, |t| {
-                if t.inner.flat.get() {
-                    return;
-                }
-                let dragged = t.inner.drag_ids.borrow().clone();
-                let plan = t
-                    .inner
-                    .ctx
-                    .engine()
-                    .with(|e| model::plan_drop(e.scene(), &dragged, None, DropPos::After));
-                if let Ok(plan) = plan {
-                    done = t.run_drop(&plan);
-                }
-            });
+            if let Some(plan) = plan_at(x, y) {
+                Self::with_weak(&weak, |t| done = t.run_drop(&plan));
+            }
             done
         });
         self.inner.list.add_controller(target);
+    }
+
+    /// Is list-view point (`x`, `y`) over a row?
+    fn over_row(&self, x: f64, y: f64) -> bool {
+        let mut w = self.inner.list.pick(x, y, gtk::PickFlags::DEFAULT);
+        while let Some(widget) = w {
+            if widget.has_css_class("tree-row") {
+                return true;
+            }
+            if widget == *self.inner.list.upcast_ref::<gtk::Widget>() {
+                return false;
+            }
+            w = widget.parent();
+        }
+        false
     }
 
     fn install_listeners(&self) {
@@ -643,12 +684,28 @@ impl SceneTree {
             Self::with_weak(&weak, |t| t.on_doc_event(ev));
         });
         *self.inner.sub.borrow_mut() = Some(sub);
+        // Selection changes re-apply (and reveal) the selection; hover only
+        // restyles rows. Both disconnect once the editor is gone.
         let weak = self.downgrade();
-        self.inner.ctx.selection().connect_changed(move |_| {
-            Self::with_weak(&weak, |t| {
-                t.apply_selection_from_ctx();
+        self.inner
+            .ctx
+            .selection()
+            .connect_selection_changed(move |_| {
+                let Some(inner) = weak.upgrade() else {
+                    return false;
+                };
+                let t = SceneTree { inner };
+                t.apply_selection_from_ctx(true);
                 t.update_tint();
+                true
             });
+        let weak = self.downgrade();
+        self.inner.ctx.selection().connect_hover_changed(move |_| {
+            let Some(inner) = weak.upgrade() else {
+                return false;
+            };
+            SceneTree { inner }.update_tint();
+            true
         });
         let weak = self.downgrade();
         self.inner.ctx.preferences().connect_changed(move |_| {
@@ -741,7 +798,8 @@ impl SceneTree {
         keys.connect_key_pressed(move |_, key, _, state| {
             let mut handled = false;
             Self::with_weak(&weak, |t| {
-                if t.renaming() {
+                // Typing in the filter or a rename entry: keys are text.
+                if t.focus_in_text() {
                     return;
                 }
                 let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
@@ -792,28 +850,30 @@ impl SceneTree {
                     )
                 });
                 if structural || (renamed && self.inner.flat.get()) {
-                    self.sync_all();
-                    // New folders start expanded (Godot-like).
-                    let folders: Vec<NodeId> = self.inner.ctx.engine().with(|e| {
-                        events
-                            .iter()
-                            .filter_map(|ev| match ev {
-                                SceneEvent::NodeAdded(id) => Some(*id),
+                    // Moved rows are recreated collapsed: restore them, and
+                    // expand new folders (Godot-like).
+                    let mut expand: HashSet<NodeId> = self.expanded_ids().into_iter().collect();
+                    self.inner.ctx.engine().with(|e| {
+                        expand.extend(events.iter().filter_map(|ev| {
+                            match ev {
+                                SceneEvent::NodeAdded(id)
+                                    if e.scene()
+                                        .get(*id)
+                                        .is_some_and(|n| matches!(n.kind, NodeKind::Folder)) =>
+                                {
+                                    Some(*id)
+                                }
                                 _ => None,
-                            })
-                            .filter(|id| {
-                                e.scene()
-                                    .get(*id)
-                                    .is_some_and(|n| matches!(n.kind, NodeKind::Folder))
-                            })
-                            .collect()
+                            }
+                        }));
                     });
-                    if !self.inner.flat.get() {
-                        for f in folders {
-                            self.expand_node(f);
+                    self.quiet(|| {
+                        self.sync_all();
+                        if !self.inner.flat.get() {
+                            self.expand_set(&expand);
                         }
-                    }
-                    self.apply_selection_from_ctx();
+                    });
+                    self.apply_selection_from_ctx(false);
                     self.refresh_all();
                 } else {
                     let changed: HashSet<NodeId> = events
@@ -830,12 +890,17 @@ impl SceneTree {
                     .any(|e| matches!(e, SceneEvent::GraphChanged { .. }))
                     || structural
                 {
+                    self.inner.tint_dirty.set(true);
                     self.update_tint();
                 }
             }
             DocEvent::Replaced => {
-                self.sync_all();
-                self.expand_all();
+                self.quiet(|| {
+                    self.sync_all();
+                    self.expand_all();
+                });
+                self.apply_selection_from_ctx(false);
+                self.inner.tint_dirty.set(true);
                 self.update_tint();
             }
             DocEvent::Settings(_) => self.refresh_all(),
@@ -986,84 +1051,108 @@ impl SceneTree {
         self.update_tint();
     }
 
-    fn apply_selection_from_ctx(&self) {
+    /// Runs `f` (which changes rows) without echoing the model's
+    /// transient selection back into the shared selection.
+    fn quiet<R>(&self, f: impl FnOnce() -> R) -> R {
+        let was = self.inner.syncing.replace(true);
+        let r = f();
+        self.inner.syncing.set(was);
+        r
+    }
+
+    /// Mirrors the shared selection into the list. `reveal`: expand the
+    /// ancestors of selected nodes and scroll to the primary one (only for
+    /// actual selection changes, never for hover or tree edits).
+    fn apply_selection_from_ctx(&self, reveal: bool) {
         if self.inner.syncing.get() {
             return;
         }
-        let wanted = self.inner.ctx.selection().selected();
-        if !self.inner.flat.get() {
-            for id in &wanted {
-                self.reveal(*id);
-            }
+        let order = self.inner.ctx.selection().selected();
+        let wanted: HashSet<NodeId> = order.iter().copied().collect();
+        if reveal && !self.inner.flat.get() {
+            let ancestors: HashSet<NodeId> = self.inner.ctx.engine().with(|e| {
+                let s = e.scene();
+                let mut set = HashSet::new();
+                for id in &order {
+                    let mut cur = s.parent(*id);
+                    while let Some(p) = cur {
+                        set.insert(p);
+                        cur = s.parent(p);
+                    }
+                }
+                set
+            });
+            self.quiet(|| self.expand_set(&ancestors));
         }
         let n = self.inner.tree.n_items();
         let selected = gtk::Bitset::new_empty();
-        let mut first = None;
+        let mut primary = None;
         for p in 0..n {
             if let Some(id) = self.id_at(p)
                 && wanted.contains(&id)
             {
                 selected.add(p);
-                if wanted.last() == Some(&id) {
-                    first = Some(p);
+                if order.last() == Some(&id) {
+                    primary = Some(p);
                 }
             }
         }
-        self.inner.syncing.set(true);
-        self.inner
-            .selection
-            .set_selection(&selected, &gtk::Bitset::new_range(0, n));
-        self.inner.syncing.set(false);
-        if let Some(p) = first {
+        self.quiet(|| {
+            self.inner
+                .selection
+                .set_selection(&selected, &gtk::Bitset::new_range(0, n));
+        });
+        if reveal && let Some(p) = primary {
             self.inner
                 .list
                 .scroll_to(p, gtk::ListScrollFlags::NONE, None);
         }
     }
 
-    /// Expands the ancestors of `id`.
-    fn reveal(&self, id: NodeId) {
-        let ancestors: Vec<NodeId> = self.inner.ctx.engine().with(|e| {
-            let s = e.scene();
-            let mut v = Vec::new();
-            let mut cur = s.parent(id);
-            while let Some(p) = cur {
-                v.push(p);
-                cur = s.parent(p);
-            }
-            v.reverse();
-            v
-        });
-        for a in ancestors {
-            self.expand_node(a);
+    /// Expands every row whose node is in `ids`, in one pass (expanding
+    /// inserts the children right after, so nested rows are reached too).
+    fn expand_set(&self, ids: &HashSet<NodeId>) {
+        if ids.is_empty() {
+            return;
         }
-    }
-
-    fn expand_node(&self, id: NodeId) {
-        if let Some(p) = self.position_of(id)
-            && let Some(row) = self.inner.tree.row(p)
-        {
-            row.set_expanded(true);
-        }
-    }
-
-    fn expand_all(&self) {
         let mut p = 0;
         while p < self.inner.tree.n_items() {
-            if let Some(row) = self.inner.tree.row(p) {
+            if let Some(row) = self.inner.tree.row(p)
+                && !row.is_expanded()
+                && obj_id(row.upcast_ref()).is_some_and(|id| ids.contains(&id))
+            {
                 row.set_expanded(true);
             }
             p += 1;
         }
     }
 
-    fn collapse_all(&self) {
-        let n = self.inner.tree.n_items();
-        for p in (0..n).rev() {
-            if let Some(row) = self.inner.tree.row(p) {
-                row.set_expanded(false);
+    fn expand_node(&self, id: NodeId) {
+        self.quiet(|| self.expand_set(&HashSet::from([id])));
+    }
+
+    fn expand_all(&self) {
+        self.quiet(|| {
+            let mut p = 0;
+            while p < self.inner.tree.n_items() {
+                if let Some(row) = self.inner.tree.row(p) {
+                    row.set_expanded(true);
+                }
+                p += 1;
             }
-        }
+        });
+        self.apply_selection_from_ctx(false);
+    }
+
+    fn collapse_all(&self) {
+        self.quiet(|| {
+            let n = self.inner.tree.n_items();
+            for p in (0..n).rev() {
+                if let Some(row) = self.inner.tree.row(p) {
+                    row.set_expanded(false);
+                }
+            }
+        });
     }
 
     fn expanded_ids(&self) -> Vec<NodeId> {
@@ -1082,34 +1171,38 @@ impl SceneTree {
             *self.inner.saved_expanded.borrow_mut() = self.expanded_ids();
         }
         *self.inner.filter.borrow_mut() = query;
-        if flat != was_flat {
-            // Rows must be recreated to change their expandability.
-            self.inner.roots.remove_all();
-        }
-        self.inner.flat.set(flat);
-        self.sync_all();
-        if was_flat && !flat {
-            let saved = std::mem::take(&mut *self.inner.saved_expanded.borrow_mut());
-            for id in saved {
-                self.expand_node(id);
+        self.quiet(|| {
+            if flat != was_flat {
+                // Rows must be recreated to change their expandability.
+                self.inner.roots.remove_all();
             }
-        }
-        self.apply_selection_from_ctx();
+            self.inner.flat.set(flat);
+            self.sync_all();
+            if was_flat && !flat {
+                let saved = std::mem::take(&mut *self.inner.saved_expanded.borrow_mut());
+                self.expand_set(&saved.into_iter().collect());
+            }
+        });
+        self.apply_selection_from_ctx(false);
     }
 
-    /// Recomputes the dependency tint for the hovered (else primary
-    /// selected) node and restyles the bound rows.
+    /// Restyles the bound rows for the hovered (else primary selected)
+    /// node. Upstream / downstream sets are cached per focus node and
+    /// recomputed only when the focus or the graph changed.
     fn update_tint(&self) {
         let sel = self.inner.ctx.selection();
         let focus = sel.hovered().or_else(|| sel.selected().last().copied());
-        let (up, down) = self.inner.ctx.engine().with(|e| match focus {
-            Some(f) if e.scene().contains(f) => (
-                e.scene().upstream(f).into_iter().collect(),
-                e.scene().downstream(f).into_iter().collect(),
-            ),
-            _ => (HashSet::new(), HashSet::new()),
-        });
-        *self.inner.tint.borrow_mut() = (focus, up, down);
+        let stale = self.inner.tint_dirty.replace(false) || self.inner.tint.borrow().0 != focus;
+        if stale {
+            let (up, down) = self.inner.ctx.engine().with(|e| match focus {
+                Some(f) if e.scene().contains(f) => (
+                    e.scene().upstream(f).into_iter().collect(),
+                    e.scene().downstream(f).into_iter().collect(),
+                ),
+                _ => (HashSet::new(), HashSet::new()),
+            });
+            *self.inner.tint.borrow_mut() = (focus, up, down);
+        }
         let rows: Vec<Rc<Row>> = self
             .inner
             .bound
@@ -1153,12 +1246,29 @@ impl SceneTree {
     // Rename, menus, toasts
     // ------------------------------------------------------------------
 
-    fn renaming(&self) -> bool {
-        self.inner.rows.borrow().values().any(|r| r.is_renaming())
+    /// Is keyboard focus in a text field (filter, rename entry)? Tree
+    /// shortcuts must not act on the selection then.
+    fn focus_in_text(&self) -> bool {
+        let focus = self.inner.root.root().and_then(|r| r.focus());
+        let mut w = focus;
+        while let Some(widget) = w {
+            if widget.is::<gtk::Text>() || widget.is::<gtk::Entry>() {
+                return true;
+            }
+            if widget == *self.inner.root.upcast_ref::<gtk::Widget>() {
+                return false;
+            }
+            w = widget.parent();
+        }
+        false
     }
 
     fn begin_rename(&self, id: NodeId) {
-        self.reveal(id);
+        let ancestors: HashSet<NodeId> = self.inner.ctx.engine().with(|e| {
+            let s = e.scene();
+            std::iter::successors(s.parent(id), |p| s.parent(*p)).collect()
+        });
+        self.quiet(|| self.expand_set(&ancestors));
         if let Some(p) = self.position_of(id) {
             self.inner
                 .list
@@ -1205,6 +1315,26 @@ impl SceneTree {
         }
     }
 
+    /// Ends a rename the user did not confirm with Enter (focus left, row
+    /// recycled): commits it, or discards it with the reason in a toast.
+    fn finish_rename(&self, row: &Row) {
+        let Some(id) = row.id.get() else {
+            row.end_rename();
+            return;
+        };
+        let alive = self.inner.ctx.engine().with(|e| e.scene().contains(id));
+        let text = row.entry.text().to_string();
+        row.end_rename();
+        if !alive {
+            return;
+        }
+        match ops::rename(&self.inner.ctx, id, &text) {
+            Ok(Some(m)) => self.toast(&m),
+            Ok(None) => {}
+            Err(e) => self.toast(&format!("Rename discarded: {e}")),
+        }
+    }
+
     fn add_and_rename(&self, kind: KindTag, parent: Option<Option<NodeId>>) {
         if let Some(Some(p)) = parent {
             self.expand_node(p);
@@ -1217,7 +1347,7 @@ impl SceneTree {
                     if let Some(Some(p)) = parent {
                         t.expand_node(p);
                     }
-                    t.apply_selection_from_ctx();
+                    t.apply_selection_from_ctx(true);
                     if t.inner
                         .ctx
                         .engine()
