@@ -501,3 +501,40 @@ fn eq_rule_reads_plot_variables_as_relations() {
         ItemKind::Relation { .. }
     ));
 }
+
+#[test]
+fn pin_plan_pins_an_older_result_later_without_reevaluating() {
+    let mut e = engine();
+    e.console_eval("k := 2");
+    e.console_eval("m := k + 1");
+    let plan = e.pin_plan().unwrap();
+    assert_eq!(plan.len(), 2, "dependency first, then the input");
+    // Later inputs change the console state; the plan is unaffected.
+    e.console_eval("k := 10");
+    e.console_eval("7 * 6");
+    let history = e.history().to_vec();
+    let ids = e.apply_pin_plan(plan).unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(e.history(), &history[..], "nothing evaluated again");
+    let m = e.scene().lookup("m").unwrap();
+    assert_eq!(e.value(m).unwrap().exact, "3");
+    // One undo step removes both nodes.
+    assert!(e.undo());
+    assert!(e.scene().lookup("m").is_none());
+    assert!(e.scene().lookup("k").is_none());
+}
+
+#[test]
+fn stale_pin_plan_skips_dependencies_now_in_the_scene() {
+    let mut e = engine();
+    e.console_eval("k := 2");
+    e.console_eval("m := k + 1");
+    let plan = e.pin_plan().unwrap();
+    e.add_line(None, "k := 5").unwrap();
+    let ids = e.apply_pin_plan(plan.clone()).unwrap();
+    assert_eq!(ids.len(), 1);
+    let m = e.scene().lookup("m").unwrap();
+    assert_eq!(e.value(m).unwrap().exact, "6");
+    // Pinning again: the input's own name is taken now.
+    assert!(e.apply_pin_plan(plan).is_err());
+}

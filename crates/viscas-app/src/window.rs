@@ -398,6 +398,32 @@ fn install_space_key(window: &gtk::ApplicationWindow) {
     window.add_controller(keys);
 }
 
+/// The focused text widget whose own text undo should take Ctrl+Z
+/// (`redo`: Ctrl+Shift+Z) instead of the document: a text view with
+/// something to undo/redo, or a text field with uncommitted changes (its
+/// entry marked `text-dirty`, or inside a scrub field being edited).
+pub fn text_undo_target(window: &gtk::Window, redo: bool) -> Option<gtk::Widget> {
+    let focus = gtk::prelude::GtkWindowExt::focus(window)?;
+    if let Some(view) = focus.downcast_ref::<gtk::TextView>() {
+        let b = view.buffer();
+        let can = if redo { b.can_redo() } else { b.can_undo() };
+        return can.then_some(focus);
+    }
+    if !focus.is::<gtk::Text>() && focus.dynamic_cast_ref::<gtk::Editable>().is_none() {
+        return None;
+    }
+    let mut w = Some(focus.clone());
+    while let Some(cur) = w {
+        if cur.has_css_class("text-dirty")
+            || (cur.has_css_class("scrub") && cur.has_css_class("editing"))
+        {
+            return Some(focus);
+        }
+        w = cur.parent();
+    }
+    None
+}
+
 /// Whether the focused widget takes text input.
 fn focus_is_text(window: &gtk::ApplicationWindow) -> bool {
     let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else {

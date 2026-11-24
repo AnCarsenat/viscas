@@ -696,4 +696,26 @@ mod tests {
         assert_eq!(prune_removed(&[a, b], &events), Some(vec![b]));
         assert_eq!(prune_removed(&[b], &events), None);
     }
+
+    /// Editors call `edit` from GTK handlers and rely on listeners running
+    /// later, in the idle tick (never re-entrantly inside `edit`).
+    #[test]
+    fn edit_dispatches_on_the_idle_tick_not_synchronously() {
+        let main = glib::MainContext::default();
+        let _owner = main.acquire().expect("default main context");
+        let handle = EngineHandle::new(Engine::with_workers(1));
+        let seen = Rc::new(Cell::new(0));
+        let s = seen.clone();
+        let _sub = handle.subscribe(move |ev| {
+            if matches!(ev, DocEvent::Scene(_)) {
+                s.set(s.get() + 1);
+            }
+        });
+        handle.edit(|e| {
+            e.add_line(None, "a := 1").unwrap();
+        });
+        assert_eq!(seen.get(), 0, "edit must not broadcast synchronously");
+        while main.iteration(false) {}
+        assert_eq!(seen.get(), 1, "the idle tick broadcasts once");
+    }
 }

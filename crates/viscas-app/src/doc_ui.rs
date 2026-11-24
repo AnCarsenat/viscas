@@ -130,6 +130,20 @@ impl DocUi {
         self.window.upgrade()
     }
 
+    /// While a text field has uncommitted edits, Ctrl+Z / Ctrl+Shift+Z
+    /// undo the typing (the widget's own text undo), not the document.
+    /// Returns whether it was handled that way.
+    fn text_undo(&self, redo: bool) -> bool {
+        let Some(target) = self
+            .window()
+            .and_then(|w| crate::window::text_undo_target(w.upcast_ref(), redo))
+        else {
+            return false;
+        };
+        let action = if redo { "text.redo" } else { "text.undo" };
+        WidgetExt::activate_action(&target, action, None).is_ok()
+    }
+
     fn set_status(&self, text: &str) {
         if let Some(l) = self.status.upgrade() {
             l.set_label(text);
@@ -384,13 +398,17 @@ pub fn install(
     let undo = add(
         "undo",
         Rc::new(|ui: &DocUi| {
-            ui.ctx.engine().undo();
+            if !ui.text_undo(false) {
+                ui.ctx.engine().undo();
+            }
         }),
     );
     let redo = add(
         "redo",
         Rc::new(|ui: &DocUi| {
-            ui.ctx.engine().redo();
+            if !ui.text_undo(true) {
+                ui.ctx.engine().redo();
+            }
         }),
     );
     add(
