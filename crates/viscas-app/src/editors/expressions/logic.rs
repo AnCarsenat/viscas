@@ -5,6 +5,24 @@
 use viscas_core::syntax::Span;
 use viscas_scene::{NodeContent, NodeId, NodeKind, Scene, SourceField};
 
+/// Byte range to underline in the entry showing `current` for an error
+/// `span` reported against `reported`; `None` once the text differs (the
+/// span would point at the wrong characters). An empty span covers the
+/// next character.
+pub fn underline_range(reported: &str, current: &str, span: Span) -> Option<(usize, usize)> {
+    if reported != current {
+        return None;
+    }
+    let (start, mut end) = crate::editors::console::render::clamp_span(current, span);
+    if start == end {
+        end = current[start..]
+            .chars()
+            .next()
+            .map_or(start, |c| start + c.len_utf8());
+    }
+    (end > start).then_some((start, end))
+}
+
 /// Kinds shown as rows: everything an expression-list line can express.
 pub fn listed(kind: &NodeKind) -> bool {
     matches!(
@@ -166,6 +184,24 @@ pub fn drop_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn underline_only_for_the_reported_text() {
+        let span = Span { start: 4, end: 7 };
+        assert_eq!(underline_range("1 + foo", "1 + foo", span), Some((4, 7)));
+        // Typed since: the span no longer applies.
+        assert_eq!(underline_range("1 + foo", "1 + fo", span), None);
+        assert_eq!(
+            underline_range("a := q", "a := qq", Span { start: 5, end: 6 }),
+            None
+        );
+        // Empty span → next char; at the end → nothing to underline.
+        assert_eq!(
+            underline_range("π+", "π+", Span { start: 2, end: 2 }),
+            Some((2, 3))
+        );
+        assert_eq!(underline_range("x", "x", Span { start: 1, end: 1 }), None);
+    }
 
     #[test]
     fn listed_kinds() {

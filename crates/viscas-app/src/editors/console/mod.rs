@@ -23,14 +23,19 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use gtk::prelude::*;
-use gtk::{gdk, glib};
-use viscas_engine::{Completion, CompletionKind, ConsoleOutput, ItemKind};
-use viscas_scene::NodeId;
+use gtk::{gdk, gio, glib};
+use viscas_engine::{
+    Completion, CompletionKind, ConsoleError, ConsoleItem, ConsoleOutput, ItemKind,
+};
+use viscas_scene::{NodeContent, NodeId};
 
 use crate::ctx::AppCtx;
 use crate::doc::{DocEvent, Subscription};
 use crate::editors::pick_icon;
 use history::HistoryNav;
+
+/// A header-menu action: name and what it does.
+type MenuAction = (&'static str, fn(&Console));
 
 /// Entries kept in the transcript; older ones are dropped.
 const MAX_ENTRIES: usize = 400;
@@ -40,11 +45,22 @@ const MAX_COMPLETIONS: usize = 60;
 thread_local! {
     /// The history file was read into the engine (once per process).
     static HISTORY_LOADED: Cell<bool> = const { Cell::new(false) };
+    /// Every console editor, most recently used last (palette commands
+    /// act on the newest one that is on screen).
+    static INSTANCES: RefCell<Vec<Weak<Inner>>> = const { RefCell::new(Vec::new()) };
 }
+
+/// What "Pin as node" does for an entry, captured when it was evaluated
+/// (`Engine::pin_plan`): the node contents to add, or why it cannot be
+/// pinned. `None` for entries with nothing to pin (commands, errors).
+type PinSnapshot = Option<Result<Vec<NodeContent>, String>>;
 
 /// One transcript entry and the data to re-render it.
 struct Entry {
+    /// Monotonic id (indices shift when old entries are dropped).
+    id: u64,
     output: ConsoleOutput,
+    pin: PinSnapshot,
     widget: gtk::Box,
 }
 
@@ -60,8 +76,7 @@ struct Inner {
     completions: RefCell<Vec<Completion>>,
     nav: RefCell<HistoryNav>,
     entries: RefCell<Vec<Entry>>,
-    /// Index of the newest entry `:pin` would pin as is.
-    last_pinnable: Cell<Option<usize>>,
+    next_id: Cell<u64>,
     /// Header chips (exact/approx, rad/deg) of every built header.
     chips: RefCell<Vec<(glib::WeakRef<gtk::Button>, glib::WeakRef<gtk::Button>)>>,
     /// Programmatic buffer edit in progress (keeps history browsing).
@@ -173,7 +188,7 @@ impl Console {
                 completions: RefCell::default(),
                 nav: RefCell::default(),
                 entries: RefCell::default(),
-                last_pinnable: Cell::new(None),
+                next_id: Cell::new(0),
                 chips: RefCell::default(),
                 setting_text: Cell::new(false),
                 stick: Cell::new(false),
@@ -185,7 +200,42 @@ impl Console {
         console.connect_input(&input_bar);
         console.connect_scrolling();
         console.connect_updates();
+        console.register(ctx);
         console
+    }
+
+    /// Tracks this console for palette commands; installs the command
+    /// provider once per process.
+    fn register(&self, ctx: &AppCtx) {
+        let first = INSTANCES.with_borrow_mut(|v| {
+            let first = v.is_empty();
+            v.retain(|w| w.strong_count() > 0);
+            v.push(self.downgrade());
+            first
+        });
+        if first {
+            ctx.add_command_provider(ConsoleCommands);
+        }
+        // Focusing a console makes it the palette's target.
+        let focus = gtk::EventControllerFocus::new();
+        let weak = self.downgrade();
+        focus.connect_enter(move |_| {
+            INSTANCES.with_borrow_mut(|v| {
+                v.retain(|w| w.strong_count() > 0 && !w.ptr_eq(&weak));
+                v.push(weak.clone());
+            });
+        });
+        self.inner.root.add_controller(focus);
+    }
+
+    /// The most recently used console that is on screen.
+    fn active() -> Option<Console> {
+        INSTANCES.with_borrow(|v| {
+            v.iter()
+                .rev()
+                .filter_map(Console::from_weak)
+                .find(|c| c.inner.root.is_mapped())
+        })
     }
 
     pub fn widget(&self) -> gtk::Widget {
@@ -253,7 +303,105 @@ impl Console {
                 c.inner.input.grab_focus();
             }
         });
-        vec![mode.upcast(), angle.upcast(), clear.upcast()]
+        let group = gio::SimpleActionGroup::new();
+        let actions: [MenuAction; 4] = [
+            ("clear", |c| c.clear_transcript()),
+            ("copy-last", |c| c.copy_last_result()),
+            ("pin-last", |c| c.pin_last()),
+            ("forget", |c| c.forget_definitions()),
+        ];
+        for (name, f) in actions {
+            let action = gio::SimpleAction::new(name, None);
+            let weak = self.downgrade();
+            action.connect_activate(move |_, _| {
+                if let Some(c) = Console::from_weak(&weak) {
+                    f(&c);
+                }
+            });
+            group.add_action(&action);
+        }
+        let menu = header_menu_button(
+            "Session",
+            "console",
+            &group,
+            &[
+                ("Clear Transcript", "clear", Some("<Control>l")),
+                ("Copy Last Result", "copy-last", None),
+                (
+                    "Pin Last Result",
+                    "pin-last",
+                    Some("<Control><Shift>Return"),
+                ),
+                ("Forget Console Definitions", "forget", None),
+            ],
+        );
+        vec![menu.upcast(), mode.upcast(), angle.upcast(), clear.upcast()]
+    }
+
+    /// The newest entry matching `f`.
+    fn last_entry<R>(&self, f: impl Fn(&Entry) -> Option<R>) -> Option<R> {
+        self.inner.entries.borrow().iter().rev().find_map(f)
+    }
+
+    fn copy_last_result(&self) {
+        let text = self.last_entry(|e| {
+            e.output
+                .results
+                .iter()
+                .find(|i| !matches!(i.kind, ItemKind::Info | ItemKind::Relation { .. }))
+                .map(|i| i.exact.clone())
+                .filter(|s| !s.is_empty())
+        });
+        match text {
+            Some(t) => self.inner.root.clipboard().set_text(&t),
+            None => self.inner.root.error_bell(),
+        }
+    }
+
+    /// Pins the newest entry that can be pinned.
+    fn pin_last(&self) {
+        let id = self.last_entry(|e| matches!(e.pin, Some(Ok(_))).then_some(e.id));
+        match id {
+            Some(id) => self.pin_entry(id),
+            None => self.append_info_error("nothing to pin yet: evaluate something first"),
+        }
+    }
+
+    /// Forgets console-only definitions and `ans` (`:clear` without
+    /// touching the input history).
+    fn forget_definitions(&self) {
+        self.inner.ctx.engine().edit(|e| {
+            let history = e.history().to_vec();
+            e.console_eval(":clear");
+            e.set_history(history);
+        });
+        self.clear_transcript();
+        self.append(
+            ConsoleOutput {
+                input_echo: ":clear".into(),
+                results: vec![ConsoleItem {
+                    exact: "console definitions and `ans` forgotten".into(),
+                    approx: String::new(),
+                    kind: ItemKind::Info,
+                }],
+                ..ConsoleOutput::default()
+            },
+            None,
+        );
+    }
+
+    fn append_info_error(&self, message: &str) {
+        self.append(
+            ConsoleOutput {
+                input_echo: ":pin".into(),
+                error: Some(ConsoleError {
+                    message: message.into(),
+                    span: None,
+                }),
+                ..ConsoleOutput::default()
+            },
+            None,
+        );
     }
 
     // ------------------------------------------------------ empty state
@@ -428,6 +576,10 @@ impl Console {
             }
         }
         match key {
+            Key::Return | Key::KP_Enter if ctrl && shift => {
+                self.pin_last();
+                stop
+            }
             Key::Return | Key::KP_Enter if !shift => {
                 self.evaluate();
                 stop
@@ -472,7 +624,11 @@ impl Console {
     fn set_input(&self, text: &str, cursor: Option<usize>) {
         let b = self.inner.input.buffer();
         self.inner.setting_text.set(true);
+        // Not a user edit: keep it (and older typing) out of text undo, so
+        // Ctrl+Z after Enter undoes the document instead.
+        b.begin_irreversible_action();
         b.set_text(text);
+        b.end_irreversible_action();
         self.inner.setting_text.set(false);
         let chars = complete::byte_to_char(text, cursor.unwrap_or(text.len()));
         let iter = b.iter_at_offset(chars as i32);
@@ -531,88 +687,92 @@ impl Console {
             return;
         }
         self.inner.popover.popdown();
-        let out = self.inner.ctx.engine().edit(|e| e.console_eval(&text));
-        self.after_eval(out);
+        let (out, pin) = self.inner.ctx.engine().edit(|e| {
+            let out = e.console_eval(&text);
+            // Snapshot what pinning this entry means now, so it can be
+            // pinned later without evaluating it again.
+            let pin = is_pinnable(&out).then(|| e.pin_plan());
+            (out, pin)
+        });
+        save_history(text.trim());
+        if out.cleared {
+            self.clear_transcript();
+        } else {
+            self.append(out, pin);
+        }
         self.set_input("", None);
         self.inner.nav.borrow_mut().reset();
     }
 
-    fn after_eval(&self, out: ConsoleOutput) {
-        save_history(&self.inner.ctx);
-        if out.cleared {
-            self.clear_transcript();
-            return;
-        }
-        let pinnable = is_pinnable(&out);
-        self.append(out);
-        let last = self.inner.entries.borrow().len().checked_sub(1);
-        self.inner
-            .last_pinnable
-            .set(if pinnable { last } else { None });
-    }
-
-    /// Pins entry `index` as a node: `:pin` directly when it is the last
-    /// pinnable input, else re-evaluating its input first. The history is
-    /// left as it was.
-    fn pin_entry(&self, index: usize) {
-        let Some(input) = self
+    /// Pins entry `id` from its snapshot (no re-evaluation, history
+    /// untouched).
+    fn pin_entry(&self, id: u64) {
+        let Some((plan, input)) = self
             .inner
             .entries
             .borrow()
-            .get(index)
-            .map(|e| e.output.input_echo.clone())
+            .iter()
+            .find_map(|e| (e.id == id).then(|| (e.pin.clone(), e.output.input_echo.clone())))
         else {
             return;
         };
-        let direct = self.inner.last_pinnable.get() == Some(index);
-        let out = self.inner.ctx.engine().edit(|e| {
-            let history = e.history().to_vec();
-            let mut out = None;
-            if !direct {
-                let again = e.console_eval(&input);
-                if again.error.is_some() {
-                    out = Some(again);
-                }
+        let result = match plan {
+            Some(Ok(plan)) => self.inner.ctx.engine().edit(|e| {
+                e.apply_pin_plan(plan).map(|ids| {
+                    ids.into_iter()
+                        .map(|node| {
+                            let (exact, approx) = e
+                                .value(node)
+                                .map(|v| (v.exact.clone(), v.approx.clone()))
+                                .unwrap_or_default();
+                            ConsoleItem {
+                                exact,
+                                approx,
+                                kind: ItemKind::Pinned { node },
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            }),
+            Some(Err(reason)) => Err(reason),
+            None => Err("this entry has nothing to pin".into()),
+        };
+        let mut out = ConsoleOutput {
+            input_echo: format!(":pin  {}", first_line(&input)),
+            ..ConsoleOutput::default()
+        };
+        match result {
+            Ok(items) => out.results = items,
+            Err(message) => {
+                out.error = Some(ConsoleError {
+                    message,
+                    span: None,
+                })
             }
-            let out = out.unwrap_or_else(|| e.console_eval(":pin"));
-            e.set_history(history);
-            out
-        });
-        let mut out = out;
-        out.input_echo = format!(":pin  {}", first_line(&input));
-        self.append(out);
-        self.inner.last_pinnable.set(None);
+        }
+        self.append(out, None);
     }
 
     // ------------------------------------------------------- transcript
 
-    fn append(&self, output: ConsoleOutput) {
-        let index = self.inner.entries.borrow().len();
-        let widget = self.build_entry(&output, index);
+    fn append(&self, output: ConsoleOutput, pin: PinSnapshot) {
+        let id = self.inner.next_id.get();
+        self.inner.next_id.set(id + 1);
+        let widget = self.build_entry(&output, &pin, id);
         self.inner.transcript.append(&widget);
-        self.inner
-            .entries
-            .borrow_mut()
-            .push(Entry { output, widget });
-        // Drop the oldest entries beyond the cap (indices shift).
-        let excess = self
-            .inner
-            .entries
-            .borrow()
-            .len()
-            .saturating_sub(MAX_ENTRIES);
+        self.inner.entries.borrow_mut().push(Entry {
+            id,
+            output,
+            pin,
+            widget,
+        });
+        // Drop the oldest entries beyond the cap; ids stay valid.
+        let excess = trim_count(self.inner.entries.borrow().len(), MAX_ENTRIES);
         if excess > 0 {
             let removed: Vec<Entry> = self.inner.entries.borrow_mut().drain(..excess).collect();
             for e in removed {
                 self.inner.transcript.remove(&e.widget);
             }
-            self.inner.last_pinnable.set(
-                self.inner
-                    .last_pinnable
-                    .get()
-                    .and_then(|i| i.checked_sub(excess)),
-            );
-            self.rebuild_entries();
         }
         self.update_empty();
         self.scroll_to_end();
@@ -623,31 +783,21 @@ impl Console {
         for e in entries {
             self.inner.transcript.remove(&e.widget);
         }
-        self.inner.last_pinnable.set(None);
         self.update_empty();
     }
 
-    /// Re-renders every entry (theme change, index shift).
+    /// Re-renders every entry in place (theme change).
     fn rebuild_entries(&self) {
-        let outputs: Vec<ConsoleOutput> = self
-            .inner
-            .entries
-            .borrow()
-            .iter()
-            .map(|e| e.output.clone())
-            .collect();
-        let old = std::mem::take(&mut *self.inner.entries.borrow_mut());
-        for e in old {
-            self.inner.transcript.remove(&e.widget);
-        }
-        for (i, output) in outputs.into_iter().enumerate() {
-            let widget = self.build_entry(&output, i);
-            self.inner.transcript.append(&widget);
+        let mut entries = std::mem::take(&mut *self.inner.entries.borrow_mut());
+        for e in &mut entries {
+            let widget = self.build_entry(&e.output, &e.pin, e.id);
             self.inner
-                .entries
-                .borrow_mut()
-                .push(Entry { output, widget });
+                .transcript
+                .insert_child_after(&widget, Some(&e.widget));
+            self.inner.transcript.remove(&e.widget);
+            e.widget = widget;
         }
+        *self.inner.entries.borrow_mut() = entries;
     }
 
     fn connect_scrolling(&self) {
@@ -674,7 +824,7 @@ impl Console {
         });
     }
 
-    fn build_entry(&self, out: &ConsoleOutput, index: usize) -> gtk::Box {
+    fn build_entry(&self, out: &ConsoleOutput, pin: &PinSnapshot, id: u64) -> gtk::Box {
         let error_color = self.inner.error_color.borrow().clone();
         let entry = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -707,7 +857,7 @@ impl Console {
         echo.set_focusable(false);
         head.append(&prompt);
         head.append(&echo);
-        let actions = self.build_actions(out, index);
+        let actions = self.build_actions(out, pin, id);
         head.append(&actions);
         entry.append(&head);
 
@@ -768,7 +918,7 @@ impl Console {
                 actions.set_opacity(1.0);
                 actions.set_can_target(true);
                 if let Some(c) = Console::from_weak(&weak) {
-                    let node = c.entry_node(index);
+                    let node = c.entry_node(id);
                     c.inner.ctx.selection().set_hovered(node);
                 }
             }
@@ -785,7 +935,7 @@ impl Console {
                 actions.set_can_target(false);
                 if let Some(c) = Console::from_weak(&weak) {
                     let sel = c.inner.ctx.selection();
-                    let node = c.entry_node(index);
+                    let node = c.entry_node(id);
                     if node.is_some() && sel.hovered() == node {
                         sel.set_hovered(None);
                     }
@@ -905,7 +1055,7 @@ impl Console {
         row.upcast()
     }
 
-    fn build_actions(&self, out: &ConsoleOutput, index: usize) -> gtk::Box {
+    fn build_actions(&self, out: &ConsoleOutput, pin: &PinSnapshot, id: u64) -> gtk::Box {
         let actions = gtk::Box::builder()
             .spacing(0)
             .valign(gtk::Align::Start)
@@ -940,15 +1090,20 @@ impl Console {
             b.connect_clicked(move |b| b.clipboard().set_text(&text));
             actions.append(&b);
         }
-        if is_pinnable(out) {
+        if let Some(plan) = pin {
             let b = button(
                 &["view-pin-symbolic", "pin-symbolic", "list-add-symbolic"],
                 "Pin as node",
             );
+            if let Err(reason) = plan {
+                // Cannot be pinned safely: say why instead of trying.
+                b.set_sensitive(false);
+                b.set_tooltip_text(Some(&format!("Can't pin: {reason}")));
+            }
             let weak = self.downgrade();
             b.connect_clicked(move |_| {
                 if let Some(c) = Console::from_weak(&weak) {
-                    c.pin_entry(index);
+                    c.pin_entry(id);
                 }
             });
             actions.append(&b);
@@ -974,11 +1129,11 @@ impl Console {
         self.inner.input.grab_focus();
     }
 
-    /// The scene node entry `index` refers to: a node it updated, pinned
+    /// The scene node entry `id` refers to: a node it updated, pinned
     /// or listed, else the first scene name in its input.
-    fn entry_node(&self, index: usize) -> Option<NodeId> {
+    fn entry_node(&self, id: u64) -> Option<NodeId> {
         let entries = self.inner.entries.borrow();
-        let out = &entries.get(index)?.output;
+        let out = &entries.iter().find(|e| e.id == id)?.output;
         self.inner.ctx.engine().with(|e| {
             for item in &out.results {
                 match &item.kind {
@@ -1114,23 +1269,17 @@ impl Console {
             let Some(c) = Console::from_weak(&weak) else {
                 return;
             };
-            match ev {
-                DocEvent::Settings(s) => {
-                    let mut chips = c.inner.chips.borrow_mut();
-                    chips.retain(|(m, a)| match (m.upgrade(), a.upgrade()) {
-                        (Some(m), Some(a)) => {
-                            update_mode_chips(&m, &a, s);
-                            true
-                        }
-                        _ => false,
-                    });
-                    drop(chips);
-                    c.build_empty_state();
-                }
-                DocEvent::Scene(_) => {
-                    // A node changed: the last result may no longer pin as is.
-                }
-                _ => {}
+            if let DocEvent::Settings(s) = ev {
+                let mut chips = c.inner.chips.borrow_mut();
+                chips.retain(|(m, a)| match (m.upgrade(), a.upgrade()) {
+                    (Some(m), Some(a)) => {
+                        update_mode_chips(&m, &a, s);
+                        true
+                    }
+                    _ => false,
+                });
+                drop(chips);
+                c.build_empty_state();
             }
         });
         self.inner.subs.borrow_mut().push(sub);
@@ -1265,13 +1414,89 @@ fn load_history_once(ctx: &AppCtx) {
     }
 }
 
-fn save_history(ctx: &AppCtx) {
+/// Adds `input` to the history file (merged with what other instances
+/// wrote meanwhile).
+fn save_history(input: &str) {
     let Some(path) = history::history_path() else {
         return;
     };
-    let entries = ctx.engine().with(|e| e.history().to_vec());
-    if let Err(err) = history::save(&path, &entries) {
+    if let Err(err) = history::append(&path, &[input.to_owned()]) {
         glib::g_warning!("viscas", "could not save console history: {err}");
+    }
+}
+
+/// How many of `len` entries to drop to keep at most `cap`.
+fn trim_count(len: usize, cap: usize) -> usize {
+    len.saturating_sub(cap)
+}
+
+/// A header menu whose items activate `group`'s actions (installed on the
+/// button as `prefix`). Items: label, action name, accelerator shown.
+pub(crate) fn header_menu_button(
+    title: &str,
+    prefix: &str,
+    group: &gio::SimpleActionGroup,
+    items: &[(&str, &str, Option<&str>)],
+) -> gtk::MenuButton {
+    let menu = gio::Menu::new();
+    for (label, action, accel) in items {
+        let item = gio::MenuItem::new(Some(label), Some(&format!("{prefix}.{action}")));
+        if let Some(accel) = accel {
+            item.set_attribute_value("accel", Some(&accel.to_variant()));
+        }
+        menu.append_item(&item);
+    }
+    let button = gtk::MenuButton::builder()
+        .label(title)
+        .menu_model(&menu)
+        .always_show_arrow(false)
+        .css_classes(["header-menu", "flat"])
+        .build();
+    button.insert_action_group(prefix, Some(group));
+    button
+}
+
+/// Palette commands acting on the active console.
+struct ConsoleCommands;
+
+impl crate::commands::CommandProvider for ConsoleCommands {
+    fn commands(&self) -> Vec<crate::commands::Command> {
+        if Console::active().is_none() {
+            return Vec::new();
+        }
+        let cmd = |id: &str, title: &str, shortcut: Option<&str>, f: fn(&Console)| {
+            crate::commands::Command {
+                id: format!("console.{id}"),
+                title: title.to_owned(),
+                category: "Console",
+                shortcut: shortcut.map(str::to_owned),
+                run: Rc::new(move || {
+                    // After the palette closed and restored focus.
+                    glib::idle_add_local_once(move || {
+                        if let Some(c) = Console::active() {
+                            f(&c);
+                        }
+                    });
+                }),
+            }
+        };
+        vec![
+            cmd(
+                "pin-last",
+                "Pin Last Result",
+                Some("Ctrl+Shift+Enter"),
+                |c| c.pin_last(),
+            ),
+            cmd("copy-last", "Copy Last Result", None, |c| {
+                c.copy_last_result()
+            }),
+            cmd("clear", "Clear Console Transcript", Some("Ctrl+L"), |c| {
+                c.clear_transcript()
+            }),
+            cmd("forget", "Forget Console Definitions", None, |c| {
+                c.forget_definitions()
+            }),
+        ]
     }
 }
 
@@ -1314,5 +1539,12 @@ mod tests {
         assert_eq!(words, vec!["f", "x_1"]);
         let words: Vec<&str> = identifiers("θ·b").collect();
         assert_eq!(words, vec!["θ", "b"]);
+    }
+
+    #[test]
+    fn transcript_trim_counts() {
+        assert_eq!(trim_count(10, 400), 0);
+        assert_eq!(trim_count(400, 400), 0);
+        assert_eq!(trim_count(401, 400), 1);
     }
 }

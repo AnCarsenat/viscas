@@ -20,21 +20,54 @@ use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use gtk::prelude::*;
-use gtk::{gdk, glib, pango};
+use gtk::{gdk, gio, glib, pango};
 use viscas_core::syntax::Span;
 use viscas_scene::{Color as SceneColor, NodeId, NodeKind, SceneEvent, SourceField, Status};
 
 use crate::ctx::AppCtx;
 use crate::doc::{DocEvent, Subscription};
-use crate::editors::console::{render, style};
+use crate::editors::console::{header_menu_button, render, style};
 use crate::editors::pick_icon;
 use crate::theme::model::{Color as UiColor, trim_float};
 use crate::widgets::scrub::{ScrubField, ScrubSpec};
 use crate::widgets::swatch::ColorSwatch;
-use logic::Place;
+use logic::{Place, underline_range};
+
+/// A header-menu action: name and what it does.
+type MenuAction = (&'static str, fn(&Expressions));
 
 /// Prefix of the drag payload (a node id).
 const DRAG_PREFIX: &str = "viscas-node:";
+
+thread_local! {
+    /// Every Expressions editor, most recently used last.
+    static INSTANCES: RefCell<Vec<Weak<Inner>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Palette command "New Expression" for the active editor.
+struct ExpressionCommands;
+
+impl crate::commands::CommandProvider for ExpressionCommands {
+    fn commands(&self) -> Vec<crate::commands::Command> {
+        if Expressions::active().is_none() {
+            return Vec::new();
+        }
+        vec![crate::commands::Command {
+            id: "expressions.new".into(),
+            title: "New Expression".into(),
+            category: "Expressions",
+            shortcut: None,
+            run: Rc::new(|| {
+                // After the palette closed and restored focus.
+                glib::idle_add_local_once(|| {
+                    if let Some(ed) = Expressions::active() {
+                        ed.new_expression();
+                    }
+                });
+            }),
+        }]
+    }
+}
 
 /// What a row shows, read from the engine in one borrow.
 struct RowData {
@@ -77,6 +110,24 @@ struct Row {
     setting: Cell<bool>,
     /// A rejected commit (parse or scene error) shown until the next edit.
     local_error: RefCell<Option<(String, Option<Span>)>>,
+    /// The text an error span refers to and the span: underlined only
+    /// while the entry shows exactly that text.
+    underline: RefCell<Option<(String, Span)>>,
+    /// The node was removed while the user had unsaved typing: the row
+    /// stays so the text is not lost (Enter adds it as a new node).
+    orphan: Cell<bool>,
+}
+
+impl Row {
+    fn set_dirty(&self, dirty: bool) {
+        self.dirty.set(dirty);
+        // Lets Ctrl+Z reach the entry's own text undo (see `window`).
+        if dirty {
+            self.entry.add_css_class("text-dirty");
+        } else {
+            self.entry.remove_css_class("text-dirty");
+        }
+    }
 }
 
 struct Inner {
@@ -88,6 +139,8 @@ struct Inner {
     add_error: gtk::Label,
     rows: RefCell<HashMap<NodeId, Rc<Row>>>,
     order: RefCell<Vec<NodeId>>,
+    /// Slider controls hidden (header menu).
+    sliders_collapsed: Cell<bool>,
     subs: RefCell<Vec<Subscription>>,
 }
 
@@ -160,6 +213,7 @@ impl Expressions {
                 add_error,
                 rows: RefCell::default(),
                 order: RefCell::default(),
+                sliders_collapsed: Cell::new(false),
                 subs: RefCell::default(),
             }),
         };
@@ -167,7 +221,56 @@ impl Expressions {
         ed.connect_add_row();
         ed.connect_updates();
         ed.reconcile();
+        ed.register(ctx);
         ed
+    }
+
+    /// Tracks this editor for the palette's "New Expression"; installs the
+    /// command provider once per process.
+    fn register(&self, ctx: &AppCtx) {
+        let first = INSTANCES.with_borrow_mut(|v| {
+            let first = v.is_empty();
+            v.retain(|w| w.strong_count() > 0);
+            v.push(self.downgrade());
+            first
+        });
+        if first {
+            ctx.add_command_provider(ExpressionCommands);
+        }
+        let focus = gtk::EventControllerFocus::new();
+        let weak = self.downgrade();
+        focus.connect_enter(move |_| {
+            INSTANCES.with_borrow_mut(|v| {
+                v.retain(|w| w.strong_count() > 0 && !w.ptr_eq(&weak));
+                v.push(weak.clone());
+            });
+        });
+        self.inner.root.add_controller(focus);
+    }
+
+    /// The most recently used Expressions editor that is on screen.
+    fn active() -> Option<Expressions> {
+        INSTANCES.with_borrow(|v| {
+            v.iter()
+                .rev()
+                .filter_map(Expressions::from_weak)
+                .find(|e| e.inner.root.is_mapped())
+        })
+    }
+
+    /// Focuses the "+" row.
+    fn new_expression(&self) {
+        self.inner.add_entry.grab_focus();
+    }
+
+    fn toggle_sliders(&self) {
+        let collapsed = !self.inner.sliders_collapsed.get();
+        self.inner.sliders_collapsed.set(collapsed);
+        for row in self.inner.rows.borrow().values() {
+            if let Some(ui) = row.slider.borrow().as_ref() {
+                ui.root.set_visible(!collapsed);
+            }
+        }
     }
 
     pub fn widget(&self) -> gtk::Widget {
@@ -196,10 +299,34 @@ impl Expressions {
         let weak = self.downgrade();
         add.connect_clicked(move |_| {
             if let Some(ed) = Expressions::from_weak(&weak) {
-                ed.inner.add_entry.grab_focus();
+                ed.new_expression();
             }
         });
-        vec![add.upcast()]
+        let group = gio::SimpleActionGroup::new();
+        let actions: [MenuAction; 2] = [
+            ("new", |e| e.new_expression()),
+            ("toggle-sliders", |e| e.toggle_sliders()),
+        ];
+        for (name, f) in actions {
+            let action = gio::SimpleAction::new(name, None);
+            let weak = self.downgrade();
+            action.connect_activate(move |_, _| {
+                if let Some(ed) = Expressions::from_weak(&weak) {
+                    f(&ed);
+                }
+            });
+            group.add_action(&action);
+        }
+        let menu = header_menu_button(
+            "Edit",
+            "expressions",
+            &group,
+            &[
+                ("New Expression", "new", None),
+                ("Collapse / Expand Sliders", "toggle-sliders", None),
+            ],
+        );
+        vec![menu.upcast(), add.upcast()]
     }
 
     fn build_empty_state(&self) {
@@ -258,14 +385,31 @@ impl Expressions {
         let gone: Vec<Rc<Row>> = {
             let mut rows = self.inner.rows.borrow_mut();
             let ids: Vec<NodeId> = rows
-                .keys()
-                .copied()
-                .filter(|id| !keep.contains(id))
+                .iter()
+                .filter(|(id, row)| !keep.contains(id) && !row.dirty.get())
+                .map(|(id, _)| *id)
                 .collect();
             ids.into_iter().filter_map(|id| rows.remove(&id)).collect()
         };
         for row in gone {
             self.inner.list.remove(&row.root);
+        }
+        // Rows with unsaved typing whose node went away stay as orphans;
+        // a node coming back (undo) adopts its row again.
+        let rows: Vec<Rc<Row>> = self.inner.rows.borrow().values().cloned().collect();
+        for row in rows {
+            let orphan = !keep.contains(&row.id);
+            if row.orphan.replace(orphan) != orphan {
+                if orphan {
+                    row.index.set_label("·");
+                    row.error.set_label(
+                        "This node was removed. Enter adds the line as a new node, Esc discards it.",
+                    );
+                    row.error.set_visible(true);
+                } else {
+                    self.sync_row(&row);
+                }
+            }
         }
         let mut prev: Option<gtk::Widget> = None;
         for (i, id) in order.iter().enumerate() {
@@ -374,6 +518,8 @@ impl Expressions {
             focused: Cell::new(false),
             setting: Cell::new(false),
             local_error: RefCell::new(None),
+            underline: RefCell::new(None),
+            orphan: Cell::new(false),
         });
         self.connect_row(&row, &handle, &delete);
         row
@@ -415,9 +561,12 @@ impl Expressions {
         row.entry.connect_changed(move |_| {
             if let Some(ed) = Expressions::from_weak(&w)
                 && let Some(row) = ed.row(id)
-                && !row.setting.get()
             {
-                row.dirty.set(true);
+                if !row.setting.get() {
+                    row.set_dirty(true);
+                }
+                // The span belongs to the text it was reported for.
+                ed.apply_underline(&row);
             }
         });
         let w = weak.clone();
@@ -600,11 +749,19 @@ impl Expressions {
             }
             Key::BackSpace if ctrl && row.entry.text().is_empty() => {
                 self.focus_after(id, -1);
-                self.delete(id);
+                if row.orphan.get() {
+                    self.drop_row(id);
+                } else {
+                    self.delete(id);
+                }
+                glib::Propagation::Stop
+            }
+            Key::Escape if row.orphan.get() => {
+                self.drop_row(id);
                 glib::Propagation::Stop
             }
             Key::Escape if row.dirty.get() || row.local_error.borrow().is_some() => {
-                row.dirty.set(false);
+                row.set_dirty(false);
                 *row.local_error.borrow_mut() = None;
                 self.sync_row(&row);
                 glib::Propagation::Stop
@@ -631,6 +788,13 @@ impl Expressions {
         }
     }
 
+    /// Removes a row that has no node any more.
+    fn drop_row(&self, id: NodeId) {
+        if let Some(row) = self.inner.rows.borrow_mut().remove(&id) {
+            self.inner.list.remove(&row.root);
+        }
+    }
+
     fn delete(&self, id: NodeId) {
         self.inner.ctx.engine().edit(|e| {
             let _ = e.scene_mut().remove(id);
@@ -644,13 +808,34 @@ impl Expressions {
             return false;
         };
         let text = row.entry.text().to_string();
+        if row.orphan.get() {
+            if text.trim().is_empty() {
+                self.drop_row(id);
+                return true;
+            }
+            let added = self.inner.ctx.engine().edit(|e| {
+                e.scene_mut().seal_history();
+                e.add_line(None, &text)
+            });
+            return match added {
+                Ok(_) => {
+                    self.drop_row(id);
+                    true
+                }
+                Err(err) => {
+                    *row.local_error.borrow_mut() = Some((err.to_string(), None));
+                    self.show_error(&row, &text);
+                    false
+                }
+            };
+        }
         if !row.dirty.get() || text == *row.line.borrow() {
-            row.dirty.set(false);
+            row.set_dirty(false);
             return true;
         }
         if text.trim().is_empty() {
             // Emptied: Ctrl+Backspace deletes; otherwise keep the node.
-            row.dirty.set(false);
+            row.set_dirty(false);
             self.sync_row(&row);
             return true;
         }
@@ -673,7 +858,7 @@ impl Expressions {
         });
         match result {
             Ok(()) => {
-                row.dirty.set(false);
+                row.set_dirty(false);
                 *row.local_error.borrow_mut() = None;
                 true
             }
@@ -725,6 +910,9 @@ impl Expressions {
 
     /// Refreshes one row from the engine, keeping the user's typing.
     fn sync_row(&self, row: &Rc<Row>) {
+        if row.orphan.get() {
+            return;
+        }
         let Some(data) = self.read_row(row.id) else {
             return;
         };
@@ -777,9 +965,16 @@ impl Expressions {
         if !editing {
             *row.local_error.borrow_mut() = None;
         }
-        let shown = row.local_error.borrow().clone().or(data.error.clone());
-        let text = row.entry.text().to_string();
-        self.render_error(row, &text, shown, data.side_error);
+        // A commit error refers to the typed text, a node error to the
+        // model's line.
+        let local = row.local_error.borrow().clone();
+        match local {
+            Some(err) => {
+                let text = row.entry.text().to_string();
+                self.render_error(row, &text, Some(err), data.side_error);
+            }
+            None => self.render_error(row, &data.line, data.error.clone(), data.side_error),
+        }
     }
 
     fn show_error(&self, row: &Rc<Row>, text: &str) {
@@ -787,6 +982,7 @@ impl Expressions {
         self.render_error(row, text, err, None);
     }
 
+    /// Shows `err` (whose span refers to `text`) and `side` under the row.
     fn render_error(
         &self,
         row: &Row,
@@ -794,6 +990,10 @@ impl Expressions {
         err: Option<(String, Option<Span>)>,
         side: Option<String>,
     ) {
+        *row.underline.borrow_mut() = match &err {
+            Some((_, Some(span))) => Some((text.to_owned(), *span)),
+            _ => None,
+        };
         let message = match (&err, side) {
             (Some((m, _)), _) => Some(m.clone()),
             (None, s) => s,
@@ -805,36 +1005,38 @@ impl Expressions {
             }
             None => row.error.set_visible(false),
         }
-        // Wavy underline of the span inside the entry itself.
+        self.apply_underline(row);
+    }
+
+    /// Wavy underline of the error span inside the entry, only while it
+    /// shows the text the span was reported for.
+    fn apply_underline(&self, row: &Row) {
         let attrs = pango::AttrList::new();
-        if let Some((_, Some(span))) = err {
-            let (start, mut end) = render::clamp_span(text, span);
-            if start == end {
-                end = text[start..]
-                    .chars()
-                    .next()
-                    .map_or(start, |c| start + c.len_utf8());
-            }
-            if end > start {
-                let color = self
-                    .inner
-                    .ctx
-                    .preferences()
-                    .with(|p| p.effective_theme().console.error);
-                let mut u = pango::AttrInt::new_underline(pango::Underline::Error);
-                u.set_start_index(start as u32);
-                u.set_end_index(end as u32);
-                attrs.insert(u);
-                let scale = |v: u8| u16::from(v) * 257;
-                let mut uc = pango::AttrColor::new_underline_color(
-                    scale(color.r),
-                    scale(color.g),
-                    scale(color.b),
-                );
-                uc.set_start_index(start as u32);
-                uc.set_end_index(end as u32);
-                attrs.insert(uc);
-            }
+        let current = row.entry.text();
+        let range = row
+            .underline
+            .borrow()
+            .as_ref()
+            .and_then(|(text, span)| underline_range(text, current.as_str(), *span));
+        if let Some((start, end)) = range {
+            let color = self
+                .inner
+                .ctx
+                .preferences()
+                .with(|p| p.effective_theme().console.error);
+            let mut u = pango::AttrInt::new_underline(pango::Underline::Error);
+            u.set_start_index(start as u32);
+            u.set_end_index(end as u32);
+            attrs.insert(u);
+            let scale = |v: u8| u16::from(v) * 257;
+            let mut uc = pango::AttrColor::new_underline_color(
+                scale(color.r),
+                scale(color.g),
+                scale(color.b),
+            );
+            uc.set_start_index(start as u32);
+            uc.set_end_index(end as u32);
+            attrs.insert(uc);
         }
         row.entry.set_attributes(&attrs);
     }
@@ -863,6 +1065,7 @@ impl Expressions {
         if row.slider.borrow().is_none() {
             let ui = self.build_slider(row.id);
             row.root.insert_child_after(&ui.root, Some(&row.value));
+            ui.root.set_visible(!self.inner.sliders_collapsed.get());
             *row.slider.borrow_mut() = Some(ui);
         }
         let slider = row.slider.borrow();
@@ -927,7 +1130,17 @@ impl Expressions {
         };
         let weak = self.downgrade();
         let set_field = move |field: SourceField, text: String| {
-            if let Some(ed) = Expressions::from_weak(&weak) {
+            let Some(ed) = Expressions::from_weak(&weak) else {
+                return;
+            };
+            // Model → widget updates must not write back.
+            let syncing = ed.row(id).is_none_or(|row| {
+                row.slider
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|ui| ui.syncing.get())
+            });
+            if !syncing {
                 ed.inner.ctx.engine().edit(|e| {
                     let _ = e.scene_mut().set_source(id, field, &text);
                 });
@@ -1002,7 +1215,13 @@ impl Expressions {
             }
         });
         let weak = self.downgrade();
-        self.inner.add_entry.connect_changed(move |_| {
+        self.inner.add_entry.connect_changed(move |entry| {
+            // A draft is uncommitted typing: Ctrl+Z undoes it first.
+            if entry.text().is_empty() {
+                entry.remove_css_class("text-dirty");
+            } else {
+                entry.add_css_class("text-dirty");
+            }
             if let Some(ed) = Expressions::from_weak(&weak) {
                 ed.inner.add_error.set_visible(false);
             }

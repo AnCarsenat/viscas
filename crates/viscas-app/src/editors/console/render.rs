@@ -24,6 +24,9 @@ fn push_escaped(out: &mut String, c: char) {
         '>' => out.push_str("&gt;"),
         '\'' => out.push_str("&#39;"),
         '"' => out.push_str("&quot;"),
+        // Not allowed in XML 1.0: Pango would reject the whole markup.
+        '\t' | '\n' | '\r' => out.push(c),
+        c if (c as u32) < 0x20 || c == '\u{fffe}' || c == '\u{ffff}' => out.push('\u{fffd}'),
         _ => out.push(c),
     }
 }
@@ -234,6 +237,12 @@ mod tests {
     #[test]
     fn escapes_markup() {
         assert_eq!(escape("a<b & \"c\""), "a&lt;b &amp; &quot;c&quot;");
+        // XML-invalid characters become U+FFFD; tab/newline stay.
+        assert_eq!(
+            escape("a\u{0}b\u{1b}\t\n\u{ffff}"),
+            "a\u{fffd}b\u{fffd}\t\n\u{fffd}"
+        );
+        assert_eq!(math_markup("x\u{7}"), "x\u{fffd}");
     }
 
     #[test]

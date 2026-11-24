@@ -60,15 +60,56 @@ pub fn load(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Writes `history` to `path` atomically (temp file + rename), creating
-/// the directory.
-pub fn save(path: &Path, history: &[String]) -> io::Result<()> {
+/// `disk` followed by the `new` entries (blank ones and consecutive
+/// repeats skipped, like the engine), capped to the newest
+/// [`HISTORY_LIMIT`].
+pub fn merged(mut disk: Vec<String>, new: &[String]) -> Vec<String> {
+    for e in new {
+        if !e.trim().is_empty() && disk.last() != Some(e) {
+            disk.push(e.clone());
+        }
+    }
+    let n = disk.len();
+    if n > HISTORY_LIMIT {
+        disk.drain(..n - HISTORY_LIMIT);
+    }
+    disk
+}
+
+/// Adds `new` entries to the history file. The file is re-read and
+/// merged first, so several running instances append to each other's
+/// history instead of overwriting it; the result is written atomically
+/// (unique temp file, fsync, rename).
+pub fn append(path: &Path, new: &[String]) -> io::Result<()> {
+    let all = merged(load(path), new);
+    write_atomic(path, &encode(&all))
+}
+
+fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, encode(history))?;
-    std::fs::rename(&tmp, path)
+    let name = path
+        .file_name()
+        .map_or_else(|| "history".into(), |n| n.to_string_lossy().into_owned());
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Up/Down recall over the history. Starting to browse remembers the
@@ -181,10 +222,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("viscas-hist-{}", std::process::id()));
         let path = dir.join("sub/console_history");
         let entries = h(&["1 + 1", "sin(x)"]);
-        save(&path, &entries).unwrap();
+        append(&path, &entries).unwrap();
         assert_eq!(load(&path), entries);
         assert!(load(&dir.join("missing")).is_empty());
+        // A second instance appends instead of clobbering.
+        append(&path, &h(&["sin(x)", "2^10"])).unwrap();
+        append(&path, &h(&["a := 1"])).unwrap();
+        assert_eq!(load(&path), h(&["1 + 1", "sin(x)", "2^10", "a := 1"]));
+        // No temp files left behind.
+        let leftovers = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            })
+            .count();
+        assert_eq!(leftovers, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_skips_repeats_and_caps() {
+        assert_eq!(merged(h(&["a"]), &h(&["a", " ", "b", "b"])), h(&["a", "b"]));
+        let disk: Vec<String> = (0..HISTORY_LIMIT).map(|i| i.to_string()).collect();
+        let all = merged(disk, &h(&["new"]));
+        assert_eq!(all.len(), HISTORY_LIMIT);
+        assert_eq!(all.last().map(String::as_str), Some("new"));
+        assert_eq!(all[0], "1");
     }
 
     #[test]

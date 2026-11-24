@@ -499,7 +499,7 @@ impl Engine {
     }
 
     /// Console-only definitions `content` depends on, dependencies first.
-    fn pin_plan(
+    fn collect_pin_deps(
         &self,
         content: &NodeContent,
         seen: &mut HashSet<String>,
@@ -519,7 +519,7 @@ impl Engine {
                     let dep = self
                         .line_content(src)
                         .map_err(|e| format!("cannot pin `{name}`: {}", e[0].message))?;
-                    self.pin_plan(&dep, seen, plan)?;
+                    self.collect_pin_deps(&dep, seen, plan)?;
                     plan.push(dep);
                 }
                 None if self.console.defs.contains_key(&name) => {
@@ -533,20 +533,17 @@ impl Engine {
         Ok(())
     }
 
-    fn cmd_pin(&mut self, out: &mut ConsoleOutput) {
-        let fail = |out: &mut ConsoleOutput, message: String| {
-            out.error = Some(ConsoleError {
-                message,
-                span: None,
-            });
-        };
-        let Some(line) = self.console.last.clone() else {
-            return fail(out, "nothing to pin yet: evaluate something first".into());
-        };
-        let content = match self.line_content(&line) {
-            Ok(c) => c,
-            Err(e) => return fail(out, e[0].message.clone()),
-        };
+    /// The node contents `:pin` would add for the last input: the
+    /// console-only definitions it depends on first, the input last.
+    /// Computing it right after an evaluation lets a UI pin that result
+    /// later (with [`Engine::apply_pin_plan`]) without re-evaluating.
+    pub fn pin_plan(&self) -> Result<Vec<NodeContent>, String> {
+        let line = self
+            .console
+            .last
+            .clone()
+            .ok_or_else(|| "nothing to pin yet: evaluate something first".to_string())?;
+        let content = self.line_content(&line).map_err(|e| e[0].message.clone())?;
         if let Some(name) = content
             .kind
             .defines_by_name()
@@ -554,22 +551,37 @@ impl Engine {
             .and(content.name.as_ref())
             && self.scene().is_name_taken(name, None)
         {
-            return fail(out, format!("a node named `{name}` already exists"));
+            return Err(format!("a node named `{name}` already exists"));
         }
         let mut plan = Vec::new();
         let mut seen = HashSet::new();
         if let Some(n) = &content.name {
             seen.insert(canonical_name(n).to_string());
         }
-        if let Err(m) = self.pin_plan(&content, &mut seen, &mut plan) {
-            return fail(out, m);
-        }
+        self.collect_pin_deps(&content, &mut seen, &mut plan)?;
         plan.push(content);
+        Ok(plan)
+    }
+
+    /// Adds a [`Engine::pin_plan`] to the scene as one undo step and
+    /// returns the new nodes. Dependencies whose name a scene node has
+    /// taken since the plan was made are skipped (that node provides
+    /// them now). All or nothing: on error the scene is unchanged.
+    pub fn apply_pin_plan(&mut self, plan: Vec<NodeContent>) -> Result<Vec<NodeId>, String> {
+        let last = plan.len().saturating_sub(1);
         let scene = self.scene_mut();
         scene.begin_group("Pin from console");
         let mut ids = Vec::new();
         let mut error = None;
-        for c in plan {
+        for (i, c) in plan.into_iter().enumerate() {
+            let provided = i < last
+                && c.kind.defines_by_name()
+                && c.name
+                    .as_ref()
+                    .is_some_and(|n| scene.is_name_taken(n, None));
+            if provided {
+                continue;
+            }
             match scene.add(None, c) {
                 Ok(id) => ids.push(id),
                 Err(e) => {
@@ -584,12 +596,26 @@ impl Engine {
                 self.scene_mut().undo();
             }
             self.update();
-            return fail(out, e);
+            return Err(e);
         }
         for &id in &ids {
             self.assign_auto_color(id);
         }
         self.update();
+        Ok(ids)
+    }
+
+    fn cmd_pin(&mut self, out: &mut ConsoleOutput) {
+        let ids = match self.pin_plan().and_then(|plan| self.apply_pin_plan(plan)) {
+            Ok(ids) => ids,
+            Err(message) => {
+                out.error = Some(ConsoleError {
+                    message,
+                    span: None,
+                });
+                return;
+            }
+        };
         for id in ids {
             let (exact, approx) = self
                 .value(id)
