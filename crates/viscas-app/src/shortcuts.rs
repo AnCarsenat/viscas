@@ -117,6 +117,15 @@ pub fn overview() -> String {
         .collect();
     lines.push(format!("{:<18}Zoom graph at cursor", "Scroll"));
     lines.push(format!("{:<18}Pan graph", "Drag"));
+    lines.push(format!("{:<18}Box zoom", "Shift+Drag"));
+    lines.push(format!("{:<18}Zoom graph", "Pinch"));
+    lines.push(format!("{:<18}Reset graph view", "Home"));
+    lines.push(format!(
+        "{:<18}Select curve, show roots/extrema",
+        "Click curve"
+    ));
+    lines.push(format!("{:<18}Pin / unpin its label", "Click dot"));
+    lines.push(format!("{:<18}Clear dots and selection", "Esc"));
     lines.join("\n")
 }
 

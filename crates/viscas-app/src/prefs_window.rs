@@ -806,6 +806,11 @@ fn viewport_page(b: &Binder) -> gtk::Box {
         |p| p.viewport.antialias,
         |p, v| p.viewport.antialias = v,
     ));
+    quality.append(&b.check(
+        "Lock Aspect Ratio",
+        |p| p.viewport.lock_aspect,
+        |p, v| p.viewport.lock_aspect = v,
+    ));
     page.append(quality.widget());
     page
 }

@@ -72,18 +72,18 @@ impl Layer for GridLayer {
 fn grid_pass(
     cr: &cairo::Context,
     view: &View,
-    step: f64,
+    (step_x, step_y): (f64, f64),
     style: GridStyle,
     width: f64,
     skip: impl Fn(i64) -> bool,
 ) {
     let (w, h) = view.size;
     let b = view.bounds();
-    let xs: Vec<f64> = ticks(b.x_min, b.x_max, step)
+    let xs: Vec<f64> = ticks(b.x_min, b.x_max, step_x)
         .filter(|(i, _)| !skip(*i))
         .map(|(_, x)| crisp(view.world_to_screen(x, 0.0).0, width))
         .collect();
-    let ys: Vec<f64> = ticks(b.y_min, b.y_max, step)
+    let ys: Vec<f64> = ticks(b.y_min, b.y_max, step_y)
         .filter(|(i, _)| !skip(*i))
         .map(|(_, y)| crisp(view.world_to_screen(0.0, y).1, width))
         .collect();
@@ -128,7 +128,9 @@ fn draw_grid(widget: &gtk::Widget, cr: &cairo::Context, view: &View, prefs: &Pre
     let _ = cr.paint();
     let bounds = view.bounds();
     let steps = grid_steps(view.scale, MIN_MAJOR_PX);
+    let steps_y = grid_steps(view.scale_y(), MIN_MAJOR_PX);
     let per_major = ((steps.major / steps.minor).round() as i64).max(1);
+    let per_major_y = ((steps_y.major / steps_y.minor).round() as i64).max(1);
     let width = opts.line_width;
     cr.set_line_width(width);
 
@@ -137,12 +139,30 @@ fn draw_grid(widget: &gtk::Widget, cr: &cairo::Context, view: &View, prefs: &Pre
         // major lines skip the axes, drawn on top afterwards.
         if opts.minor_grid {
             set(cr, palette.grid_minor);
-            grid_pass(cr, view, steps.minor, opts.grid_style, width, |i| {
-                i % per_major == 0
-            });
+            // Equal subdivisions on both axes unless the aspect is free.
+            let per = if per_major == per_major_y {
+                per_major
+            } else {
+                0
+            };
+            grid_pass(
+                cr,
+                view,
+                (steps.minor, steps_y.minor),
+                opts.grid_style,
+                width,
+                |i| per != 0 && i % per == 0,
+            );
         }
         set(cr, palette.grid_major);
-        grid_pass(cr, view, steps.major, opts.grid_style, width, |i| i == 0);
+        grid_pass(
+            cr,
+            view,
+            (steps.major, steps_y.major),
+            opts.grid_style,
+            width,
+            |i| i == 0,
+        );
     }
 
     // Axes.
@@ -187,11 +207,11 @@ fn draw_grid(widget: &gtk::Widget, cr: &cairo::Context, view: &View, prefs: &Pre
         let sy = clamp_soft(oy + LABEL_GAP, EDGE_MARGIN, h - th - EDGE_MARGIN);
         show_layout(cr, &layout, sx, sy);
     }
-    for (i, y) in ticks(bounds.y_min, bounds.y_max, steps.major) {
+    for (i, y) in ticks(bounds.y_min, bounds.y_max, steps_y.major) {
         if i == 0 {
             continue;
         }
-        let (tw, th) = text_size(&format_tick(y, steps.major));
+        let (tw, th) = text_size(&format_tick(y, steps_y.major));
         let sx = clamp_soft(ox - LABEL_GAP - tw, EDGE_MARGIN, w - tw - EDGE_MARGIN);
         let sy = view.world_to_screen(0.0, y).1 - th / 2.0;
         show_layout(cr, &layout, sx, sy);

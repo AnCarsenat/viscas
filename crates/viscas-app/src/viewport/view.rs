@@ -20,8 +20,10 @@ pub const MAX_CENTER: f64 = 1e9;
 pub struct View {
     /// World coordinates shown at the center of the screen.
     pub center: (f64, f64),
-    /// Zoom level in pixels per world unit (same on both axes).
+    /// Zoom level of the x axis, in pixels per world unit.
     pub scale: f64,
+    /// Vertical over horizontal scale (1 when the aspect is locked).
+    pub aspect: f64,
     /// Screen size in logical pixels.
     pub size: (f64, f64),
 }
@@ -31,6 +33,7 @@ impl Default for View {
         Self {
             center: (0.0, 0.0),
             scale: 60.0,
+            aspect: 1.0,
             size: (800.0, 600.0),
         }
     }
@@ -46,12 +49,17 @@ pub struct Bounds {
 }
 
 impl View {
+    /// Zoom level of the y axis, in pixels per world unit.
+    pub fn scale_y(&self) -> f64 {
+        self.scale * self.aspect
+    }
+
     /// Converts a world point to screen coordinates.
     pub fn world_to_screen(&self, x: f64, y: f64) -> (f64, f64) {
         let (w, h) = self.size;
         (
             w / 2.0 + (x - self.center.0) * self.scale,
-            h / 2.0 - (y - self.center.1) * self.scale,
+            h / 2.0 - (y - self.center.1) * self.scale_y(),
         )
     }
 
@@ -60,8 +68,71 @@ impl View {
         let (w, h) = self.size;
         (
             self.center.0 + (sx - w / 2.0) / self.scale,
-            self.center.1 - (sy - h / 2.0) / self.scale,
+            self.center.1 - (sy - h / 2.0) / self.scale_y(),
         )
+    }
+
+    /// Equal scales on both axes (keeps the x scale).
+    pub fn lock_aspect(&mut self) {
+        self.aspect = 1.0;
+    }
+
+    /// Shows the world rectangle spanned by two screen points. With
+    /// `locked` the aspect stays 1 and the whole rectangle fits; otherwise
+    /// each axis is fitted on its own. Rectangles smaller than 4 px in
+    /// either direction are ignored (returns `false`).
+    pub fn fit_screen_rect(&mut self, a: (f64, f64), b: (f64, f64), locked: bool) -> bool {
+        let (w, h) = self.size;
+        let (dw, dh) = ((a.0 - b.0).abs(), (a.1 - b.1).abs());
+        if dw < 4.0 || dh < 4.0 || w <= 0.0 || h <= 0.0 {
+            return false;
+        }
+        let p = self.screen_to_world(a.0, a.1);
+        let q = self.screen_to_world(b.0, b.1);
+        let (bw, bh) = ((p.0 - q.0).abs(), (p.1 - q.1).abs());
+        let sx = w / bw;
+        let sy = h / bh;
+        if locked {
+            let s = sx.min(sy);
+            self.set_scales(s, s);
+        } else {
+            self.set_scales(sx, sy);
+        }
+        self.center = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
+        self.clamp_center();
+        true
+    }
+
+    /// The sampling view for the plot engine: the visible rectangle grown
+    /// by `margin` (fraction of its size) on every side, with the pixel
+    /// size grown alike so the resolution matches the screen.
+    pub fn plot_view(&self, margin: f64) -> Option<viscas_plot::View> {
+        let (w, h) = self.size;
+        if w < 1.0 || h < 1.0 {
+            return None;
+        }
+        let b = self.bounds();
+        let (mx, my) = ((b.x_max - b.x_min) * margin, (b.y_max - b.y_min) * margin);
+        let rect = viscas_plot::Rect::new(b.x_min - mx, b.y_min - my, b.x_max + mx, b.y_max + my);
+        let k = 1.0 + 2.0 * margin;
+        viscas_plot::View::try_new(rect, (w * k).round(), (h * k).round()).ok()
+    }
+
+    /// Whether the visible rectangle lies inside `plot` and was sampled
+    /// at (nearly) this resolution, so cached layers are still sharp.
+    pub fn covered_by(&self, plot: &viscas_plot::View) -> bool {
+        let (w, _) = self.size;
+        let b = self.bounds();
+        let r = plot.bounds();
+        let ratio = (plot.units_per_px_x() * self.scale).abs();
+        let ratio_y = (plot.units_per_px_y() * self.scale_y()).abs();
+        w > 0.0
+            && (ratio - 1.0).abs() < 0.01
+            && (ratio_y - 1.0).abs() < 0.01
+            && b.x_min >= r.x_min
+            && b.x_max <= r.x_max
+            && b.y_min >= r.y_min
+            && b.y_max <= r.y_max
     }
 
     /// The world rectangle currently visible on screen.
@@ -79,7 +150,7 @@ impl View {
     /// Moves the view so that content follows a pointer drag of `(dx, dy)` pixels.
     pub fn pan_by_pixels(&mut self, dx: f64, dy: f64) {
         self.center.0 -= dx / self.scale;
-        self.center.1 += dy / self.scale;
+        self.center.1 += dy / self.scale_y();
         self.clamp_center();
     }
 
@@ -90,11 +161,33 @@ impl View {
             return;
         }
         let anchor = self.screen_to_world(sx, sy);
-        self.scale = (self.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+        let (x, y) = (self.scale * factor, self.scale_y() * factor);
+        // Keep the aspect when either axis hits a limit.
+        let k = (x.clamp(MIN_SCALE, MAX_SCALE) / x).min(y.clamp(MIN_SCALE, MAX_SCALE) / y);
+        let k = if factor >= 1.0 {
+            k.min(1.0)
+        } else {
+            k.max(1.0)
+        };
+        let k = if k.is_finite() { k } else { 1.0 };
+        self.set_scales(x * k, y * k);
         let moved = self.screen_to_world(sx, sy);
         self.center.0 += anchor.0 - moved.0;
         self.center.1 += anchor.1 - moved.1;
         self.clamp_center();
+    }
+
+    /// Sets both axis scales, each clamped to `MIN_SCALE..=MAX_SCALE`.
+    pub fn set_scales(&mut self, x: f64, y: f64) {
+        let fix = |v: f64| {
+            if v.is_finite() {
+                v.clamp(MIN_SCALE, MAX_SCALE)
+            } else {
+                MIN_SCALE
+            }
+        };
+        self.scale = fix(x);
+        self.aspect = fix(y) / self.scale;
     }
 
     fn clamp_center(&mut self) {
@@ -246,6 +339,7 @@ mod tests {
         let v = View {
             center: (3.5, -2.25),
             scale: 17.0,
+            aspect: 1.0,
             size: (640.0, 480.0),
         };
         for &(x, y) in &[(0.0, 0.0), (1.0, -1.0), (123.4, 56.7), (-9.0, 1e3)] {
@@ -260,6 +354,7 @@ mod tests {
         let v = View {
             center: (1.0, 2.0),
             scale: 100.0,
+            aspect: 1.0,
             size: (200.0, 100.0),
         };
         let b = v.bounds();
@@ -386,5 +481,75 @@ mod tests {
             format_tick(-3.0000000000000004e-6, 1e-6),
             "\u{2212}3e\u{2212}6"
         );
+    }
+
+    #[test]
+    fn box_zoom_fits_rect() {
+        let mut v = View::default();
+        // A 200x100 px box around the origin: 3.33 x 1.67 world units.
+        assert!(v.fit_screen_rect((300.0, 250.0), (500.0, 350.0), true));
+        assert!(approx(v.aspect, 1.0));
+        assert!(approx(v.scale, 240.0), "{}", v.scale); // 800 / (200/60)
+        assert!(approx(v.center.0, 0.0) && approx(v.center.1, 0.0));
+        let mut u = View::default();
+        assert!(u.fit_screen_rect((300.0, 250.0), (500.0, 350.0), false));
+        assert!(approx(u.scale, 240.0));
+        assert!(approx(u.scale_y(), 360.0)); // 600 / (100/60)
+        let (x, y) = u.screen_to_world(800.0, 0.0);
+        assert!(approx(x, 200.0 / 60.0 / 2.0) && approx(y, 100.0 / 60.0 / 2.0));
+        assert!(!u.fit_screen_rect((1.0, 1.0), (3.0, 90.0), false));
+    }
+
+    #[test]
+    fn plot_view_pads_and_covers() {
+        let v = View::default();
+        let p = v.plot_view(0.25).unwrap();
+        assert!(approx(p.width_px(), 1200.0) && approx(p.height_px(), 900.0));
+        assert!(v.covered_by(&p));
+        let mut panned = v;
+        panned.pan_by_pixels(150.0, -100.0);
+        assert!(panned.covered_by(&p), "small pans reuse the padded layers");
+        panned.pan_by_pixels(300.0, 0.0);
+        assert!(!panned.covered_by(&p));
+        let mut zoomed = v;
+        zoomed.zoom_at(1.1, 400.0, 300.0);
+        assert!(!zoomed.covered_by(&p), "zoom needs a resample");
+        let tiny = View {
+            size: (0.0, 10.0),
+            ..View::default()
+        };
+        assert!(tiny.plot_view(0.25).is_none());
+    }
+
+    #[test]
+    fn unlocked_aspect_scales_y() {
+        let v = View {
+            aspect: 2.0,
+            ..View::default()
+        };
+        let (_, sy) = v.world_to_screen(0.0, 1.0);
+        assert!(approx(sy, 300.0 - 120.0));
+        let (_, wy) = v.screen_to_world(0.0, sy);
+        assert!(approx(wy, 1.0));
+    }
+
+    #[test]
+    fn repeated_box_zooms_keep_scales_in_range() {
+        let mut v = View::default();
+        for _ in 0..40 {
+            // Tall thin boxes push the y scale up much faster than x.
+            v.fit_screen_rect((100.0, 290.0), (700.0, 296.0), false);
+            assert!(v.scale >= MIN_SCALE && v.scale <= MAX_SCALE);
+            assert!(v.scale_y() >= MIN_SCALE && v.scale_y() <= MAX_SCALE * (1.0 + 1e-12));
+        }
+        for _ in 0..200 {
+            v.zoom_at(10.0, 400.0, 300.0);
+            assert!(v.scale_y() <= MAX_SCALE * (1.0 + 1e-12));
+        }
+        for _ in 0..400 {
+            v.zoom_at(0.1, 400.0, 300.0);
+            assert!(v.scale >= MIN_SCALE * (1.0 - 1e-12));
+            assert!(v.scale_y() >= MIN_SCALE * (1.0 - 1e-12));
+        }
     }
 }

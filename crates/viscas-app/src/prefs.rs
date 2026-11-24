@@ -146,6 +146,8 @@ pub struct Viewport {
     pub line_width: f64,
     pub antialias: bool,
     pub grid_style: GridStyle,
+    /// Equal scales on both axes (box zoom keeps the aspect).
+    pub lock_aspect: bool,
 }
 
 impl Default for Viewport {
@@ -157,6 +159,7 @@ impl Default for Viewport {
             line_width: LINE_WIDTH.default,
             antialias: true,
             grid_style: GridStyle::Lines,
+            lock_aspect: true,
         }
     }
 }

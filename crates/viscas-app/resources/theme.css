@@ -887,3 +887,9 @@ window.prefs-window {
   background: alpha(@vc_danger, 0.12);
   color: @vc_danger_text;
 }
+
+.chip.error {
+  border-color: alpha(@vc_danger, 0.6);
+  background: alpha(@vc_danger, 0.14);
+  color: @vc_danger_text;
+}
