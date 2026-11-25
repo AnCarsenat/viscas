@@ -194,6 +194,11 @@ pub struct Editing {
     /// Stored now; the evaluator will pass it to the parser
     /// (`viscas_core` `ParseOptions::definition_op`).
     pub definition_op: DefinitionOp,
+    /// The console adds things that draw (`y = x^2`, `(1, 2)`) to the
+    /// board as soon as they are entered.
+    pub console_add_plots: bool,
+    /// The console adds new definitions (`a := 3`) to the board too.
+    pub console_add_definitions: bool,
 }
 
 impl Default for Editing {
@@ -201,6 +206,8 @@ impl Default for Editing {
         Self {
             undo_steps: UNDO_STEPS.default as u32,
             definition_op: DefinitionOp::default(),
+            console_add_plots: true,
+            console_add_definitions: false,
         }
     }
 }
@@ -741,6 +748,20 @@ mod tests {
         assert_eq!(p.interface.font_size, 14.0);
         assert!(p.interface.tooltips);
         assert_eq!(p.viewport, Viewport::default());
+    }
+
+    #[test]
+    fn console_auto_add_defaults() {
+        // Older files without the keys: plots on, definitions off.
+        let (p, w) = Preferences::from_toml("[editing]\nundo_steps = 50\n");
+        assert!(w.is_empty());
+        assert!(p.editing.console_add_plots);
+        assert!(!p.editing.console_add_definitions);
+        let (p, _) = Preferences::from_toml(
+            "[editing]\nconsole_add_plots = false\nconsole_add_definitions = true\n",
+        );
+        assert!(!p.editing.console_add_plots);
+        assert!(p.editing.console_add_definitions);
     }
 
     #[test]

@@ -80,6 +80,33 @@ button.console-chip {
 }
 button.console-chip:hover { background: alpha(@vx_ui_accent, 0.22); }
 
+.console-swatch { min-width: 10px; min-height: 10px; }
+button.console-node-link {
+  min-height: 16px;
+  padding: 0 3px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @vx_console_result;
+  font-size: 14px;
+  font-weight: 600;
+}
+button.console-node-link:hover {
+  color: @vx_ui_accent_text;
+  text-decoration: underline;
+}
+button.console-add {
+  min-height: 16px;
+  padding: 0 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  color: @vx_ui_accent_text;
+  background: none;
+  border: 1px dashed alpha(@vx_ui_accent, 0.45);
+  box-shadow: none;
+}
+button.console-add:hover { background: alpha(@vx_ui_accent, 0.14); border-style: solid; }
+
 .console-actions button {
   min-height: 16px;
   min-width: 16px;
@@ -111,6 +138,12 @@ textview.console-input > text {
 .console-empty { margin: 24px 16px; }
 .console-empty .placeholder-title { font-size: 13px; font-weight: 600; color: @vx_ui_fg; }
 .console-empty .console-hint { margin-top: 2px; }
+.console-empty .console-board-hint {
+  font-family: __MONO__;
+  font-size: 12px;
+  color: @vx_ui_accent_text;
+  margin-bottom: 2px;
+}
 .console-empty .console-try {
   font-family: __MONO__;
   font-size: 11px;

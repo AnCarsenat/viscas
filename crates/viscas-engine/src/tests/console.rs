@@ -156,7 +156,7 @@ fn pin_definition_creates_node_and_undo_removes_it() {
     let mut e = engine();
     e.console_eval("a := 3");
     let out = e.console_eval(":pin");
-    let ItemKind::Pinned { node } = first(&out).kind.clone() else {
+    let ItemKind::Added { node } = first(&out).kind.clone() else {
         panic!("{out:?}");
     };
     assert_eq!(e.scene().get(node).unwrap().name.as_deref(), Some("a"));
@@ -176,7 +176,7 @@ fn pinned_node_is_reactive() {
     let a = var(&mut e, "a", "2");
     e.console_eval("b := a + 1");
     let out = e.console_eval(":pin");
-    let ItemKind::Pinned { node } = first(&out).kind.clone() else {
+    let ItemKind::Added { node } = first(&out).kind.clone() else {
         panic!()
     };
     set(&mut e, a, "10");
@@ -188,13 +188,13 @@ fn pin_value_and_relation() {
     let mut e = engine();
     e.console_eval("2 + 3");
     let out = e.console_eval(":pin");
-    let ItemKind::Pinned { node } = first(&out).kind.clone() else {
+    let ItemKind::Added { node } = first(&out).kind.clone() else {
         panic!()
     };
     assert_eq!(exact(&e, node), "5");
     e.console_eval("y = x^2");
     let out = e.console_eval(":pin");
-    let ItemKind::Pinned { node } = first(&out).kind.clone() else {
+    let ItemKind::Added { node } = first(&out).kind.clone() else {
         panic!()
     };
     let n = e.scene().get(node).unwrap();
@@ -208,7 +208,7 @@ fn pin_function() {
     let mut e = engine();
     e.console_eval("g(x) := x^3");
     let out = e.console_eval(":pin");
-    let ItemKind::Pinned { node } = first(&out).kind.clone() else {
+    let ItemKind::Added { node } = first(&out).kind.clone() else {
         panic!()
     };
     assert_eq!(e.scene().get(node).unwrap().kind.tag(), KindTag::Function);
@@ -421,7 +421,7 @@ fn pin_also_pins_console_dependencies_in_one_undo_step() {
         .results
         .iter()
         .filter_map(|r| match r.kind {
-            ItemKind::Pinned { node } => Some(node),
+            ItemKind::Added { node } => Some(node),
             _ => None,
         })
         .collect();
@@ -537,4 +537,144 @@ fn stale_pin_plan_skips_dependencies_now_in_the_scene() {
     assert_eq!(e.value(m).unwrap().exact, "6");
     // Pinning again: the input's own name is taken now.
     assert!(e.apply_pin_plan(plan).is_err());
+}
+
+const PLOTS: AutoAdd = AutoAdd {
+    plots: true,
+    definitions: false,
+    values: false,
+};
+
+fn added(out: &ConsoleOutput) -> Vec<NodeId> {
+    assert!(out.error.is_none(), "{:?}", out.error);
+    out.results
+        .iter()
+        .filter_map(|i| match i.kind {
+            ItemKind::Added { node } => Some(node),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn auto_add_puts_plots_on_the_board() {
+    let mut e = engine();
+    for (input, tag) in [
+        ("y = x^2", KindTag::Plot),
+        ("x^2 + y^2 = 4", KindTag::Plot),
+        ("r = θ", KindTag::Plot),
+        ("y < x", KindTag::Plot),
+        ("(cos t, sin t)", KindTag::Plot),
+        ("(1, 2)", KindTag::Plot),
+        ("P := (3, 4)", KindTag::Point),
+    ] {
+        let out = e.console_eval_with(input, PLOTS);
+        let ids = added(&out);
+        assert_eq!(ids.len(), 1, "{input}: {out:?}");
+        assert_eq!(e.scene().get(ids[0]).unwrap().kind.tag(), tag, "{input}");
+        assert!(e.node_color(ids[0]).is_some());
+    }
+    assert_eq!(e.scene().len(), 7);
+    // Each add is its own undo step.
+    assert!(e.undo());
+    assert_eq!(e.scene().len(), 6);
+    // Nothing left to add afterwards.
+    assert!(e.console_eval(":add").error.is_some());
+}
+
+#[test]
+fn auto_add_leaves_definitions_and_values_in_the_console() {
+    let mut e = engine();
+    let out = e.console_eval_with("a := 3", PLOTS);
+    assert_eq!(first(&out).kind, ItemKind::Definition { name: "a".into() });
+    let out = e.console_eval_with("2 + 3", PLOTS);
+    assert_eq!(first(&out).kind, ItemKind::Value);
+    assert!(e.scene().is_empty());
+    // A plot using `a` brings `a` along, in one undo step.
+    let ids = added(&e.console_eval_with("y = a x", PLOTS));
+    assert_eq!(ids.len(), 2);
+    assert!(e.scene().lookup("a").is_some());
+    assert!(e.undo());
+    assert!(e.scene().is_empty());
+}
+
+#[test]
+fn auto_add_definitions_when_asked() {
+    let mut e = engine();
+    let auto = AutoAdd {
+        definitions: true,
+        ..PLOTS
+    };
+    let ids = added(&e.console_eval_with("a := 3", auto));
+    assert_eq!(ids.len(), 1);
+    assert_eq!(exact(&e, ids[0]), "3");
+    // Redefining it updates the node, nothing new is added.
+    let out = e.console_eval_with("a := 4", auto);
+    assert!(matches!(first(&out).kind, ItemKind::UpdatedNode { .. }));
+    assert_eq!(e.scene().len(), 1);
+    // Values stay in the console.
+    assert_eq!(
+        first(&e.console_eval_with("a + 1", auto)).kind,
+        ItemKind::Value
+    );
+    assert_eq!(e.scene().len(), 1);
+}
+
+#[test]
+fn auto_add_off_keeps_relations_in_the_console() {
+    let mut e = engine();
+    let out = e.console_eval("y = x^2");
+    assert!(matches!(first(&out).kind, ItemKind::Relation { .. }));
+    assert!(e.scene().is_empty());
+    assert_eq!(added(&e.console_eval(":add")).len(), 1);
+}
+
+#[test]
+fn add_pin_and_bare_plot_add_the_last_input() {
+    let mut e = engine();
+    e.console_eval("b := 2");
+    assert_eq!(added(&e.console_eval(":pin")).len(), 1);
+    e.console_eval("c := 2");
+    assert_eq!(added(&e.console_eval(":add")).len(), 1);
+    e.console_eval("d := 2");
+    assert_eq!(added(&e.console_eval(":plot")).len(), 1);
+    assert!(e.console_eval(":add y = x").error.is_some());
+}
+
+#[test]
+fn plot_command_evaluates_and_adds_anything() {
+    let mut e = engine();
+    for input in [
+        ":plot y = sin x",
+        ":plot a := 3",
+        ":plot 2 + 3",
+        ":plot  (1, 2)",
+    ] {
+        let out = e.console_eval(input);
+        assert_eq!(added(&out).len(), 1, "{input}: {out:?}");
+        assert_eq!(out.input_echo, input);
+    }
+    assert_eq!(e.scene().len(), 4);
+    assert_eq!(
+        e.history().last().map(String::as_str),
+        Some(":plot  (1, 2)")
+    );
+}
+
+#[test]
+fn plot_command_error_spans_point_into_the_echo() {
+    let mut e = engine();
+    let out = e.console_eval(":plot  1 + foo");
+    let err = out.error.expect("unknown name");
+    let span = err.span.expect("span");
+    assert_eq!(&out.input_echo[span.start..span.end], "foo");
+    assert!(e.scene().is_empty());
+}
+
+#[test]
+fn auto_add_multiple_statements() {
+    let mut e = engine();
+    let out = e.console_eval_with("k := 2; y = k x", PLOTS);
+    assert_eq!(added(&out).len(), 2, "{out:?}");
+    assert!(e.console_names().is_empty());
 }

@@ -314,18 +314,27 @@ fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::Window {
     body.append(&sidebar);
     body.append(&scrolled);
 
+    let title = gtk::Box::builder().spacing(6).build();
+    title.append(
+        &gtk::Image::builder()
+            .icon_name(crate::app::APP_ID)
+            .pixel_size(16)
+            .build(),
+    );
+    title.append(
+        &gtk::Label::builder()
+            .label("Viscas Preferences")
+            .css_classes(["app-name"])
+            .build(),
+    );
     let header = gtk::HeaderBar::builder()
         .css_classes(["topbar"])
-        .title_widget(
-            &gtk::Label::builder()
-                .label("Viscas Preferences")
-                .css_classes(["app-name"])
-                .build(),
-        )
+        .title_widget(&title)
         .build();
 
     let window = gtk::Window::builder()
         .application(app)
+        .icon_name(crate::app::APP_ID)
         .title("Viscas Preferences")
         .default_width(760)
         .default_height(600)
@@ -849,6 +858,27 @@ fn editing_page(b: &Binder) -> gtk::Box {
     op.set_tooltip_text(Some("Operator that defines a named node"));
     exprs.append(&property_row("Definition Operator", &op));
     page.append(exprs.widget());
+
+    let console = Panel::new("Console", true);
+    let plots = b.check(
+        "Console: auto-add plots to board",
+        |p| p.editing.console_add_plots,
+        |p, v| p.editing.console_add_plots = v,
+    );
+    plots.set_tooltip_text(Some(
+        "Relations and points typed in the console (y = x^2, (1, 2)) become board nodes at once",
+    ));
+    console.append(&plots);
+    let defs = b.check(
+        "Console: auto-add definitions to board",
+        |p| p.editing.console_add_definitions,
+        |p, v| p.editing.console_add_definitions = v,
+    );
+    defs.set_tooltip_text(Some(
+        "Definitions typed in the console (a := 3) become board nodes instead of console-only names",
+    ));
+    console.append(&defs);
+    page.append(console.widget());
     page
 }
 

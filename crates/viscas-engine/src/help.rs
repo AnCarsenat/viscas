@@ -123,9 +123,19 @@ pub static COMMAND_HELP: &[HelpEntry] = &[
         "switch evaluation mode",
     ),
     h(
+        ":add",
+        ":add",
+        "add the last input to the board as a node (also :pin, Ctrl+Shift+Enter)",
+    ),
+    h(
+        ":plot",
+        ":plot input",
+        "evaluate the input and add it to the board (y = x^2, a := 3, (1, 2))",
+    ),
+    h(
         ":pin",
         ":pin",
-        "turn the last result or definition into a scene node",
+        "alias of :add: the last input becomes a board node",
     ),
     h(
         ":clear",

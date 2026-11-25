@@ -3,7 +3,13 @@
 //! A transcript of entries above a multi-line input. Each entry echoes
 //! the input (errors underline the offending span), shows results with
 //! the exact form and a dim `≈` decimal side by side, "did you mean"
-//! chips, and hover actions (copy exact/approx, pin as node, insert).
+//! chips, and hover actions (copy exact/approx, add to board, insert).
+//!
+//! Board: things that draw (`y = x^2`, `(1, 2)`) go on the board as soon
+//! as they are entered (preference, on by default; definitions can too).
+//! Anything else that can become a node gets an "Add to board" button
+//! and Ctrl+Shift+Enter; `:add` (alias `:pin`) and `:plot <input>` do the
+//! same from the input.
 //!
 //! Input: Enter evaluates, Shift+Enter adds a line, Up/Down recall the
 //! (persisted) history, Tab completes through a popover, Ctrl+L clears
@@ -25,7 +31,7 @@ use std::rc::{Rc, Weak};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use viscas_engine::{
-    Completion, CompletionKind, ConsoleError, ConsoleItem, ConsoleOutput, ItemKind,
+    AutoAdd, Completion, CompletionKind, ConsoleError, ConsoleItem, ConsoleOutput, ItemKind,
 };
 use viscas_scene::{NodeContent, NodeId};
 
@@ -50,9 +56,10 @@ thread_local! {
     static INSTANCES: RefCell<Vec<Weak<Inner>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// What "Pin as node" does for an entry, captured when it was evaluated
+/// What "Add to board" does for an entry, captured when it was evaluated
 /// (`Engine::pin_plan`): the node contents to add, or why it cannot be
-/// pinned. `None` for entries with nothing to pin (commands, errors).
+/// added. `None` for entries with nothing to add (commands, errors,
+/// inputs already on the board).
 type PinSnapshot = Option<Result<Vec<NodeContent>, String>>;
 
 /// One transcript entry and the data to re-render it.
@@ -307,7 +314,7 @@ impl Console {
         let actions: [MenuAction; 4] = [
             ("clear", |c| c.clear_transcript()),
             ("copy-last", |c| c.copy_last_result()),
-            ("pin-last", |c| c.pin_last()),
+            ("add-last", |c| c.pin_last()),
             ("forget", |c| c.forget_definitions()),
         ];
         for (name, f) in actions {
@@ -328,8 +335,8 @@ impl Console {
                 ("Clear Transcript", "clear", Some("<Control>l")),
                 ("Copy Last Result", "copy-last", None),
                 (
-                    "Pin Last Result",
-                    "pin-last",
+                    "Add Last Result to Board",
+                    "add-last",
                     Some("<Control><Shift>Return"),
                 ),
                 ("Forget Console Definitions", "forget", None),
@@ -358,12 +365,15 @@ impl Console {
         }
     }
 
-    /// Pins the newest entry that can be pinned.
+    /// Adds the newest entry that can become a node to the board ("Add to
+    /// board", Ctrl+Shift+Enter, `:add`).
     fn pin_last(&self) {
         let id = self.last_entry(|e| matches!(e.pin, Some(Ok(_))).then_some(e.id));
         match id {
             Some(id) => self.pin_entry(id),
-            None => self.append_info_error("nothing to pin yet: evaluate something first"),
+            None => {
+                self.append_info_error("nothing to add to the board yet: evaluate something first")
+            }
         }
     }
 
@@ -393,7 +403,7 @@ impl Console {
     fn append_info_error(&self, message: &str) {
         self.append(
             ConsoleOutput {
-                input_echo: ":pin".into(),
+                input_echo: ":add".into(),
                 error: Some(ConsoleError {
                     message: message.into(),
                     span: None,
@@ -416,9 +426,19 @@ impl Console {
             .label("Console")
             .css_classes(["placeholder-title"])
             .build();
+        let hint = gtk::Label::builder()
+            .label(format!(
+                "Type y = x^2 to draw it · a {op} 3 to define · :help"
+            ))
+            .wrap(true)
+            .max_width_chars(44)
+            .justify(gtk::Justification::Center)
+            .css_classes(["console-board-hint"])
+            .build();
         let desc = gtk::Label::builder()
             .label(
-                "Expressions, definitions and relations. Tab completes, ↑ recalls, \
+                "Drawings go straight on the board; anything else can follow with \
+                 Add to board (Ctrl+Shift+Enter, :add). Tab completes, ↑ recalls, \
                  Shift+Enter adds a line.",
             )
             .wrap(true)
@@ -451,10 +471,11 @@ impl Console {
             .row_spacing(4)
             .build();
         let examples = [
-            "2^100".to_owned(),
+            "y = x^2".to_owned(),
+            format!("a {op} 3"),
+            "(1, 2)".to_owned(),
             format!("f(x) {op} x^2 - 2"),
             "solve(f(x) = 0, x)".to_owned(),
-            "y = sin x".to_owned(),
             ":help".to_owned(),
         ];
         for ex in examples {
@@ -473,6 +494,7 @@ impl Console {
             tries.append(&b);
         }
         empty.append(&title);
+        empty.append(&hint);
         empty.append(&desc);
         empty.append(&quip);
         empty.append(&tries);
@@ -687,8 +709,13 @@ impl Console {
             return;
         }
         self.inner.popover.popdown();
+        let auto = self.inner.ctx.preferences().with(|p| AutoAdd {
+            plots: p.editing.console_add_plots,
+            definitions: p.editing.console_add_definitions,
+            values: false,
+        });
         let (out, pin) = self.inner.ctx.engine().edit(|e| {
-            let out = e.console_eval(&text);
+            let out = e.console_eval_with(&text, auto);
             // Snapshot what pinning this entry means now, so it can be
             // pinned later without evaluating it again.
             let pin = is_pinnable(&out).then(|| e.pin_plan());
@@ -698,14 +725,18 @@ impl Console {
         if out.cleared {
             self.clear_transcript();
         } else {
+            // `:add` / `:pin` / bare `:plot` added the newest addable entry.
+            if is_add_last_command(&out) && out.error.is_none() {
+                self.mark_added(None);
+            }
             self.append(out, pin);
         }
         self.set_input("", None);
         self.inner.nav.borrow_mut().reset();
     }
 
-    /// Pins entry `id` from its snapshot (no re-evaluation, history
-    /// untouched).
+    /// Adds entry `id` to the board from its snapshot (no re-evaluation,
+    /// history untouched).
     fn pin_entry(&self, id: u64) {
         let Some((plan, input)) = self
             .inner
@@ -716,33 +747,29 @@ impl Console {
         else {
             return;
         };
+        let newest = self.last_entry(|e| e.pin.is_some().then_some(e.id)) == Some(id);
         let result = match plan {
             Some(Ok(plan)) => self.inner.ctx.engine().edit(|e| {
                 e.apply_pin_plan(plan).map(|ids| {
-                    ids.into_iter()
-                        .map(|node| {
-                            let (exact, approx) = e
-                                .value(node)
-                                .map(|v| (v.exact.clone(), v.approx.clone()))
-                                .unwrap_or_default();
-                            ConsoleItem {
-                                exact,
-                                approx,
-                                kind: ItemKind::Pinned { node },
-                            }
-                        })
-                        .collect::<Vec<_>>()
+                    if newest {
+                        // `:add` must not add the same input again.
+                        e.forget_console_last();
+                    }
+                    e.added_items(ids)
                 })
             }),
             Some(Err(reason)) => Err(reason),
-            None => Err("this entry has nothing to pin".into()),
+            None => Err("this entry has nothing to add to the board".into()),
         };
         let mut out = ConsoleOutput {
-            input_echo: format!(":pin  {}", first_line(&input)),
+            input_echo: format!(":add  {}", first_line(&input)),
             ..ConsoleOutput::default()
         };
         match result {
-            Ok(items) => out.results = items,
+            Ok(items) => {
+                out.results = items;
+                self.mark_added(Some(id));
+            }
             Err(message) => {
                 out.error = Some(ConsoleError {
                     message,
@@ -753,9 +780,37 @@ impl Console {
         self.append(out, None);
     }
 
+    /// Entry `id` (else the newest addable one) is on the board now: drop
+    /// its "Add to board" buttons.
+    fn mark_added(&self, id: Option<u64>) {
+        let target =
+            id.or_else(|| self.last_entry(|e| matches!(e.pin, Some(Ok(_))).then_some(e.id)));
+        let Some(target) = target else {
+            return;
+        };
+        let mut entries = self.inner.entries.borrow_mut();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == target) else {
+            return;
+        };
+        entry.pin = None;
+        let widget = self.build_entry(&entry.output, &entry.pin, entry.id);
+        self.inner
+            .transcript
+            .insert_child_after(&widget, Some(&entry.widget));
+        self.inner.transcript.remove(&entry.widget);
+        entry.widget = widget;
+    }
+
     // ------------------------------------------------------- transcript
 
     fn append(&self, output: ConsoleOutput, pin: PinSnapshot) {
+        if output
+            .results
+            .iter()
+            .any(|i| matches!(i.kind, ItemKind::Added { .. }))
+        {
+            self.drop_stale_adds();
+        }
         let id = self.inner.next_id.get();
         self.inner.next_id.set(id + 1);
         let widget = self.build_entry(&output, &pin, id);
@@ -776,6 +831,31 @@ impl Console {
         }
         self.update_empty();
         self.scroll_to_end();
+    }
+
+    /// Entries defining a name a board node provides now (e.g. added as
+    /// a dependency of a plot) lose their "Add to board" buttons.
+    fn drop_stale_adds(&self) {
+        let stale: Vec<u64> = self.inner.ctx.engine().with(|e| {
+            self.inner
+                .entries
+                .borrow()
+                .iter()
+                .filter(|entry| match &entry.pin {
+                    Some(Ok(plan)) => plan.last().is_some_and(|c| {
+                        c.kind.defines_by_name()
+                            && c.name
+                                .as_ref()
+                                .is_some_and(|n| e.scene().is_name_taken(n, None))
+                    }),
+                    _ => false,
+                })
+                .map(|entry| entry.id)
+                .collect()
+        });
+        for id in stale {
+            self.mark_added(Some(id));
+        }
     }
 
     fn clear_transcript(&self) {
@@ -861,8 +941,19 @@ impl Console {
         head.append(&actions);
         entry.append(&head);
 
-        for item in &out.results {
-            entry.append(&self.build_item(item));
+        // The item "Add to board" refers to gets an inline button too.
+        let inline_add = matches!(pin, Some(Ok(_)))
+            .then(|| {
+                out.results.iter().rposition(|i| {
+                    matches!(
+                        i.kind,
+                        ItemKind::Definition { .. } | ItemKind::Relation { .. }
+                    )
+                })
+            })
+            .flatten();
+        for (i, item) in out.results.iter().enumerate() {
+            entry.append(&self.build_item(item, (inline_add == Some(i)).then_some(id)));
         }
         if let Some(err) = &out.error {
             let label = gtk::Label::builder()
@@ -946,7 +1037,9 @@ impl Console {
         entry
     }
 
-    fn build_item(&self, item: &viscas_engine::ConsoleItem) -> gtk::Widget {
+    /// One result row; `add` is the entry id when the row offers an
+    /// inline "Add to board" button.
+    fn build_item(&self, item: &viscas_engine::ConsoleItem, add: Option<u64>) -> gtk::Widget {
         let row = gtk::Box::builder().spacing(6).margin_start(16).build();
         let tag = |text: &str, node: bool| {
             let l = gtk::Label::builder()
@@ -999,15 +1092,9 @@ impl Console {
                 row.append(&value(Some(name)));
                 row.append(&tag("node updated", true));
             }
-            ItemKind::Pinned { node } => {
-                let title = self
-                    .inner
-                    .ctx
-                    .engine()
-                    .with(|e| e.scene().get(*node).map(|n| n.title()))
-                    .unwrap_or_else(|| "node".into());
-                row.append(&tag("pinned", true));
-                row.append(&value(Some(&title)));
+            ItemKind::Added { node } => {
+                row.append(&self.added_row(*node, item));
+                row.append(&tag("added to board", true));
                 if item.exact.is_empty() {
                     show_value = false;
                 }
@@ -1020,7 +1107,7 @@ impl Console {
                 row.append(&tag(kind, false));
                 row.append(
                     &gtk::Label::builder()
-                        .label("relation — pin it to plot")
+                        .label("not on the board yet")
                         .css_classes(["console-hint"])
                         .build(),
                 );
@@ -1041,6 +1128,22 @@ impl Console {
                 show_value = false;
             }
         }
+        if let Some(id) = add {
+            let b = gtk::Button::builder()
+                .label("+ Add to board")
+                .valign(gtk::Align::Center)
+                .tooltip_text("Add to board (Ctrl+Shift+Enter, :add)")
+                .css_classes(["console-add"])
+                .build();
+            let weak = self.downgrade();
+            b.connect_clicked(move |_| {
+                if let Some(c) = Console::from_weak(&weak) {
+                    c.pin_entry(id);
+                    c.inner.input.grab_focus();
+                }
+            });
+            row.append(&b);
+        }
         if show_value && render::shows_approx(&item.exact, &item.approx) {
             row.append(
                 &gtk::Label::builder()
@@ -1053,6 +1156,89 @@ impl Console {
             );
         }
         row.upcast()
+    }
+
+    /// Color swatch, a link selecting `node` and its value ("= 3").
+    fn added_row(&self, node: NodeId, item: &ConsoleItem) -> gtk::Box {
+        let row = gtk::Box::builder().spacing(4).build();
+        let (title, color) = self.inner.ctx.engine().with(|e| {
+            // Unnamed nodes (plots) read best as their definition.
+            let title = e.scene().get(node).map(|n| match &n.name {
+                Some(name) => name.clone(),
+                None => {
+                    viscas_scene::definition_line_with(&n.content(), e.settings().parse_options())
+                        .unwrap_or_else(|| n.title())
+                }
+            });
+            (title, e.node_color(node))
+        });
+        let swatch = gtk::DrawingArea::builder()
+            .content_width(10)
+            .content_height(10)
+            .valign(gtk::Align::Center)
+            .css_classes(["console-swatch"])
+            .build();
+        let rgb = color.map(|c| (c.r, c.g, c.b));
+        swatch.set_draw_func(move |_, cr, w, h| {
+            let (r, g, b) = rgb.unwrap_or((128, 128, 128));
+            cr.set_source_rgb(
+                f64::from(r) / 255.0,
+                f64::from(g) / 255.0,
+                f64::from(b) / 255.0,
+            );
+            let (w, h) = (f64::from(w), f64::from(h));
+            let r = 2.5;
+            cr.new_sub_path();
+            cr.arc(w - r, r, r, -std::f64::consts::FRAC_PI_2, 0.0);
+            cr.arc(w - r, h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
+            cr.arc(
+                r,
+                h - r,
+                r,
+                std::f64::consts::FRAC_PI_2,
+                std::f64::consts::PI,
+            );
+            cr.arc(r, r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+            cr.close_path();
+            let _ = cr.fill();
+        });
+        row.append(&swatch);
+        let exists = title.is_some();
+        let same = title.as_deref() == Some(item.exact.as_str());
+        let link = gtk::Button::builder()
+            .label(title.unwrap_or_else(|| "node".into()))
+            .sensitive(exists)
+            .tooltip_text(if exists {
+                "Select this node on the board"
+            } else {
+                "This node is no longer on the board"
+            })
+            .css_classes(["console-node-link"])
+            .build();
+        let ctx = self.inner.ctx.downgrade();
+        link.connect_clicked(move |_| {
+            if let Some(ctx) = ctx.upgrade()
+                && ctx.engine().with(|e| e.scene().get(node).is_some())
+            {
+                ctx.selection().set_selected([node]);
+            }
+        });
+        row.append(&link);
+        if !item.exact.is_empty() && !same {
+            row.append(
+                &gtk::Label::builder()
+                    .use_markup(true)
+                    .label(format!("= {}", render::math_markup(&item.exact)))
+                    .xalign(0.0)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .selectable(true)
+                    .focusable(false)
+                    .css_classes(["console-result"])
+                    .build(),
+            );
+        }
+        row
     }
 
     fn build_actions(&self, out: &ConsoleOutput, pin: &PinSnapshot, id: u64) -> gtk::Box {
@@ -1092,13 +1278,13 @@ impl Console {
         }
         if let Some(plan) = pin {
             let b = button(
-                &["view-pin-symbolic", "pin-symbolic", "list-add-symbolic"],
-                "Pin as node",
+                &["list-add-symbolic", "view-pin-symbolic"],
+                "Add to board (Ctrl+Shift+Enter)",
             );
             if let Err(reason) = plan {
-                // Cannot be pinned safely: say why instead of trying.
+                // Cannot be added safely: say why instead of trying.
                 b.set_sensitive(false);
-                b.set_tooltip_text(Some(&format!("Can't pin: {reason}")));
+                b.set_tooltip_text(Some(&format!("Can't add to board: {reason}")));
             }
             let weak = self.downgrade();
             b.connect_clicked(move |_| {
@@ -1137,7 +1323,7 @@ impl Console {
         self.inner.ctx.engine().with(|e| {
             for item in &out.results {
                 match &item.kind {
-                    ItemKind::UpdatedNode { node, .. } | ItemKind::Pinned { node } => {
+                    ItemKind::UpdatedNode { node, .. } | ItemKind::Added { node } => {
                         return Some(*node);
                     }
                     ItemKind::Variable { name, scene: true } => {
@@ -1361,16 +1547,22 @@ fn completion_row(c: &Completion) -> gtk::ListBoxRow {
         .build()
 }
 
-/// Could `:pin` turn this output into a node?
+/// Could "Add to board" turn this output into a node? Its last result
+/// (the input `:add` refers to) must not be on the board already.
 fn is_pinnable(out: &ConsoleOutput) -> bool {
     out.error.is_none()
         && !out.input_echo.starts_with(':')
-        && out.results.iter().any(|i| {
+        && out.results.last().is_some_and(|i| {
             matches!(
                 i.kind,
                 ItemKind::Value | ItemKind::Definition { .. } | ItemKind::Relation { .. }
             )
         })
+}
+
+/// Is this a bare `:add` / `:pin` / `:plot` (adds the last input)?
+fn is_add_last_command(out: &ConsoleOutput) -> bool {
+    matches!(out.input_echo.as_str(), ":add" | ":pin" | ":plot")
 }
 
 fn first_line(s: &str) -> &str {
@@ -1482,8 +1674,8 @@ impl crate::commands::CommandProvider for ConsoleCommands {
         };
         vec![
             cmd(
-                "pin-last",
-                "Pin Last Result",
+                "add-last",
+                "Add Last Result to Board",
                 Some("Ctrl+Shift+Enter"),
                 |c| c.pin_last(),
             ),
