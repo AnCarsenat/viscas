@@ -7,6 +7,7 @@
 //! and the save prompt comes after the file was picked.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -30,26 +31,127 @@ thread_local! {
     /// A background save or open is running.
     static BUSY: Cell<bool> = const { Cell::new(false) };
     /// Saves/opens requested while one was running, run in order after it.
-    static QUEUED: RefCell<Vec<Box<dyn FnOnce()>>> = RefCell::default();
+    static QUEUE: RefCell<JobQueue<DocUi, SaveDone>> = RefCell::default();
 }
 
-/// Starts a background job now, or queues it after the running one
-/// (e.g. Save in a close prompt while an earlier save is still writing).
-/// `job` must mark itself busy and call [`job_finished`] when done.
-fn run_job(job: impl FnOnce() + 'static) {
-    if BUSY.get() {
-        QUEUED.with_borrow_mut(|q| q.push(Box::new(job)));
-    } else {
-        job();
+/// Outcome callback of a save.
+type SaveDone = Box<dyn FnOnce(bool)>;
+
+/// A save or open waiting for the running one.
+enum Pending<F> {
+    /// `generation` is the document's at request time (see
+    /// [`crate::doc::EngineHandle::generation`]).
+    Save {
+        path: PathBuf,
+        generation: u64,
+        thens: Vec<F>,
+    },
+    Load(PathBuf),
+}
+
+/// Saves/opens requested while a job runs, in request order (e.g. Save
+/// in a close prompt while an earlier save is still writing). A save of
+/// the same document to the same path as a queued one joins it.
+struct JobQueue<C, F> {
+    items: VecDeque<(C, Pending<F>)>,
+}
+
+impl<C, F> Default for JobQueue<C, F> {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+        }
     }
 }
 
-/// Marks the running job done and starts the next queued one.
-fn job_finished() {
-    BUSY.set(false);
-    let next = QUEUED.with_borrow_mut(|q| (!q.is_empty()).then(|| q.remove(0)));
-    if let Some(job) = next {
-        job();
+impl<C, F> JobQueue<C, F> {
+    fn push_save(&mut self, ctx: C, path: PathBuf, generation: u64, then: F) {
+        for (_, item) in &mut self.items {
+            if let Pending::Save {
+                path: p,
+                generation: g,
+                thens,
+            } = item
+                && *p == path
+                && *g == generation
+            {
+                thens.push(then);
+                return;
+            }
+        }
+        self.items.push_back((
+            ctx,
+            Pending::Save {
+                path,
+                generation,
+                thens: vec![then],
+            },
+        ));
+    }
+
+    fn push_load(&mut self, ctx: C, path: PathBuf) {
+        self.items.push_back((ctx, Pending::Load(path)));
+    }
+
+    fn pop(&mut self) -> Option<(C, Pending<F>)> {
+        self.items.pop_front()
+    }
+}
+
+/// Marks a background job as running; dropping it (also when a result
+/// callback panics) clears the flag and starts the next queued job.
+struct BusyGuard;
+
+impl BusyGuard {
+    fn acquire() -> Self {
+        BUSY.set(true);
+        BusyGuard
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        BUSY.set(false);
+        glib::idle_add_local_once(run_next_job);
+    }
+}
+
+/// Starts the next queued job when nothing runs and no prompt shows.
+fn run_next_job() {
+    if BUSY.get() || ASKING.get() {
+        return;
+    }
+    let Some((ui, job)) = QUEUE.with_borrow_mut(JobQueue::pop) else {
+        return;
+    };
+    match job {
+        Pending::Save {
+            path,
+            generation,
+            thens,
+        } => {
+            let then = move |ok: bool| thens.into_iter().for_each(|t| t(ok));
+            if generation == ui.ctx.engine().generation() {
+                ui.save_to(&path, then);
+            } else {
+                // Never write a different document to the captured path.
+                ui.set_status("queued save skipped: another document was opened");
+                then(false);
+            }
+        }
+        Pending::Load(path) => {
+            // The document may have changed while the open waited.
+            let me = ui.clone();
+            ui.confirm_discard(move |ok| {
+                if ok {
+                    me.load(path);
+                }
+                glib::idle_add_local_once(run_next_job);
+            });
+        }
+    }
+    if !BUSY.get() && !ASKING.get() {
+        glib::idle_add_local_once(run_next_job);
     }
 }
 
@@ -192,14 +294,14 @@ impl DocUi {
     fn load(&self, path: PathBuf) {
         if BUSY.get() {
             self.set_status("waiting for the running save or open…");
-            let this = self.clone();
-            run_job(move || this.load(path));
+            QUEUE.with_borrow_mut(|q| q.push_load(self.clone(), path));
             return;
         }
-        BUSY.set(true);
+        let guard = BusyGuard::acquire();
         self.set_status("opening…");
         let this = self.clone();
         glib::spawn_future_local(async move {
+            let _guard = guard;
             let p = path.clone();
             let res = gio::spawn_blocking(move || Engine::load_file(&p)).await;
             this.set_status("ready");
@@ -217,26 +319,34 @@ impl DocUi {
                 Ok(Err(err)) => this.error("Could not open the document", &err.to_string()),
                 Err(_) => this.error("Could not open the document", "the loader crashed"),
             }
-            job_finished();
         });
     }
 
     /// Serializes and writes the document off the UI thread; `then`
     /// runs with the outcome.
     fn save_to(&self, path: &Path, then: impl FnOnce(bool) + 'static) {
-        if BUSY.get() {
-            // Never drop the request (a close prompt's Save would silently
-            // do nothing): run it once the current job is done.
-            self.set_status("waiting for the running save or open…");
-            let (this, path) = (self.clone(), path.to_path_buf());
-            run_job(move || this.save_to(&path, then));
-            return;
-        }
-        BUSY.set(true);
         let path = with_extension(path);
         let engine = self.ctx.engine().clone();
-        // Uncommitted editor input belongs in the file.
-        engine.commit_edits();
+        if BUSY.get() {
+            // Never drop the request (a close prompt's Save would silently
+            // do nothing): run it once the current job is done — for this
+            // document only.
+            self.set_status("waiting for the running save or open…");
+            let generation = engine.generation();
+            QUEUE.with_borrow_mut(|q| {
+                q.push_save(self.clone(), path, generation, Box::new(then));
+            });
+            return;
+        }
+        // Uncommitted editor input belongs in the file; input that cannot
+        // be committed must not be dropped silently.
+        if let Err(failures) = engine.commit_edits() {
+            self.set_status("not saved: some input has errors");
+            self.error("Could not save the document", &failures.join("\n"));
+            then(false);
+            return;
+        }
+        let guard = BusyGuard::acquire();
         let layout = self.areas.to_blob();
         engine.edit(|e| e.set_layout(Some(layout)));
         let depth = engine.begin_save();
@@ -244,6 +354,7 @@ impl DocUi {
         self.set_status("saving…");
         let this = self.clone();
         glib::spawn_future_local(async move {
+            let _guard = guard;
             let res = gio::spawn_blocking(task).await;
             this.set_status("ready");
             match res {
@@ -261,7 +372,6 @@ impl DocUi {
                     then(false);
                 }
             }
-            job_finished();
         });
     }
 
@@ -321,9 +431,10 @@ impl DocUi {
     /// unmodified, saved, or the user chose to discard. While a prompt is
     /// showing, further requests are answered `false`.
     fn confirm_discard(&self, then: impl FnOnce(bool) + 'static) {
-        // Pending editor input counts as a change worth asking about.
-        self.ctx.engine().commit_edits();
-        if !self.ctx.engine().is_modified() {
+        // Pending editor input counts as a change worth asking about, and
+        // so does input that could not be committed (it would be lost).
+        let committed = self.ctx.engine().commit_edits().is_ok();
+        if committed && !self.ctx.engine().is_modified() {
             then(true);
             return;
         }
@@ -523,8 +634,9 @@ pub fn install(
         if CLOSING.get() {
             return glib::Propagation::Proceed;
         }
-        close_ui.ctx.engine().flush();
-        if !close_ui.ctx.engine().is_modified() {
+        // Typed but uncommitted input counts (see `confirm_discard`).
+        let committed = close_ui.ctx.engine().commit_edits().is_ok();
+        if committed && !close_ui.ctx.engine().is_modified() {
             return glib::Propagation::Proceed;
         }
         let w = w.downgrade();
@@ -567,6 +679,36 @@ fn update_chips(mode: &gtk::Label, angle: &gtk::Label, settings: &EngineSettings
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_keeps_order_and_coalesces_identical_saves() {
+        let mut q: JobQueue<&str, u32> = JobQueue::default();
+        let (a, b) = (PathBuf::from("a.viscas"), PathBuf::from("b.viscas"));
+        q.push_save("ui", a.clone(), 1, 10);
+        q.push_load("ui", b.clone());
+        q.push_save("ui", a.clone(), 1, 11); // same doc, same path: joins
+        q.push_save("ui", a.clone(), 2, 12); // another document: separate
+        q.push_save("ui", b.clone(), 1, 13); // another path: separate
+        let kinds: Vec<String> = std::iter::from_fn(|| q.pop())
+            .map(|(_, p)| match p {
+                Pending::Save {
+                    path,
+                    generation,
+                    thens,
+                } => format!("save {} g{generation} {thens:?}", path.display()),
+                Pending::Load(path) => format!("load {}", path.display()),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "save a.viscas g1 [10, 11]",
+                "load b.viscas",
+                "save a.viscas g2 [12]",
+                "save b.viscas g1 [13]",
+            ]
+        );
+    }
 
     #[test]
     fn extension_is_added_once() {

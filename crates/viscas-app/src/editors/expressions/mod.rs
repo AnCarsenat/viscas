@@ -356,17 +356,10 @@ impl Expressions {
             .css_classes(["console-hint"])
             .visible(self.inner.ctx.preferences().with(|p| p.interface.playful))
             .build();
-        let weak_quip = quip.downgrade();
         self.inner
             .ctx
             .preferences()
-            .connect_changed(move |p| match weak_quip.upgrade() {
-                Some(q) => {
-                    q.set_visible(p.interface.playful);
-                    true
-                }
-                None => false,
-            });
+            .connect_changed_for(quip.downgrade(), |q, p| q.set_visible(p.interface.playful));
         empty.append(&hint);
         empty.append(&quip);
         self.inner
@@ -802,8 +795,9 @@ impl Expressions {
 
     /// Commits every row with unsaved typing into its node (save, close,
     /// the editor being hidden). Orphan rows stay as they are: adding
-    /// them back is the user's call.
-    fn commit_dirty(&self) {
+    /// them back is the user's call. Returns the 1-based positions of
+    /// rows whose text could not be committed (shown with their error).
+    fn commit_dirty(&self) -> Vec<usize> {
         let dirty: Vec<NodeId> = self
             .inner
             .rows
@@ -812,9 +806,14 @@ impl Expressions {
             .filter(|r| r.dirty.get() && !r.orphan.get())
             .map(|r| r.id)
             .collect();
-        for id in dirty {
-            self.commit(id);
-        }
+        let failed: Vec<NodeId> = dirty.into_iter().filter(|id| !self.commit(*id)).collect();
+        let order = self.inner.order.borrow();
+        let mut positions: Vec<usize> = failed
+            .iter()
+            .filter_map(|id| order.iter().position(|x| x == id).map(|p| p + 1))
+            .collect();
+        positions.sort_unstable();
+        positions
     }
 
     /// Removes a row that has no node any more.
@@ -1371,7 +1370,13 @@ impl Expressions {
                     ed.sync_all();
                 }
                 DocEvent::Colors => ed.sync_all(),
-                DocEvent::CommitEdits => ed.commit_dirty(),
+                DocEvent::CommitEdits => {
+                    for n in ed.commit_dirty() {
+                        ed.inner.ctx.engine().report_commit_failure(format!(
+                            "Expression row {n} has an error — fix it or press Esc to discard it before saving."
+                        ));
+                    }
+                }
                 DocEvent::Replaced => {
                     let rows: Vec<Rc<Row>> =
                         ed.inner.rows.borrow_mut().drain().map(|(_, r)| r).collect();
@@ -1390,7 +1395,9 @@ impl Expressions {
         let weak = self.downgrade();
         self.inner.root.connect_unmap(move |_| {
             if let Some(ed) = Expressions::from_weak(&weak) {
-                ed.commit_dirty();
+                // Failures stay visible on their rows; the save path asks
+                // again (CommitEdits) and refuses to drop them silently.
+                let _ = ed.commit_dirty();
             }
         });
         self.inner

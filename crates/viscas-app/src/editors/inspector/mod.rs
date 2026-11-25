@@ -174,7 +174,8 @@ impl Inspector {
                 }
             }
             DocEvent::Replaced => self.update(true),
-            DocEvent::HistoryNavigating | DocEvent::CommitEdits => self.interrupt_scrub(),
+            DocEvent::HistoryNavigating => self.interrupt_scrub(),
+            DocEvent::CommitEdits => self.seal_group(),
             DocEvent::Settings(_) | DocEvent::Colors => self.update(false),
             _ => {}
         }
@@ -197,6 +198,9 @@ impl Inspector {
 
     fn rebuild(&self) {
         self.close_group();
+        // The fields (and any interrupted drag) are replaced: a drag that
+        // never reports its end must not keep new fields suspended.
+        self.inner.scrub_suspended.set(false);
         let body = &self.inner.body;
         while let Some(c) = body.first_child() {
             body.remove(&c);
@@ -390,8 +394,21 @@ impl Inspector {
         }
     }
 
-    /// Undo/redo or a save while a scrub holds an undo group open: close
-    /// the group now (one complete step) and ignore the rest of the drag.
+    /// A save during a scrub: closes the open undo group so the saved
+    /// document holds the current values; the drag goes on (its next
+    /// value opens a fresh group from the same start values).
+    fn seal_group(&self) {
+        if self.inner.group_open.replace(false) {
+            self.inner.ctx.engine().edit(|e| {
+                let s = e.scene_mut();
+                s.end_group();
+                s.seal_history();
+            });
+        }
+    }
+
+    /// Undo/redo while a scrub holds an undo group open: close the group
+    /// now (one complete step) and ignore the rest of the drag.
     fn interrupt_scrub(&self) {
         if self.inner.group_open.get() {
             self.close_group();
@@ -401,13 +418,7 @@ impl Inspector {
 
     fn close_group(&self) {
         self.inner.scrub_base.borrow_mut().take();
-        if self.inner.group_open.replace(false) {
-            self.inner.ctx.engine().edit(|e| {
-                let s = e.scene_mut();
-                s.end_group();
-                s.seal_history();
-            });
-        }
+        self.seal_group();
     }
 
     /// A scrub field editing a number of every selected node.

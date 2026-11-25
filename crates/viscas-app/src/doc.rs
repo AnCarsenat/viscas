@@ -247,6 +247,12 @@ struct Inner {
     history_limit: Cell<Option<usize>>,
     /// Run during each tick before broadcasting (selection pruning).
     pre_broadcast: RefCell<Option<EventHook>>,
+    /// Bumped by every document replacement (new/open): work captured
+    /// for one document (a queued save) can tell it is stale.
+    generation: Cell<u64>,
+    /// Pending input editors could not commit during the current
+    /// [`EngineHandle::commit_edits`].
+    commit_failures: RefCell<Vec<String>>,
 }
 
 /// Shared handle to the document engine. Cloning is cheap.
@@ -280,6 +286,8 @@ impl EngineHandle {
                 pending_close: RefCell::default(),
                 history_limit: Cell::new(None),
                 pre_broadcast: RefCell::new(None),
+                generation: Cell::new(0),
+                commit_failures: RefCell::default(),
             }),
         }
     }
@@ -313,6 +321,9 @@ impl EngineHandle {
     /// to close open undo groups (the scene also closes any group left
     /// open before moving the history).
     pub fn undo(&self) -> bool {
+        if !self.with(|e| e.scene().can_undo()) {
+            return false;
+        }
         self.inner.events.emit(&DocEvent::HistoryNavigating);
         self.inner.navigated.set(true);
         self.edit(|e| e.undo())
@@ -320,6 +331,9 @@ impl EngineHandle {
 
     /// Redo one step (see [`EngineHandle::undo`]).
     pub fn redo(&self) -> bool {
+        if !self.with(|e| e.scene().can_redo()) {
+            return false;
+        }
         self.inner.events.emit(&DocEvent::HistoryNavigating);
         self.inner.navigated.set(true);
         self.edit(|e| e.redo())
@@ -327,10 +341,30 @@ impl EngineHandle {
 
     /// Asks editors to commit pending input ([`DocEvent::CommitEdits`])
     /// and runs a tick, so the document and its modified flag include it.
-    /// Call before saving, closing or replacing the document.
-    pub fn commit_edits(&self) {
+    /// Call before saving, closing or replacing the document. `Err` lists
+    /// the input editors could not commit (e.g. a row that does not
+    /// parse): it is not in the document.
+    pub fn commit_edits(&self) -> Result<(), Vec<String>> {
+        self.inner.commit_failures.borrow_mut().clear();
         self.inner.events.emit(&DocEvent::CommitEdits);
         self.flush();
+        let failures = self.inner.commit_failures.take();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
+        }
+    }
+
+    /// Called by editors handling [`DocEvent::CommitEdits`] for input
+    /// they could not commit.
+    pub fn report_commit_failure(&self, message: impl Into<String>) {
+        self.inner.commit_failures.borrow_mut().push(message.into());
+    }
+
+    /// Identifies the current document: changes on every new/open.
+    pub fn generation(&self) -> u64 {
+        self.inner.generation.get()
     }
 
     /// Applies evaluation settings on the next pump tick (not inside the
@@ -582,6 +616,7 @@ impl EngineHandle {
                 e.scene_mut().set_history_limit(limit);
             }
         }
+        self.inner.generation.set(self.inner.generation.get() + 1);
         self.inner.modified.set(false);
         self.inner.saved_depth.set(Some(0));
         self.inner.last_depth.set(0);
@@ -700,8 +735,50 @@ mod tests {
             }
         });
         assert!(!handle.is_modified());
-        handle.commit_edits();
+        assert_eq!(handle.commit_edits(), Ok(()));
         assert!(handle.is_modified(), "the pending edit counts");
+    }
+
+    #[test]
+    fn commit_edits_reports_failures_once() {
+        let handle = quiet_handle();
+        let h = handle.clone();
+        let fail = Rc::new(Cell::new(true));
+        let f = fail.clone();
+        let _sub = handle.subscribe(move |ev| {
+            if matches!(ev, DocEvent::CommitEdits) && f.get() {
+                h.report_commit_failure("row 1 does not parse");
+            }
+        });
+        assert_eq!(
+            handle.commit_edits(),
+            Err(vec!["row 1 does not parse".to_owned()])
+        );
+        fail.set(false);
+        assert_eq!(handle.commit_edits(), Ok(()), "failures do not linger");
+    }
+
+    #[test]
+    fn nothing_to_undo_announces_nothing() {
+        let handle = quiet_handle();
+        let seen = Rc::new(Cell::new(0));
+        let s = seen.clone();
+        let _sub = handle.subscribe(move |ev| {
+            if matches!(ev, DocEvent::HistoryNavigating) {
+                s.set(s.get() + 1);
+            }
+        });
+        assert!(!handle.undo());
+        assert!(!handle.redo());
+        assert_eq!(seen.get(), 0);
+    }
+
+    #[test]
+    fn replacing_the_document_bumps_the_generation() {
+        let handle = quiet_handle();
+        let g = handle.generation();
+        handle.replace_with(|e| e.new_document());
+        assert_ne!(handle.generation(), g);
     }
 
     #[test]
