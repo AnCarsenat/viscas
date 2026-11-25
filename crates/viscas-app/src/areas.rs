@@ -74,17 +74,13 @@ impl Areas {
         };
         // "Show unfinished editors" off: hidden editors and workspaces are
         // swapped out on the next rebuild.
-        let weak = areas.downgrade();
         let last = Cell::new(ctx.preferences().with(|p| p.interface.show_unfinished));
-        ctx.preferences().connect_changed(move |p| {
-            let Some(areas) = weak.upgrade() else {
-                return false;
-            };
-            if last.replace(p.interface.show_unfinished) != p.interface.show_unfinished {
-                areas.schedule_rebuild();
-            }
-            true
-        });
+        ctx.preferences()
+            .connect_changed_for(Rc::downgrade(&areas.inner), move |inner, p| {
+                if last.replace(p.interface.show_unfinished) != p.interface.show_unfinished {
+                    Areas { inner }.schedule_rebuild();
+                }
+            });
         areas.rebuild();
         areas
     }

@@ -111,18 +111,13 @@ fn build_topbar(ctx: &AppCtx) -> gtk::HeaderBar {
     let show = ctx.preferences().with(|p| p.interface.show_unfinished);
     let bar = gtk::PopoverMenuBar::from_model(Some(&menubar(show)));
     // "Show unfinished editors" changes the Editor Type / Workspace menus.
-    let weak = bar.downgrade();
     let last = std::cell::Cell::new(show);
     ctx.preferences()
-        .connect_changed(move |p| match weak.upgrade() {
-            Some(bar) => {
-                let show = p.interface.show_unfinished;
-                if last.replace(show) != show {
-                    bar.set_menu_model(Some(&menubar(show)));
-                }
-                true
+        .connect_changed_for(bar.downgrade(), move |bar, p| {
+            let show = p.interface.show_unfinished;
+            if last.replace(show) != show {
+                bar.set_menu_model(Some(&menubar(show)));
             }
-            None => false,
         });
     header.pack_start(&bar);
 

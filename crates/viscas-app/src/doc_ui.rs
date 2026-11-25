@@ -538,8 +538,8 @@ fn save_prompt(
     window.set_child(Some(&column));
     window.set_default_widget(Some(&save));
 
-    let then: Rc<RefCell<Option<Box<dyn FnOnce(SaveChoice)>>>> =
-        Rc::new(RefCell::new(Some(Box::new(then))));
+    type Answer = Box<dyn FnOnce(SaveChoice)>;
+    let then: Rc<RefCell<Option<Answer>>> = Rc::new(RefCell::new(Some(Box::new(then))));
     let answer = {
         let then = then.clone();
         let window = window.downgrade();

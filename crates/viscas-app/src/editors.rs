@@ -76,15 +76,8 @@ pub fn bind_shown(
 ) {
     let widget = widget.as_ref().clone();
     widget.set_visible(ctx.preferences().with(&shown));
-    let weak = widget.downgrade();
     ctx.preferences()
-        .connect_changed(move |p| match weak.upgrade() {
-            Some(w) => {
-                w.set_visible(shown(p));
-                true
-            }
-            None => false,
-        });
+        .connect_changed_for(widget.downgrade(), move |w, p| w.set_visible(shown(p)));
 }
 
 /// Candidate symbolic icons, most preferred first. Icon themes differ
@@ -423,4 +416,29 @@ fn capsule(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
     cr.arc(x + w - r, y + r, r, -PI / 2.0, PI / 2.0);
     cr.arc(x + r, y + r, r, PI / 2.0, 3.0 * PI / 2.0);
     cr.close_path();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::IdGen;
+
+    #[test]
+    fn unfinished_editors_are_swapped_for_built_ones() {
+        for ws in Workspace::ALL {
+            let mut layout = ws.default_layout(&mut IdGen::default());
+            replace_unfinished(&mut layout);
+            assert!(
+                layout.leaves().iter().all(|(_, k)| !is_unfinished(*k)),
+                "{ws:?}"
+            );
+            assert!(!replace_unfinished(&mut layout), "idempotent");
+        }
+        let mut prefs = Preferences::default();
+        assert!(!prefs.interface.show_unfinished, "off by default");
+        assert!(!workspace_shown(Workspace::Data, &prefs));
+        assert!(editor_shown(EditorKind::Console, &prefs));
+        prefs.interface.show_unfinished = true;
+        assert!(editor_shown(EditorKind::Sheet, &prefs));
+    }
 }

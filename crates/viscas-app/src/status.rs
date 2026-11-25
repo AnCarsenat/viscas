@@ -57,13 +57,9 @@ pub fn connect(ctx: &AppCtx, label: &gtk::Label) {
         }
     };
     update();
+    // The status bar lives as long as the window (and the context).
     let u = update.clone();
-    let weak = label.downgrade();
-    ctx.selection().connect_changed(move |_| {
-        if weak.upgrade().is_some() {
-            u();
-        }
-    });
+    ctx.selection().connect_changed(move |_| u());
     let sub = ctx.engine().subscribe(move |ev| {
         if matches!(
             ev,

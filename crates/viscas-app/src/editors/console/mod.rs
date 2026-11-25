@@ -5,11 +5,11 @@
 //! the exact form and a dim `≈` decimal side by side, "did you mean"
 //! chips, and hover actions (copy exact/approx, add to board, insert).
 //!
-//! Board: things that draw (`y = x^2`, `(1, 2)`) go on the board as soon
-//! as they are entered (preference, on by default; definitions can too).
-//! Anything else that can become a node gets an "Add to board" button
-//! and Ctrl+Shift+Enter; `:add` (alias `:pin`) and `:plot <input>` do the
-//! same from the input.
+//! Board: typing never pins anything by default. Every entry that can
+//! become a node (plots, points, definitions, values) gets a prominent
+//! "+ Add to board" button and Ctrl+Shift+Enter; `:add` (alias `:pin`)
+//! and `:plot <input>` do the same from the input. Preferences ▸ Editing
+//! can opt into auto-adding drawings or definitions.
 //!
 //! Input: Enter evaluates, Shift+Enter adds a line, Up/Down recall the
 //! (persisted) history, Tab completes through a popover, Ctrl+L clears
@@ -491,9 +491,7 @@ impl Console {
             .css_classes(["placeholder-title"])
             .build();
         let hint = gtk::Label::builder()
-            .label(format!(
-                "Type y = x^2 to draw it · a {op} 3 to define · :help"
-            ))
+            .label("Type y = x^2 to try it · Ctrl+Shift+Enter adds it to the board")
             .wrap(true)
             .max_width_chars(44)
             .justify(gtk::Justification::Center)
@@ -501,8 +499,8 @@ impl Console {
             .build();
         let desc = gtk::Label::builder()
             .label(
-                "Drawings go straight on the board; anything else can follow with \
-                 Add to board (Ctrl+Shift+Enter, :add). Tab completes, ↑ recalls, \
+                "Nothing goes on the board until you say so: + Add to board, \
+                 Ctrl+Shift+Enter or :add. Tab completes, ↑ recalls, \
                  Shift+Enter adds a line.",
             )
             .wrap(true)

@@ -73,7 +73,7 @@ Editors (UI, not nodes):
 | Viewport         | Renders a Viewport node (2D now, 3D later). Several can be open at once. |
 | Scene Tree       | Godot-style tree of all nodes: typed icons, rename, reparent by drag, folders, hide/lock toggles, filter. |
 | Inspector        | Properties of the selected node(s): expression, style, ranges, metadata; compact fields, drag-to-scrub numbers, multi-edit. |
-| Console          | Primary input. REPL (qalc-grade): history, typeset output, completion, `ans`, unit conversion, exact/approx; plots typed in it go straight on the board, other results can be added to the board as nodes. |
+| Console          | Primary input. REPL (qalc-grade): history, typeset output, completion, `ans`, unit conversion, exact/approx; nothing typed in it goes on the board until added explicitly ("Add to board", Ctrl+Shift+Enter, `:add`). |
 | Expressions      | Flat ordered list of statement nodes for quick editing (a view of the tree, not a separate model). |
 | Sheet            | Spreadsheet editor for table nodes. |
 | Script           | Code editor for script nodes (Viscas language or Rhai). |
@@ -184,7 +184,7 @@ capability scope, not an API to copy.
 - History (persisted), up/down recall, `ans`, `ans2`.
 - Tab completion for functions, nodes, units.
 - Commands: `:help f`, `:add` (alias `:pin`: turn the last result into a board node), `:plot <input>` (evaluate and add), `:clear`, `:mode deg|rad|exact|approx`, `to <unit>`.
-- Add to board: things that draw (`y = x^2`, `x^2+y^2=4`, `(1, 2)`, `r = θ`, parametric) become board nodes as soon as they are entered (undoable; preference, on by default). Definitions stay console-local unless a node exists or "auto-add definitions" is on; every entry that can become a node has an "Add to board" button and Ctrl+Shift+Enter.
+- Add to board: typing never pins anything by default — trying expressions must not litter the scene. Every entry that can become a node (drawings such as `y = x^2`, `x^2+y^2=4`, `(1, 2)`, `r = θ`, parametric; definitions; values) shows its result with a prominent "+ Add to board" button; Ctrl+Shift+Enter and `:add` do the same (undoable). Definitions stay console-local unless a node exists. Preferences ▸ Editing can opt into auto-adding drawings and/or definitions (both off by default).
 - Shares the scene's variables: console sees `a`, `f`, etc.
 
 ## 8. Sheets

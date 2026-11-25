@@ -1363,7 +1363,8 @@ impl Inspector {
     fn analysis_panel(&self, id: NodeId) -> Panel {
         use viscas_plot::FeatureKind as K;
         let panel = Panel::new("Analysis", true);
-        let groups: [(&str, fn(K) -> bool); 3] = [
+        type Group = (&'static str, fn(K) -> bool);
+        let groups: [Group; 3] = [
             ("Roots", |k| k == K::Root),
             ("Extrema", |k| matches!(k, K::Minimum | K::Maximum)),
             ("Intersections", |k| k == K::Intersection),
@@ -1394,7 +1395,8 @@ impl Inspector {
         panel.append(&hint);
 
         let weak = self.downgrade();
-        let last: Rc<RefCell<Option<Vec<(K, u64, u64)>>>> = Rc::default();
+        type Key = Vec<(K, u64, u64)>;
+        let last: Rc<RefCell<Option<Key>>> = Rc::default();
         self.add_refresher(move |e| {
             let hits = e.node_features(id, None);
             let key: Vec<(K, u64, u64)> = hits
