@@ -207,6 +207,8 @@ impl Console {
         input_bar.append(&field);
         let examples = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
+            .halign(gtk::Align::Start)
+            .min_children_per_line(2)
             .max_children_per_line(8)
             .column_spacing(4)
             .row_spacing(4)

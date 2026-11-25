@@ -120,12 +120,13 @@ fn best_alignment(query: &[char], folded: &[char], chars: &[char]) -> Option<Mat
     Some(Match { score, positions })
 }
 
-/// Lowest score [`rank`] keeps for `query`: on average one plain match
-/// per query char, so word-start and contiguous matches pass while
-/// letters scattered across a long title (gaps, late start) drop out.
+/// Lowest score [`rank`] keeps for `query`: a bit more than one plain
+/// match per query char, so word-start and contiguous matches pass while
+/// letters scattered across a title (gaps, late start) drop out.
 pub fn threshold(query: &str) -> i32 {
+    const PER_CHAR: i32 = MATCH + CONSECUTIVE / 2;
     let len = query.chars().filter(|c| !c.is_whitespace()).count();
-    MATCH * i32::try_from(len).unwrap_or(i32::MAX / MATCH)
+    PER_CHAR * i32::try_from(len).unwrap_or(i32::MAX / PER_CHAR)
 }
 
 /// Filters and ranks `candidates`, best first; ties keep the input order.
@@ -222,11 +223,12 @@ mod tests {
         let items = [
             "Show Roots of Selected",
             "Toggle Radians / Degrees",
-            "Rotate",
+            "prod(L) — product of a list",
+            "Clear Console Transcript",
         ];
         let ranked: Vec<usize> = rank("root", items).into_iter().map(|(i, _)| i).collect();
         assert_eq!(ranked, vec![0]);
-        assert!(fuzzy_match("root", items[1]).is_none_or(|m| m.score < threshold("root")));
+        assert!(fuzzy_match("sa", "Split Area").is_some_and(|m| m.score >= threshold("sa")));
     }
 
     #[test]
