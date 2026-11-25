@@ -16,8 +16,13 @@
 //!   Greek letter (`dθ`) is one identifier so differentials work.
 //! - Unicode operator aliases: `· × ⋅` → `*`, `÷` → `/`, `−` → `-`,
 //!   `≤ ≥ ≠`, `→` → `->`, `′` → `'`, `**` → `^`, `...` → `..`, `≔` → `:=`.
-//! - Superscript digits are exponents: `x²` → `x ^ 2`, `x⁻¹` → `x ^ -1`
-//!   (`²` is a plain key on AZERTY keyboards).
+//! - Superscript digits are exponents (math first): `x²` → `x ^ 2`,
+//!   `x⁻¹` → `x ^ -1` (`²` is a plain key on AZERTY keyboards). A run of
+//!   superscripts is one exponent number: `x²²` → `x ^ 22`, `x⁻¹²` →
+//!   `x ^ -12`; a lone sign takes an ordinary exponent (`x⁻1` → `x ^ -1`).
+//!   Identifiers never contain superscript digits. Earlier builds lexed
+//!   `x²` as one name; the document format is pre-1.0, so saved files are
+//!   not migrated.
 //! - A string literal never spans lines: an unterminated string ends at the
 //!   newline, which is kept as a separate token so the next line still parses.
 
