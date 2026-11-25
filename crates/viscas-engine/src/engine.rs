@@ -896,6 +896,42 @@ impl Engine {
         compute_features(&self.feature_curves(None), view, point, radius, &opts)
     }
 
+    /// Every feature of `node` (roots, extrema, y-intercept and its
+    /// intersections with other curves) within the view of a plotted
+    /// viewport (`viewport`, else the lowest-numbered one), sorted by x.
+    /// Bounded like [`Engine::features_near`].
+    pub fn node_features(&self, node: NodeId, viewport: Option<ViewportId>) -> Vec<FeatureHit> {
+        let vp = viewport
+            .filter(|v| self.viewport_view(*v).is_some())
+            .or_else(|| {
+                let mut ids: Vec<ViewportId> = self
+                    .viewports
+                    .iter()
+                    .filter(|(_, s)| s.view.is_some())
+                    .map(|(id, _)| *id)
+                    .collect();
+                ids.sort_unstable();
+                ids.first().copied()
+            });
+        let Some(vp) = vp else {
+            return Vec::new();
+        };
+        let Some(view) = self.viewport_view(vp) else {
+            return Vec::new();
+        };
+        let center = Vec2::new(
+            (view.bounds().x_min + view.bounds().x_max) / 2.0,
+            (view.bounds().y_min + view.bounds().y_max) / 2.0,
+        );
+        let mut hits: Vec<FeatureHit> = self
+            .features_near(vp, center, f64::INFINITY)
+            .into_iter()
+            .filter(|h| h.node == node || h.other == Some(node))
+            .collect();
+        hits.sort_by(|a, b| a.feature.pos.x.total_cmp(&b.feature.pos.x));
+        hits
+    }
+
     /// [`Engine::features_near`] on the worker pool. A newer request
     /// cancels the previous one. Returns the ticket of the result
     /// delivered by [`Engine::poll_features`], or `None` when the viewport

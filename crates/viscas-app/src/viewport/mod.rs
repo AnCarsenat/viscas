@@ -15,6 +15,7 @@ use gtk::{cairo, gdk, gio, glib};
 
 use self::draw::GridLayer;
 use self::plots::{FEATURE_RADIUS_PX, HOVER_PX, PlotState, PlotsLayer, filter_hits, nearest_curve};
+pub use self::plots::{feature_label, format_coord};
 use self::view::View;
 use crate::ctx::AppCtx;
 use crate::doc::DocEvent;
@@ -78,7 +79,6 @@ pub struct Viewport {
     plots: Rc<PlotState>,
     actions: gio::SimpleActionGroup,
     header: Rc<RefCell<HeaderRefs>>,
-    quick_input: Rc<Cell<bool>>,
 }
 
 impl Viewport {
@@ -124,7 +124,6 @@ impl Viewport {
             plots: PlotState::new(ctx),
             actions: gio::SimpleActionGroup::new(),
             header: Rc::default(),
-            quick_input: Rc::new(Cell::new(false)),
         };
         viewport.add_layer(GridLayer { ctx: ctx.clone() });
         viewport.add_layer(PlotsLayer {
@@ -297,8 +296,8 @@ impl Viewport {
         chip.set_tooltip_text(Some(&tip));
     }
 
-    /// Widgets for the area header: View and Add menus, the temporary
-    /// quick input, the error chip and the reset button. Built once; later
+    /// Widgets for the area header: View and Add (▸ Examples) menus, the
+    /// error chip and the frame-all button. Built once; later
     /// calls move the same widgets out of the previous header.
     pub fn header_widgets(&self) -> Vec<gtk::Widget> {
         let cached = self.header.borrow().widgets.clone();
@@ -322,10 +321,12 @@ impl Viewport {
         let view_menu = gio::Menu::new();
         view_menu.append(Some("Reset View"), Some("vp.reset"));
         view_menu.append(Some("Lock Aspect"), Some("vp.lock-aspect"));
-        let add_menu = gio::Menu::new();
+        let examples = gio::Menu::new();
         for (target, title, _) in EXAMPLES {
-            add_menu.append(Some(title), Some(&format!("vp.add-example::{target}")));
+            examples.append(Some(title), Some(&format!("vp.add-example::{target}")));
         }
+        let add_menu = gio::Menu::new();
+        add_menu.append_submenu(Some("Examples"), &examples);
         let menu = |title: &str, model: &gio::Menu| {
             let b = gtk::MenuButton::builder()
                 .label(title)
@@ -338,58 +339,6 @@ impl Viewport {
         };
         let mut widgets = vec![menu("View", &view_menu), menu("Add", &add_menu)];
 
-        // Temporary quick input (to be replaced by Console/Expressions).
-        let toggle = gtk::ToggleButton::builder()
-            .label("Quick ›")
-            .active(self.quick_input.get())
-            .tooltip_text(
-                "Temporary quick input: type a line such as y = sin(x) and press Enter. \
-                 Will be replaced by the Console and Expressions editors.",
-            )
-            .css_classes(["header-menu", "flat"])
-            .build();
-        let entry = gtk::Entry::builder()
-            .placeholder_text("y = sin(x)   (temporary)")
-            .width_chars(22)
-            .visible(self.quick_input.get())
-            .css_classes(["mono"])
-            .build();
-        let flag = self.quick_input.clone();
-        let weak_entry = entry.downgrade();
-        toggle.connect_toggled(move |t| {
-            flag.set(t.is_active());
-            if let Some(e) = weak_entry.upgrade() {
-                e.set_visible(t.is_active());
-                if t.is_active() {
-                    e.grab_focus();
-                }
-            }
-        });
-        let ctx = self.ctx().downgrade();
-        entry.connect_activate(move |e| {
-            let Some(ctx) = ctx.upgrade() else {
-                return;
-            };
-            let text = e.text().trim().to_owned();
-            if text.is_empty() {
-                return;
-            }
-            match ctx.engine().edit(|eng| eng.add_line(None, &text)) {
-                Ok(id) => {
-                    e.set_text("");
-                    e.remove_css_class("error");
-                    e.set_tooltip_text(None);
-                    ctx.selection().set_selected([id]);
-                }
-                Err(err) => {
-                    e.add_css_class("error");
-                    e.set_tooltip_text(Some(&err.to_string()));
-                }
-            }
-        });
-        widgets.push(toggle.upcast());
-        widgets.push(entry.upcast());
-
         let errors = gtk::Label::builder()
             .css_classes(["chip", "error"])
             .visible(false)
@@ -399,10 +348,11 @@ impl Viewport {
 
         let reset = gtk::Button::builder()
             .icon_name(crate::editors::pick_icon(&[
+                "zoom-fit-best-symbolic",
+                "view-fullscreen-symbolic",
                 "zoom-original-symbolic",
-                "view-refresh-symbolic",
             ]))
-            .tooltip_text("Reset View (Home)")
+            .tooltip_text("Frame All — reset the view (Home)")
             .action_name("vp.reset")
             .css_classes(["area-tool"])
             .build();
@@ -793,7 +743,6 @@ impl Viewport {
             plots: Rc::downgrade(&self.plots),
             actions: self.actions.downgrade(),
             header: Rc::downgrade(&self.header),
-            quick_input: Rc::downgrade(&self.quick_input),
         }
     }
 }
@@ -810,7 +759,6 @@ struct WeakViewport {
     plots: Weak<PlotState>,
     actions: glib::WeakRef<gio::SimpleActionGroup>,
     header: Weak<RefCell<HeaderRefs>>,
-    quick_input: Weak<Cell<bool>>,
 }
 
 impl crate::ctx::WeakGuard for WeakViewport {
@@ -835,7 +783,6 @@ impl WeakViewport {
             plots: self.plots.upgrade()?,
             actions: self.actions.upgrade()?,
             header: self.header.upgrade()?,
-            quick_input: self.quick_input.upgrade()?,
         })
     }
 }
@@ -848,8 +795,18 @@ fn hud_text(view: &View, pointer: Option<(f64, f64)>) -> String {
             let (x, y) = view.screen_to_world(sx, sy);
             let dx = view::label_digits(view.scale);
             let dy = view::label_digits(view.scale_y());
-            format!("x {x:>+10.dx$}   y {y:>+10.dy$}")
+            format!("x {x:>+10.dx$}   y {y:>+10.dy$}   {}", zoom_percent(view))
         }
-        None => format!("{:.3} px/unit", view.scale),
+        None => zoom_percent(view),
+    }
+}
+
+/// Zoom relative to the default view, e.g. `250 %`.
+fn zoom_percent(view: &View) -> String {
+    let pct = view.scale / View::default().scale * 100.0;
+    if pct >= 10.0 {
+        format!("{pct:.0} %")
+    } else {
+        format!("{pct:.2e} %")
     }
 }

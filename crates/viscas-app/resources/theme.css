@@ -893,3 +893,37 @@ window.prefs-window {
   background: alpha(@vc_danger, 0.14);
   color: @vc_danger_text;
 }
+
+/* ------------------------------------------------- stock GTK file chooser */
+/* The dense app rules above are global selectors; inside the stock file
+   chooser (used when no portal is available) restore stock proportions so
+   the dialog stays usable. Colors still follow the theme. */
+
+filechooser,
+filechooser label,
+placessidebar label {
+  font-size: 13px;
+}
+filechooser button,
+window.dialog headerbar button {
+  min-height: 28px;
+  min-width: 28px;
+  padding: 2px 10px;
+}
+filechooser button image,
+placessidebar image {
+  -gtk-icon-size: 16px;
+}
+filechooser entry {
+  min-height: 30px;
+  padding: 0 8px;
+}
+filechooser columnview > listview > row,
+placessidebar row {
+  min-height: 30px;
+}
+placessidebar row:selected,
+filechooser columnview > listview > row:selected {
+  background-color: alpha(@vc_accent, 0.22);
+  color: @vc_fg_strong;
+}

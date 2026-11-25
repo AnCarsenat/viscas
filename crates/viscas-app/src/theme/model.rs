@@ -410,6 +410,8 @@ impl Theme {
         }
         self.ui.accent_text = text;
         self.dep_graph.port_active = accent.with_alpha(self.dep_graph.port_active.alpha());
+        // The selected tree row is an accent tint: it follows the accent.
+        self.scene_tree.selected = accent.with_alpha(self.scene_tree.selected.alpha());
     }
 
     /// The theme with `accent` applied (unchanged for [`Accent::Theme`]).
