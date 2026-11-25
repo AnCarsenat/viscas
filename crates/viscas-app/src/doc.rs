@@ -58,6 +58,13 @@ pub enum DocEvent {
     /// A different document was loaded (new/open): editors drop their
     /// per-document state. Followed by `Scene` and `Document` events.
     Replaced,
+    /// Commit pending editor input into the document now (uncommitted
+    /// typing, open drags). Emitted synchronously before save, close,
+    /// new and open (see [`EngineHandle::commit_edits`]).
+    CommitEdits,
+    /// Undo or redo is about to run: editors end interactions that hold
+    /// an undo group open (scrub drags) before the history moves.
+    HistoryNavigating,
 }
 
 type Listener = Rc<dyn Fn(&DocEvent)>;
@@ -108,15 +115,20 @@ impl DocEvents {
         }
     }
 
+    /// Calls every listener. A listener unsubscribed by an earlier one
+    /// during this broadcast is skipped.
     pub fn emit(&self, event: &DocEvent) {
-        let listeners: Vec<Listener> = self
+        let listeners: Vec<(u64, Listener)> = self
             .listeners
             .borrow()
             .iter()
-            .map(|(_, f)| f.clone())
+            .map(|(id, f)| (*id, f.clone()))
             .collect();
-        for f in listeners {
-            f(event);
+        for (id, f) in listeners {
+            let live = self.listeners.borrow().iter().any(|(i, _)| *i == id);
+            if live {
+                f(event);
+            }
         }
     }
 
@@ -297,16 +309,28 @@ impl EngineHandle {
         r
     }
 
-    /// Undo one step.
+    /// Undo one step. Editors first get [`DocEvent::HistoryNavigating`]
+    /// to close open undo groups (the scene also closes any group left
+    /// open before moving the history).
     pub fn undo(&self) -> bool {
+        self.inner.events.emit(&DocEvent::HistoryNavigating);
         self.inner.navigated.set(true);
         self.edit(|e| e.undo())
     }
 
-    /// Redo one step.
+    /// Redo one step (see [`EngineHandle::undo`]).
     pub fn redo(&self) -> bool {
+        self.inner.events.emit(&DocEvent::HistoryNavigating);
         self.inner.navigated.set(true);
         self.edit(|e| e.redo())
+    }
+
+    /// Asks editors to commit pending input ([`DocEvent::CommitEdits`])
+    /// and runs a tick, so the document and its modified flag include it.
+    /// Call before saving, closing or replacing the document.
+    pub fn commit_edits(&self) {
+        self.inner.events.emit(&DocEvent::CommitEdits);
+        self.flush();
     }
 
     /// Applies evaluation settings on the next pump tick (not inside the
@@ -595,6 +619,14 @@ mod tests {
     use super::*;
     use crate::theme::model;
 
+    /// A handle whose pump never schedules itself (no main context
+    /// needed: ticks run only through `flush`).
+    fn quiet_handle() -> EngineHandle {
+        let handle = EngineHandle::new(Engine::with_workers(1));
+        handle.inner.scheduled.set(true);
+        handle
+    }
+
     #[test]
     fn hub_broadcasts_and_guard_disconnects() {
         let hub = Rc::new(DocEvents::default());
@@ -625,6 +657,51 @@ mod tests {
         hub.subscribe(move |_| h.borrow_mut().clear()).forever();
         hub.emit(&DocEvent::Colors);
         assert_eq!(hub.len(), 2, "the new subscription was dropped again");
+    }
+
+    #[test]
+    fn listener_unsubscribed_mid_broadcast_is_not_called() {
+        let hub = Rc::new(DocEvents::default());
+        let victim: Rc<RefCell<Option<Subscription>>> = Rc::default();
+        let v = victim.clone();
+        hub.subscribe(move |_| drop(v.borrow_mut().take()))
+            .forever();
+        let called = Rc::new(Cell::new(false));
+        let c = called.clone();
+        *victim.borrow_mut() = Some(hub.subscribe(move |_| c.set(true)));
+        hub.emit(&DocEvent::Colors);
+        assert!(!called.get(), "removed by an earlier listener");
+        assert_eq!(hub.len(), 1);
+    }
+
+    #[test]
+    fn undo_announces_itself_before_the_history_moves() {
+        let handle = quiet_handle();
+        handle.edit(|e| e.add_line(None, "a := 1").unwrap());
+        let depth_seen = Rc::new(Cell::new(None));
+        let (d, h) = (depth_seen.clone(), handle.clone());
+        let _sub = handle.subscribe(move |ev| {
+            if matches!(ev, DocEvent::HistoryNavigating) {
+                d.set(Some(h.with(|e| e.scene().undo_depth())));
+            }
+        });
+        assert!(handle.undo());
+        assert_eq!(depth_seen.get(), Some(1));
+        assert_eq!(handle.with(|e| e.scene().undo_depth()), 0);
+    }
+
+    #[test]
+    fn commit_edits_lets_editors_write_before_the_flush() {
+        let handle = quiet_handle();
+        let h = handle.clone();
+        let _sub = handle.subscribe(move |ev| {
+            if matches!(ev, DocEvent::CommitEdits) {
+                h.edit(|e| e.add_line(None, "b := 2").unwrap());
+            }
+        });
+        assert!(!handle.is_modified());
+        handle.commit_edits();
+        assert!(handle.is_modified(), "the pending edit counts");
     }
 
     #[test]

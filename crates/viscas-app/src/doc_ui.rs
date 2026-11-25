@@ -29,6 +29,28 @@ thread_local! {
     static CLOSING: Cell<bool> = const { Cell::new(false) };
     /// A background save or open is running.
     static BUSY: Cell<bool> = const { Cell::new(false) };
+    /// Saves/opens requested while one was running, run in order after it.
+    static QUEUED: RefCell<Vec<Box<dyn FnOnce()>>> = RefCell::default();
+}
+
+/// Starts a background job now, or queues it after the running one
+/// (e.g. Save in a close prompt while an earlier save is still writing).
+/// `job` must mark itself busy and call [`job_finished`] when done.
+fn run_job(job: impl FnOnce() + 'static) {
+    if BUSY.get() {
+        QUEUED.with_borrow_mut(|q| q.push(Box::new(job)));
+    } else {
+        job();
+    }
+}
+
+/// Marks the running job done and starts the next queued one.
+fn job_finished() {
+    BUSY.set(false);
+    let next = QUEUED.with_borrow_mut(|q| (!q.is_empty()).then(|| q.remove(0)));
+    if let Some(job) = next {
+        job();
+    }
 }
 
 /// Applies the preferences to the engine now and after every change:
@@ -168,15 +190,18 @@ impl DocUi {
     /// Reads and parses `path` off the UI thread, then replaces the
     /// document (only on success).
     fn load(&self, path: PathBuf) {
-        if BUSY.replace(true) {
+        if BUSY.get() {
+            self.set_status("waiting for the running save or open…");
+            let this = self.clone();
+            run_job(move || this.load(path));
             return;
         }
+        BUSY.set(true);
         self.set_status("opening…");
         let this = self.clone();
         glib::spawn_future_local(async move {
             let p = path.clone();
             let res = gio::spawn_blocking(move || Engine::load_file(&p)).await;
-            BUSY.set(false);
             this.set_status("ready");
             match res {
                 Ok(Ok(scene)) => {
@@ -192,19 +217,26 @@ impl DocUi {
                 Ok(Err(err)) => this.error("Could not open the document", &err.to_string()),
                 Err(_) => this.error("Could not open the document", "the loader crashed"),
             }
+            job_finished();
         });
     }
 
     /// Serializes and writes the document off the UI thread; `then`
     /// runs with the outcome.
     fn save_to(&self, path: &Path, then: impl FnOnce(bool) + 'static) {
-        if BUSY.replace(true) {
-            then(false);
+        if BUSY.get() {
+            // Never drop the request (a close prompt's Save would silently
+            // do nothing): run it once the current job is done.
+            self.set_status("waiting for the running save or open…");
+            let (this, path) = (self.clone(), path.to_path_buf());
+            run_job(move || this.save_to(&path, then));
             return;
         }
+        BUSY.set(true);
         let path = with_extension(path);
         let engine = self.ctx.engine().clone();
-        engine.flush();
+        // Uncommitted editor input belongs in the file.
+        engine.commit_edits();
         let layout = self.areas.to_blob();
         engine.edit(|e| e.set_layout(Some(layout)));
         let depth = engine.begin_save();
@@ -213,7 +245,6 @@ impl DocUi {
         let this = self.clone();
         glib::spawn_future_local(async move {
             let res = gio::spawn_blocking(task).await;
-            BUSY.set(false);
             this.set_status("ready");
             match res {
                 Ok(Ok(())) => {
@@ -230,6 +261,7 @@ impl DocUi {
                     then(false);
                 }
             }
+            job_finished();
         });
     }
 
@@ -289,7 +321,8 @@ impl DocUi {
     /// unmodified, saved, or the user chose to discard. While a prompt is
     /// showing, further requests are answered `false`.
     fn confirm_discard(&self, then: impl FnOnce(bool) + 'static) {
-        self.ctx.engine().flush();
+        // Pending editor input counts as a change worth asking about.
+        self.ctx.engine().commit_edits();
         if !self.ctx.engine().is_modified() {
             then(true);
             return;

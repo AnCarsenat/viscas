@@ -142,6 +142,8 @@ struct Inner {
     /// Slider controls hidden (header menu).
     sliders_collapsed: Cell<bool>,
     subs: RefCell<Vec<Subscription>>,
+    /// Selection and hover the row styles currently show.
+    styled: RefCell<(Vec<NodeId>, Option<NodeId>)>,
 }
 
 /// The Expressions editor. Cloning yields a handle to the same widget.
@@ -215,6 +217,7 @@ impl Expressions {
                 order: RefCell::default(),
                 sliders_collapsed: Cell::new(false),
                 subs: RefCell::default(),
+                styled: RefCell::default(),
             }),
         };
         ed.build_empty_state();
@@ -748,11 +751,20 @@ impl Expressions {
                 glib::Propagation::Stop
             }
             Key::BackSpace if ctrl && row.entry.text().is_empty() => {
+                // The emptied text is not "unsaved typing": a dirty row
+                // would survive its node's removal as a ghost orphan (the
+                // first row keeps focus, so no focus-out clears it).
+                row.set_dirty(false);
                 self.focus_after(id, -1);
                 if row.orphan.get() {
                     self.drop_row(id);
                 } else {
                     self.delete(id);
+                    let exists = self.inner.ctx.engine().with(|e| e.scene().contains(id));
+                    if exists {
+                        // Refused (locked): show the node's line again.
+                        self.sync_row(&row);
+                    }
                 }
                 glib::Propagation::Stop
             }
@@ -785,6 +797,23 @@ impl Expressions {
         {
             row.entry.grab_focus();
             row.entry.set_position(-1);
+        }
+    }
+
+    /// Commits every row with unsaved typing into its node (save, close,
+    /// the editor being hidden). Orphan rows stay as they are: adding
+    /// them back is the user's call.
+    fn commit_dirty(&self) {
+        let dirty: Vec<NodeId> = self
+            .inner
+            .rows
+            .borrow()
+            .values()
+            .filter(|r| r.dirty.get() && !r.orphan.get())
+            .map(|r| r.id)
+            .collect();
+        for id in dirty {
+            self.commit(id);
         }
     }
 
@@ -1246,21 +1275,44 @@ impl Expressions {
 
     // ------------------------------------------------------- updates
 
+    /// Restyles every row from the shared selection (rows were added or
+    /// rebuilt).
     fn apply_selection(&self) {
         let sel = self.inner.ctx.selection();
-        let selected = sel.selected();
-        let hovered = sel.hovered();
+        let (selected, hovered) = (sel.selected(), sel.hovered());
         for (id, row) in self.inner.rows.borrow().iter() {
-            if selected.contains(id) {
-                row.root.add_css_class("selected");
-            } else {
-                row.root.remove_css_class("selected");
+            Self::style_row(row, selected.contains(id), hovered == Some(*id));
+        }
+        *self.inner.styled.borrow_mut() = (selected, hovered);
+    }
+
+    /// Restyles only the rows whose selected/hovered state changed since
+    /// the last styling (hover moves touch two rows, not every row).
+    fn update_selection_styles(&self) {
+        let sel = self.inner.ctx.selection();
+        let (selected, hovered) = (sel.selected(), sel.hovered());
+        let changed = {
+            let (old_sel, old_hover) = &*self.inner.styled.borrow();
+            logic::restyle_ids(old_sel, *old_hover, &selected, hovered)
+        };
+        for id in changed {
+            if let Some(row) = self.row(id) {
+                Self::style_row(&row, selected.contains(&id), hovered == Some(id));
             }
-            if hovered == Some(*id) {
-                row.root.add_css_class("hovered");
-            } else {
-                row.root.remove_css_class("hovered");
-            }
+        }
+        *self.inner.styled.borrow_mut() = (selected, hovered);
+    }
+
+    fn style_row(row: &Row, selected: bool, hovered: bool) {
+        if selected {
+            row.root.add_css_class("selected");
+        } else {
+            row.root.remove_css_class("selected");
+        }
+        if hovered {
+            row.root.add_css_class("hovered");
+        } else {
+            row.root.remove_css_class("hovered");
         }
     }
 
@@ -1319,6 +1371,7 @@ impl Expressions {
                     ed.sync_all();
                 }
                 DocEvent::Colors => ed.sync_all(),
+                DocEvent::CommitEdits => ed.commit_dirty(),
                 DocEvent::Replaced => {
                     let rows: Vec<Rc<Row>> =
                         ed.inner.rows.borrow_mut().drain().map(|(_, r)| r).collect();
@@ -1331,11 +1384,20 @@ impl Expressions {
             }
         });
         self.inner.subs.borrow_mut().push(sub);
+        // Hidden (workspace switch, area change) with unsaved typing: the
+        // row would otherwise stay uncommitted and a save would write the
+        // old value.
         let weak = self.downgrade();
-        self.inner.ctx.selection().connect_changed(move |_| {
+        self.inner.root.connect_unmap(move |_| {
             if let Some(ed) = Expressions::from_weak(&weak) {
-                ed.apply_selection();
+                ed.commit_dirty();
             }
         });
+        self.inner
+            .ctx
+            .selection()
+            .connect_changed_for(self.downgrade(), |inner, _| {
+                Expressions { inner }.update_selection_styles();
+            });
     }
 }

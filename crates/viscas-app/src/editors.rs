@@ -235,13 +235,7 @@ fn empty_state(kind: EditorKind, ctx: &AppCtx) -> gtk::Box {
         .build();
     let weak_quip = quip.downgrade();
     ctx.preferences()
-        .connect_changed(move |p| match weak_quip.upgrade() {
-            Some(quip) => {
-                quip.set_visible(p.interface.playful);
-                true
-            }
-            None => false,
-        });
+        .connect_changed_for(weak_quip, |quip, p| quip.set_visible(p.interface.playful));
     let milestone = gtk::Label::builder()
         .label(format!("planned · {}", kind.milestone()))
         .halign(gtk::Align::Center)
@@ -282,13 +276,7 @@ fn canvas_placeholder(kind: EditorKind, ctx: &AppCtx) -> gtk::Widget {
     });
     let weak_canvas = canvas.downgrade();
     ctx.preferences()
-        .connect_changed(move |_| match weak_canvas.upgrade() {
-            Some(canvas) => {
-                canvas.queue_draw();
-                true
-            }
-            None => false,
-        });
+        .connect_changed_for(weak_canvas, |canvas, _| canvas.queue_draw());
     let overlay = gtk::Overlay::builder()
         .child(&canvas)
         .css_classes(["placeholder"])

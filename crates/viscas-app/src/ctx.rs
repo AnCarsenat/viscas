@@ -6,10 +6,16 @@
 //! [`crate::doc`]), the shared selection/hover model, and the command
 //! providers the palette queries.
 //! The area layout itself stays pure UI state owned by `Areas`.
+//!
+//! Listeners owned by a widget or editor are registered with a
+//! [`WeakGuard`] (`connect_*_for`): they are dropped as soon as the guard is
+//! dead — on the next notification *or* the next registration — so area
+//! churn cannot pile up dead listeners.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
+use gtk::glib;
 pub use viscas_scene::NodeId;
 
 use crate::commands::{Command, CommandProvider};
@@ -17,14 +23,120 @@ use crate::doc::EngineHandle;
 use crate::prefs::Preferences;
 use crate::theme::model::{self, Theme};
 
-/// A selection listener; returns `false` to disconnect.
-type SelectionListener = Rc<dyn Fn(&Selection) -> bool>;
+/// A weak handle that a listener is bound to (an editor's `Weak<Inner>`,
+/// a widget's `WeakRef`). The listener gets the upgraded handle and is
+/// disconnected once the handle is dead.
+pub trait WeakGuard: 'static {
+    type Strong;
+    fn upgrade_guard(&self) -> Option<Self::Strong>;
+    /// Whether the handle still upgrades (may be cheaper than upgrading).
+    fn is_alive(&self) -> bool {
+        self.upgrade_guard().is_some()
+    }
+}
 
-/// What changed in a [`Selection`] notification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Topic {
-    Selected,
-    Hovered,
+impl<T: 'static> WeakGuard for Weak<T> {
+    type Strong = Rc<T>;
+    fn upgrade_guard(&self) -> Option<Rc<T>> {
+        self.upgrade()
+    }
+    fn is_alive(&self) -> bool {
+        self.strong_count() > 0
+    }
+}
+
+impl<T: glib::object::ObjectType> WeakGuard for glib::WeakRef<T> {
+    type Strong = T;
+    fn upgrade_guard(&self) -> Option<T> {
+        self.upgrade()
+    }
+}
+
+/// One listener: `f` returns `false` to disconnect; `alive` (guarded
+/// listeners) tells whether it is still wanted without calling it.
+struct Listener<A: ?Sized> {
+    alive: Option<Rc<dyn Fn() -> bool>>,
+    f: Rc<dyn Fn(&A) -> bool>,
+}
+
+impl<A: ?Sized> Clone for Listener<A> {
+    fn clone(&self) -> Self {
+        Self {
+            alive: self.alive.clone(),
+            f: self.f.clone(),
+        }
+    }
+}
+
+impl<A: ?Sized> Listener<A> {
+    fn is_alive(&self) -> bool {
+        self.alive.as_ref().is_none_or(|a| a())
+    }
+}
+
+/// Listeners taking `&A`. Dead guarded listeners are pruned on every
+/// registration and notification.
+struct Listeners<A: ?Sized> {
+    list: RefCell<Vec<Listener<A>>>,
+}
+
+impl<A: ?Sized> Default for Listeners<A> {
+    fn default() -> Self {
+        Self {
+            list: RefCell::default(),
+        }
+    }
+}
+
+impl<A: ?Sized + 'static> Listeners<A> {
+    fn push(&self, l: Listener<A>) {
+        let mut list = self.list.borrow_mut();
+        list.retain(Listener::is_alive);
+        list.push(l);
+    }
+
+    fn connect(&self, f: impl Fn(&A) -> bool + 'static) {
+        self.push(Listener {
+            alive: None,
+            f: Rc::new(f),
+        });
+    }
+
+    fn connect_for<G: WeakGuard>(&self, guard: G, f: impl Fn(G::Strong, &A) + 'static) {
+        let guard = Rc::new(guard);
+        let g = guard.clone();
+        self.push(Listener {
+            alive: Some(Rc::new(move || g.is_alive())),
+            f: Rc::new(move |a| match guard.upgrade_guard() {
+                Some(s) => {
+                    f(s, a);
+                    true
+                }
+                None => false,
+            }),
+        });
+    }
+
+    /// Runs every live listener through `call` (which invokes it with the
+    /// argument) and drops the ones that are dead or ask to disconnect.
+    fn notify(&self, call: impl Fn(&dyn Fn(&A) -> bool) -> bool) {
+        // Clone first so a listener may connect further listeners.
+        let listeners = self.list.borrow().clone();
+        let dead: Vec<Listener<A>> = listeners
+            .into_iter()
+            .filter(|l| !l.is_alive() || !call(&*l.f))
+            .collect();
+        if !dead.is_empty() {
+            self.list
+                .borrow_mut()
+                .retain(|l| !dead.iter().any(|d| Rc::ptr_eq(&d.f, &l.f)));
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.list.borrow().len()
+    }
 }
 
 /// Observable selection and hover state, shared by every editor so that
@@ -38,7 +150,8 @@ enum Topic {
 pub struct Selection {
     selected: RefCell<Vec<NodeId>>,
     hovered: Cell<Option<NodeId>>,
-    listeners: RefCell<Vec<(Topic, SelectionListener)>>,
+    on_selected: Listeners<Selection>,
+    on_hovered: Listeners<Selection>,
 }
 
 impl Selection {
@@ -67,70 +180,72 @@ impl Selection {
         }
         if *self.selected.borrow() != unique {
             *self.selected.borrow_mut() = unique;
-            self.notify(Topic::Selected);
+            self.on_selected.notify(|f| f(self));
         }
     }
 
     pub fn set_hovered(&self, id: Option<NodeId>) {
         if self.hovered.replace(id) != id {
-            self.notify(Topic::Hovered);
+            self.on_hovered.notify(|f| f(self));
         }
     }
 
-    /// Calls `f` after every selection or hover change. Listeners get the
-    /// selection as an argument and must not capture the owning
-    /// [`AppCtx`] strongly.
+    /// Calls `f` after every selection or hover change, for the
+    /// context's whole lifetime: only for listeners living as long as the
+    /// window or app (widget-owned listeners use
+    /// [`Selection::connect_changed_for`] and friends). `f` must not
+    /// capture the owning [`AppCtx`] strongly.
     pub fn connect_changed(&self, f: impl Fn(&Selection) + 'static) {
         let f = Rc::new(f);
-        for topic in [Topic::Selected, Topic::Hovered] {
-            let f = f.clone();
-            self.push(topic, move |s| {
-                f(s);
-                true
-            });
-        }
+        let g = f.clone();
+        self.on_selected.connect(move |s| {
+            f(s);
+            true
+        });
+        self.on_hovered.connect(move |s| {
+            g(s);
+            true
+        });
+    }
+
+    /// Calls `f` with the upgraded `guard` after every selection or hover
+    /// change, while `guard` is alive.
+    pub fn connect_changed_for<G: WeakGuard + Clone>(
+        &self,
+        guard: G,
+        f: impl Fn(G::Strong, &Selection) + 'static,
+    ) {
+        let f = Rc::new(f);
+        let g = f.clone();
+        self.on_selected
+            .connect_for(guard.clone(), move |s, sel| f(s, sel));
+        self.on_hovered.connect_for(guard, move |s, sel| g(s, sel));
     }
 
     /// Calls `f` after the selected set (or its order) changed — not on
-    /// hover. `f` returns `false` to disconnect (e.g. its editor is gone).
-    pub fn connect_selection_changed(&self, f: impl Fn(&Selection) -> bool + 'static) {
-        self.push(Topic::Selected, f);
+    /// hover — while `guard` is alive.
+    pub fn connect_selection_for<G: WeakGuard>(
+        &self,
+        guard: G,
+        f: impl Fn(G::Strong, &Selection) + 'static,
+    ) {
+        self.on_selected.connect_for(guard, f);
     }
 
-    /// Calls `f` after the hovered node changed; `f` returns `false` to
-    /// disconnect.
-    pub fn connect_hover_changed(&self, f: impl Fn(&Selection) -> bool + 'static) {
-        self.push(Topic::Hovered, f);
-    }
-
-    fn push(&self, topic: Topic, f: impl Fn(&Selection) -> bool + 'static) {
-        self.listeners.borrow_mut().push((topic, Rc::new(f)));
-    }
-
-    fn notify(&self, topic: Topic) {
-        // Clone first so a listener may connect further listeners.
-        let listeners: Vec<SelectionListener> = self
-            .listeners
-            .borrow()
-            .iter()
-            .filter(|(t, _)| *t == topic)
-            .map(|(_, f)| f.clone())
-            .collect();
-        let dead: Vec<SelectionListener> = listeners.into_iter().filter(|f| !f(self)).collect();
-        if !dead.is_empty() {
-            self.listeners
-                .borrow_mut()
-                .retain(|(_, f)| !dead.iter().any(|d| Rc::ptr_eq(d, f)));
-        }
+    /// Calls `f` after the hovered node changed, while `guard` is alive.
+    pub fn connect_hover_for<G: WeakGuard>(
+        &self,
+        guard: G,
+        f: impl Fn(G::Strong, &Selection) + 'static,
+    ) {
+        self.on_hovered.connect_for(guard, f);
     }
 
     #[cfg(test)]
     fn listener_count(&self) -> usize {
-        self.listeners.borrow().len()
+        self.on_selected.len() + self.on_hovered.len()
     }
 }
-
-type PrefsListener = Rc<dyn Fn(&Preferences) -> bool>;
 
 /// Observable user preferences plus the themes available to choose from.
 ///
@@ -139,7 +254,7 @@ type PrefsListener = Rc<dyn Fn(&Preferences) -> bool>;
 #[derive(Default)]
 pub struct PrefsStore {
     prefs: RefCell<Preferences>,
-    listeners: RefCell<Vec<PrefsListener>>,
+    listeners: Listeners<Preferences>,
     user_themes: RefCell<Vec<Theme>>,
     /// Desktop color scheme: `Some(true)` for dark, `None` when unknown.
     system_dark: Cell<Option<bool>>,
@@ -199,22 +314,28 @@ impl PrefsStore {
     }
 
     /// Calls `f` after every change. `f` returns `false` to disconnect
-    /// (e.g. when the widget it updates is gone); it must not capture the
-    /// owning [`AppCtx`] strongly.
+    /// (prefer [`PrefsStore::connect_changed_for`] for widget-owned
+    /// listeners: dead ones are then pruned without waiting for a change);
+    /// it must not capture the owning [`AppCtx`] strongly.
     pub fn connect_changed(&self, f: impl Fn(&Preferences) -> bool + 'static) {
-        self.listeners.borrow_mut().push(Rc::new(f));
+        self.listeners.connect(f);
+    }
+
+    /// Calls `f` with the upgraded `guard` after every change, while
+    /// `guard` is alive (dropped on the next change or registration once
+    /// it is dead).
+    pub fn connect_changed_for<G: WeakGuard>(
+        &self,
+        guard: G,
+        f: impl Fn(G::Strong, &Preferences) + 'static,
+    ) {
+        self.listeners.connect_for(guard, f);
     }
 
     fn notify(&self) {
-        let listeners = self.listeners.borrow().clone();
         // Each listener gets a fresh snapshot: an earlier listener may have
         // changed the preferences again (which notifies on its own).
-        let dead: Vec<PrefsListener> = listeners.into_iter().filter(|f| !f(&self.get())).collect();
-        if !dead.is_empty() {
-            self.listeners
-                .borrow_mut()
-                .retain(|f| !dead.iter().any(|d| Rc::ptr_eq(d, f)));
-        }
+        self.listeners.notify(|f| f(&self.get()));
     }
 
     /// Built-in themes followed by the user's themes.
@@ -408,22 +529,58 @@ mod tests {
     fn hover_and_selection_notify_separately_and_dead_listeners_drop() {
         let sel = Selection::default();
         let (s_count, h_count) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let owner = Rc::new(());
         let c = s_count.clone();
-        sel.connect_selection_changed(move |_| {
-            c.set(c.get() + 1);
-            true
-        });
+        sel.connect_selection_for(Rc::downgrade(&owner), move |_, _| c.set(c.get() + 1));
         let c = h_count.clone();
-        sel.connect_hover_changed(move |_| {
-            c.set(c.get() + 1);
-            true
-        });
-        sel.connect_selection_changed(|_| false);
+        sel.connect_hover_for(Rc::downgrade(&owner), move |_, _| c.set(c.get() + 1));
+        let gone = Rc::new(());
+        let c = s_count.clone();
+        sel.connect_selection_for(Rc::downgrade(&gone), move |_, _| c.set(c.get() + 100));
+        drop(gone);
         sel.set_hovered(Some(NodeId(1)));
         assert_eq!((s_count.get(), h_count.get()), (0, 1));
         sel.set_selected([NodeId(2)]);
-        assert_eq!((s_count.get(), h_count.get()), (1, 1));
+        assert_eq!(
+            (s_count.get(), h_count.get()),
+            (1, 1),
+            "dead listener not called"
+        );
         assert_eq!(sel.listener_count(), 2, "the dead listener was dropped");
+    }
+
+    #[test]
+    fn dead_guarded_listeners_are_pruned_on_registration() {
+        // Area churn: editors come and go without any selection or
+        // preference change in between.
+        let sel = Selection::default();
+        let store = PrefsStore::default();
+        for _ in 0..50 {
+            let editor = Rc::new(());
+            sel.connect_changed_for(Rc::downgrade(&editor), |_, _| {});
+            store.connect_changed_for(Rc::downgrade(&editor), |_, _| {});
+            drop(editor);
+        }
+        let live = Rc::new(());
+        sel.connect_changed_for(Rc::downgrade(&live), |_, _| {});
+        store.connect_changed_for(Rc::downgrade(&live), |_, _| {});
+        assert_eq!(sel.listener_count(), 2, "one per topic");
+        assert_eq!(store.listeners.len(), 1);
+        drop(live);
+        sel.set_hovered(Some(NodeId(1)));
+        sel.set_selected([NodeId(1)]);
+        store.update(|p| p.interface.playful = !p.interface.playful);
+        assert_eq!(sel.listener_count(), 0);
+        assert_eq!(store.listeners.len(), 0);
+    }
+
+    #[test]
+    fn guarded_listener_gets_the_upgraded_handle() {
+        let store = PrefsStore::default();
+        let owner = Rc::new(Cell::new(0));
+        store.connect_changed_for(Rc::downgrade(&owner), |o, _| o.set(o.get() + 1));
+        store.update(|p| p.interface.playful = !p.interface.playful);
+        assert_eq!(owner.get(), 1);
     }
 
     #[test]
@@ -447,7 +604,7 @@ mod tests {
         store.update(|p| p.interface.playful = false);
         store.update(|p| p.interface.playful = false);
         assert_eq!(count.get(), 1);
-        assert_eq!(store.listeners.borrow().len(), 1);
+        assert_eq!(store.listeners.len(), 1);
         // Validation runs on every update.
         store.update(|p| p.interface.ui_scale = 50.0);
         assert_eq!(store.get().interface.ui_scale, 2.0);

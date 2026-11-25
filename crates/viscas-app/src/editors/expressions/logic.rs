@@ -181,9 +181,50 @@ pub fn drop_target(
     (!unchanged).then_some((parent, index))
 }
 
+/// Rows whose selected/hovered styling differs between two selection
+/// states (each id once): a hover move restyles two rows, not all.
+pub fn restyle_ids(
+    old_selected: &[NodeId],
+    old_hovered: Option<NodeId>,
+    selected: &[NodeId],
+    hovered: Option<NodeId>,
+) -> Vec<NodeId> {
+    let mut ids: Vec<NodeId> = Vec::new();
+    let mut add = |id: NodeId| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
+    for id in old_selected {
+        if !selected.contains(id) {
+            add(*id);
+        }
+    }
+    for id in selected {
+        if !old_selected.contains(id) {
+            add(*id);
+        }
+    }
+    if old_hovered != hovered {
+        old_hovered.into_iter().chain(hovered).for_each(add);
+    }
+    ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restyle_only_rows_whose_state_changed() {
+        let (a, b, c) = (NodeId(1), NodeId(2), NodeId(3));
+        assert!(restyle_ids(&[a], Some(b), &[a], Some(b)).is_empty());
+        assert_eq!(restyle_ids(&[a], Some(b), &[a], Some(c)), vec![b, c]);
+        assert_eq!(restyle_ids(&[a], None, &[b], None), vec![a, b]);
+        assert_eq!(restyle_ids(&[], None, &[a], Some(a)), vec![a]);
+        // Order changes alone do not change any row's style.
+        assert!(restyle_ids(&[a, b], None, &[b, a], None).is_empty());
+    }
 
     #[test]
     fn underline_only_for_the_reported_text() {
