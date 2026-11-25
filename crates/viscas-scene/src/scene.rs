@@ -787,6 +787,22 @@ impl Scene {
         }
     }
 
+    /// Mark for [`Scene::rollback_group_to`]: the number of edits
+    /// recorded so far in the open undo group.
+    pub fn group_mark(&self) -> usize {
+        self.history.group_len()
+    }
+
+    /// Reverts the open group's edits made after `mark`, leaving no trace
+    /// in the history: if nothing else is recorded, ending the group
+    /// commits nothing and the redo stack stays as it was.
+    pub fn rollback_group_to(&mut self, mark: usize) {
+        for c in self.history.truncate_group(mark).iter().rev() {
+            let r = self.apply(&c.inverse());
+            debug_assert!(r.is_ok(), "rollback failed: {r:?}");
+        }
+    }
+
     /// Run `f` inside one undo group.
     pub fn transaction<R>(&mut self, label: &str, f: impl FnOnce(&mut Scene) -> R) -> R {
         self.begin_group(label);

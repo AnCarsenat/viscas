@@ -16,11 +16,23 @@ const ICON_RESOURCE_PATH: &str = "/io/github/ancarsenat/Viscas/icons";
 /// copy (see the README) only matters to the desktop's launcher and task
 /// bar, which find the icon through the `.desktop` file.
 pub fn install_icon() {
-    gio::resources_register_include!("viscas.gresource").expect("embedded resources are valid");
+    register_resources();
     if let Some(display) = gtk::gdk::Display::default() {
-        gtk::IconTheme::for_display(&display).add_resource_path(ICON_RESOURCE_PATH);
+        let theme = gtk::IconTheme::for_display(&display);
+        theme.add_resource_path(ICON_RESOURCE_PATH);
+        if !theme.has_icon(APP_ID) {
+            gtk::glib::g_warning!("viscas", "the embedded app icon was not found");
+        }
     }
     gtk::Window::set_default_icon_name(APP_ID);
+}
+
+/// Registers the embedded GResource bundle (once per process).
+fn register_resources() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        gio::resources_register_include!("viscas.gresource").expect("embedded resources are valid");
+    });
 }
 
 /// Creates the application with all actions and accelerators installed.
@@ -106,4 +118,21 @@ fn show_shortcuts(app: &gtk::Application) {
         .modal(true)
         .build();
     dialog.show(app.active_window().as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The icon theme looks icons up as `<resource path>/<size>/apps/<id>`.
+    #[test]
+    fn icons_are_embedded_in_the_hicolor_layout() {
+        register_resources();
+        for name in [APP_ID.to_owned(), format!("{APP_ID}-symbolic")] {
+            let path = format!("{ICON_RESOURCE_PATH}/scalable/apps/{name}.svg");
+            let data = gio::resources_lookup_data(&path, gio::ResourceLookupFlags::NONE)
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert!(data.starts_with(b"<svg"), "{path}");
+        }
+    }
 }

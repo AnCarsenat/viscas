@@ -21,5 +21,3 @@ viscas-engine.workspace = true
 viscas-plot.workspace = true
 viscas-scene.workspace = true
 
-[build-dependencies]
-glib-build-tools.workspace = true

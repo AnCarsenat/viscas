@@ -51,6 +51,9 @@ pub enum ItemKind {
     /// The input was added to the board as this node (dependencies
     /// first, the input itself last).
     Added { node: NodeId },
+    /// The input is on the board already as this identical node; nothing
+    /// was added.
+    OnBoard { node: NodeId },
     /// A `:vars` entry.
     Variable { name: String, scene: bool },
     /// Help or status text (in `exact`).
@@ -139,6 +142,8 @@ pub(crate) struct ConsoleState {
     history: Vec<String>,
     /// The last successful non-command statement (for `:pin`).
     last: Option<String>,
+    /// The plan of the last automatic add ([`Engine::take_added_plan`]).
+    added_plan: Option<Vec<NodeContent>>,
 }
 
 impl ConsoleState {
@@ -208,6 +213,8 @@ impl Engine {
                 return;
             }
         };
+        // The whole input is one undo step, even with several statements.
+        self.scene_mut().begin_group("Console input");
         for stmt in &program.stmts {
             let (start, end) = (stmt.span.start, stmt.span.end);
             if !span_in(src, stmt.span) {
@@ -215,15 +222,22 @@ impl Engine {
             }
             let text = &src[start..end];
             let before = out.results.len();
-            if !self.console_statement(text, base + start, out) {
-                return;
+            let ok = self.console_statement(text, base + start, out) && {
+                self.console.last = Some(text.to_string());
+                !self.wants_auto_add(text, &out.results[before..], auto)
+                    || self.auto_add(before, out)
+            };
+            if !ok {
+                break;
             }
-            self.console.last = Some(text.to_string());
-            if self.wants_auto_add(text, &out.results[before..], auto)
-                && !self.auto_add(before, out)
-            {
-                return;
-            }
+        }
+        let changed = self.scene().in_group() && self.scene().group_mark() > 0;
+        self.scene_mut().end_group();
+        if out.error.is_some() && changed {
+            // Earlier statements stay on the board (one undo step).
+            out.results.push(ConsoleItem::info(
+                "the statements before the error are on the board (Undo removes them)",
+            ));
         }
     }
 
@@ -241,7 +255,11 @@ impl Engine {
             .line_content(text)
             .is_ok_and(|c| matches!(c.kind, NodeKind::Plot { .. } | NodeKind::Point { .. }));
         if draws {
-            return auto.plots || auto.values;
+            // A named point is a definition too (`P := (1, 2)`).
+            let defines = items
+                .iter()
+                .any(|i| matches!(i.kind, ItemKind::Definition { .. }));
+            return auto.plots || auto.values || (defines && auto.definitions);
         }
         items.iter().all(|i| match i.kind {
             ItemKind::Definition { .. } => auto.definitions,
@@ -254,10 +272,13 @@ impl Engine {
     /// Adds the last statement to the board, replacing its results (from
     /// index `from`) with the added nodes; `false` after an error.
     fn auto_add(&mut self, from: usize, out: &mut ConsoleOutput) -> bool {
-        match self.pin_plan().and_then(|plan| self.apply_pin_plan(plan)) {
-            Ok(ids) => {
+        let result = self.pin_plan().and_then(|plan| {
+            self.console.added_plan = Some(plan.clone());
+            self.add_pin_plan(plan)
+        });
+        match result {
+            Ok(items) => {
                 out.results.truncate(from);
-                let items = self.added_items(ids);
                 out.results.extend(items);
                 self.console.last = None;
                 true
@@ -276,6 +297,12 @@ impl Engine {
     /// it from a [`Engine::pin_plan`] snapshot already).
     pub fn forget_console_last(&mut self) {
         self.console.forget_pin();
+    }
+
+    /// The plan the last automatic add used (cleared by the call), so a
+    /// UI can offer to add the input again after an undo.
+    pub fn take_added_plan(&mut self) -> Option<Vec<NodeContent>> {
+        self.console.added_plan.take()
     }
 
     /// [`ItemKind::Added`] results for new nodes, with their values.
@@ -703,6 +730,7 @@ impl Engine {
         let last = plan.len().saturating_sub(1);
         let scene = self.scene_mut();
         scene.begin_group("Add to board from console");
+        let mark = scene.group_mark();
         let mut ids = Vec::new();
         let mut error = None;
         for (i, c) in plan.into_iter().enumerate() {
@@ -722,11 +750,12 @@ impl Engine {
                 }
             }
         }
+        if error.is_some() {
+            // Leaves no undo step and keeps the redo stack.
+            scene.rollback_group_to(mark);
+        }
         scene.end_group();
         if let Some(e) = error {
-            if !ids.is_empty() {
-                self.scene_mut().undo();
-            }
             self.update();
             return Err(e);
         }
@@ -737,9 +766,34 @@ impl Engine {
         Ok(ids)
     }
 
+    /// A scene node with the same name and definition as the input of
+    /// `plan` (its last entry), if any: adding it again would duplicate it.
+    pub fn existing_node(&self, plan: &[NodeContent]) -> Option<NodeId> {
+        let input = plan.last()?;
+        self.scene()
+            .iter()
+            .find(|n| n.name == input.name && n.kind == input.kind)
+            .map(|n| n.id)
+    }
+
+    /// Adds `plan` to the board ([`Engine::apply_pin_plan`]) and returns
+    /// the transcript items, or [`ItemKind::OnBoard`] without touching
+    /// the scene when an identical node is there already.
+    pub fn add_pin_plan(&mut self, plan: Vec<NodeContent>) -> Result<Vec<ConsoleItem>, String> {
+        if let Some(node) = self.existing_node(&plan) {
+            let mut items = self.added_items(vec![node]);
+            for i in &mut items {
+                i.kind = ItemKind::OnBoard { node };
+            }
+            return Ok(items);
+        }
+        let ids = self.apply_pin_plan(plan)?;
+        Ok(self.added_items(ids))
+    }
+
     fn cmd_pin(&mut self, out: &mut ConsoleOutput) {
-        let ids = match self.pin_plan().and_then(|plan| self.apply_pin_plan(plan)) {
-            Ok(ids) => ids,
+        match self.pin_plan().and_then(|plan| self.add_pin_plan(plan)) {
+            Ok(items) => out.results.extend(items),
             Err(message) => {
                 out.error = Some(ConsoleError {
                     message,
@@ -747,9 +801,7 @@ impl Engine {
                 });
                 return;
             }
-        };
-        let items = self.added_items(ids);
-        out.results.extend(items);
+        }
         self.console.last = None;
     }
 

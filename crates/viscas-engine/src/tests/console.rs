@@ -678,3 +678,120 @@ fn auto_add_multiple_statements() {
     assert_eq!(added(&out).len(), 2, "{out:?}");
     assert!(e.console_names().is_empty());
 }
+
+fn on_board(out: &ConsoleOutput) -> Vec<NodeId> {
+    assert!(out.error.is_none(), "{:?}", out.error);
+    out.results
+        .iter()
+        .filter_map(|i| match i.kind {
+            ItemKind::OnBoard { node } => Some(node),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn re_entering_a_plot_does_not_duplicate_it() {
+    let mut e = engine();
+    for input in ["y = x^2", "(1, 2)", ":plot r = θ"] {
+        let auto = if input.starts_with(':') {
+            AutoAdd::default()
+        } else {
+            PLOTS
+        };
+        let first_ids = added(&e.console_eval_with(input, auto));
+        assert_eq!(first_ids.len(), 1, "{input}");
+        let depth = e.scene().undo_depth();
+        let again = e.console_eval_with(input, auto);
+        assert_eq!(on_board(&again), first_ids, "{input}");
+        assert_eq!(e.scene().undo_depth(), depth, "no new undo step");
+    }
+    assert_eq!(e.scene().len(), 3);
+    // `:add` of a recalled duplicate is a no-op too.
+    e.console_eval("y = x^2");
+    assert_eq!(on_board(&e.console_eval(":add")).len(), 1);
+    assert_eq!(e.scene().len(), 3);
+}
+
+#[test]
+fn failed_add_leaves_scene_undo_and_redo_untouched() {
+    let mut e = engine();
+    e.add_line(None, "z := 1").unwrap();
+    assert!(e.undo());
+    assert!(e.scene().can_redo());
+    e.console_eval("k := 2");
+    e.console_eval("m := k + 1");
+    let plan = e.pin_plan().unwrap();
+    // The input's own name is taken by the time the plan is applied.
+    let m = e.add_line(None, "m := 0").unwrap();
+    e.scene_mut().undo();
+    e.scene_mut().redo();
+    assert!(e.scene().contains(m));
+    let depth = e.scene().undo_depth();
+    let redo = e.scene().redo_depth();
+    let len = e.scene().len();
+    assert!(e.apply_pin_plan(plan).is_err());
+    assert_eq!(e.scene().len(), len);
+    assert!(e.scene().lookup("k").is_none(), "dependency rolled back");
+    assert_eq!(e.scene().undo_depth(), depth);
+    assert_eq!(e.scene().redo_depth(), redo);
+}
+
+#[test]
+fn named_point_is_a_definition_for_auto_add() {
+    let mut e = engine();
+    let defs_only = AutoAdd {
+        plots: false,
+        definitions: true,
+        values: false,
+    };
+    assert_eq!(
+        added(&e.console_eval_with("P := (1, 2)", defs_only)).len(),
+        1
+    );
+    // A bare point is only a plot.
+    let out = e.console_eval_with("(3, 4)", defs_only);
+    assert!(added(&out).is_empty());
+}
+
+#[test]
+fn multi_statement_input_is_one_undo_step_even_on_error() {
+    let mut e = engine();
+    let depth = e.scene().undo_depth();
+    let out = e.console_eval_with("y = x^2; x^2 + y^2 = 1; bar + 1", PLOTS);
+    assert!(out.error.is_some());
+    assert_eq!(e.scene().len(), 2, "earlier statements stay");
+    assert!(
+        out.results
+            .iter()
+            .any(|i| i.kind == ItemKind::Info && i.exact.contains("before the error")),
+        "{out:?}"
+    );
+    assert_eq!(e.scene().undo_depth(), depth + 1);
+    assert!(e.undo());
+    assert!(e.scene().is_empty());
+}
+
+#[test]
+fn plot_definition_of_existing_node_updates_it() {
+    let mut e = engine();
+    let a = var(&mut e, "a", "1");
+    let out = e.console_eval(":plot a := 5");
+    assert!(matches!(first(&out).kind, ItemKind::UpdatedNode { node, .. } if node == a));
+    assert_eq!(exact(&e, a), "5");
+    assert_eq!(e.scene().len(), 1);
+}
+
+#[test]
+fn auto_added_plan_can_be_added_again_after_undo() {
+    let mut e = engine();
+    e.console_eval_with("k := 3", PLOTS);
+    added(&e.console_eval_with("y = k x", PLOTS));
+    let plan = e.take_added_plan().expect("plan of the auto add");
+    assert_eq!(plan.len(), 2);
+    assert!(e.take_added_plan().is_none());
+    assert!(e.undo());
+    assert!(e.scene().is_empty());
+    assert_eq!(e.add_pin_plan(plan).unwrap().len(), 2);
+    assert_eq!(e.scene().len(), 2);
+}

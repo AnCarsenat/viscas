@@ -130,7 +130,7 @@ pub static COMMAND_HELP: &[HelpEntry] = &[
     h(
         ":plot",
         ":plot input",
-        "evaluate the input and add it to the board (y = x^2, a := 3, (1, 2))",
+        "evaluate the input and add it to the board (y = x^2, (1, 2)); a := 5 updates an existing node a",
     ),
     h(
         ":pin",

@@ -156,7 +156,6 @@ impl History {
         if cmd.is_noop() {
             return;
         }
-        self.redo.clear();
         let coalescible = matches!(&cmd, Command::Update { key: Some(_), .. });
         if let Some(group) = &mut self.group {
             let merged = self.mergeable
@@ -168,8 +167,11 @@ impl History {
                 group.commands.push(cmd);
             }
             self.mergeable = coalescible;
+            // Redo is cleared when the group commits (a rolled-back
+            // group leaves it intact).
             return;
         }
+        self.redo.clear();
         let merged = self.mergeable
             && self
                 .undo
@@ -220,6 +222,7 @@ impl History {
         self.mergeable = false;
         match self.group.take() {
             Some(t) if !t.commands.is_empty() => {
+                self.redo.clear();
                 self.undo.push(t);
                 self.trim();
                 true
@@ -230,6 +233,21 @@ impl History {
 
     pub fn in_group(&self) -> bool {
         self.depth > 0
+    }
+
+    /// Commands recorded so far in the open group (0 outside groups).
+    pub fn group_len(&self) -> usize {
+        self.group.as_ref().map_or(0, |g| g.commands.len())
+    }
+
+    /// Removes the open group's commands after the first `mark` and
+    /// returns them, oldest first (the caller reverts them).
+    pub fn truncate_group(&mut self, mark: usize) -> Vec<Command> {
+        self.mergeable = false;
+        match &mut self.group {
+            Some(g) if g.commands.len() > mark => g.commands.split_off(mark),
+            _ => Vec::new(),
+        }
     }
 
     /// Close any open group (before undo/redo).
