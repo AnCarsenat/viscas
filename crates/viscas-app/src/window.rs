@@ -25,6 +25,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Viscas")
+        .icon_name(crate::app::APP_ID)
         .default_width(1440)
         .default_height(880)
         .width_request(480)

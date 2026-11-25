@@ -8,6 +8,21 @@ use crate::{prefs_window, settings, shortcuts, window};
 
 pub const APP_ID: &str = "io.github.ancarsenat.Viscas";
 
+/// GResource path of the embedded icons (hicolor layout below it).
+const ICON_RESOURCE_PATH: &str = "/io/github/ancarsenat/Viscas/icons";
+
+/// Registers the embedded app icon with the icon theme and makes it the
+/// default window icon. Works wherever the binary runs; an installed
+/// copy (see the README) only matters to the desktop's launcher and task
+/// bar, which find the icon through the `.desktop` file.
+pub fn install_icon() {
+    gio::resources_register_include!("viscas.gresource").expect("embedded resources are valid");
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::IconTheme::for_display(&display).add_resource_path(ICON_RESOURCE_PATH);
+    }
+    gtk::Window::set_default_icon_name(APP_ID);
+}
+
 /// Creates the application with all actions and accelerators installed.
 pub fn build() -> gtk::Application {
     let app = gtk::Application::builder().application_id(APP_ID).build();
@@ -28,6 +43,7 @@ pub fn build() -> gtk::Application {
 }
 
 fn setup(app: &gtk::Application, ctx: &AppCtx) {
+    install_icon();
     settings::init(ctx);
     crate::doc_ui::connect_prefs(ctx);
 
@@ -76,6 +92,7 @@ fn show_about(app: &gtk::Application) {
         )
         .modal(true)
         .build();
+    dialog.set_icon_name(Some(APP_ID));
     dialog.set_transient_for(app.active_window().as_ref());
     dialog.present();
 }
