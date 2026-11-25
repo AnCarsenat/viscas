@@ -13,6 +13,22 @@ use crate::fuzzy;
 
 /// Maximum number of rows shown at once.
 const MAX_ROWS: usize = 40;
+/// Recently run commands remembered for the empty query.
+const MAX_RECENT: usize = 8;
+
+thread_local! {
+    /// Ids of recently run commands, newest first.
+    static RECENT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Remembers `id` as the most recent command.
+fn remember(id: &str) {
+    RECENT.with_borrow_mut(|r| {
+        r.retain(|x| x != id);
+        r.insert(0, id.to_owned());
+        r.truncate(MAX_RECENT);
+    });
+}
 
 /// Handle to the palette. Cloning is cheap.
 #[derive(Clone)]
@@ -261,12 +277,10 @@ impl Palette {
         let Some(index) = index else {
             return;
         };
-        let run = self
-            .inner
-            .commands
-            .borrow()
-            .get(index)
-            .map(|c| c.run.clone());
+        let run = self.inner.commands.borrow().get(index).map(|c| {
+            remember(&c.id);
+            c.run.clone()
+        });
         self.close();
         if let Some(run) = run {
             // Run after the palette is hidden and the event is finished.
@@ -283,7 +297,18 @@ impl Palette {
             .ctx
             .preferences()
             .with(|p| p.effective_theme().ui.accent_text.to_rgb_hex());
-        let ranked = fuzzy::rank(&query, commands.iter().map(|c| c.title.as_str()));
+        let mut ranked = fuzzy::rank(&query, commands.iter().map(|c| c.title.as_str()));
+        if query.trim().is_empty() {
+            // Empty query: recent commands first, then window/app actions
+            // (the node, function and setting indexes need a query).
+            let recent = RECENT.with_borrow(|r| r.clone());
+            let pos = |i: usize| recent.iter().position(|id| *id == commands[i].id);
+            ranked.retain(|(i, _)| {
+                pos(*i).is_some()
+                    || !matches!(commands[*i].category, "Node" | "Function" | "Settings")
+            });
+            ranked.sort_by_key(|(i, _)| pos(*i).unwrap_or(usize::MAX));
+        }
         while let Some(child) = i.list.first_child() {
             i.list.remove(&child);
         }

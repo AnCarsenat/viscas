@@ -13,7 +13,7 @@ use crate::workspace::Workspace;
 /// Builds and returns the main window for `app`.
 pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     let areas = Areas::new(ctx, Workspace::Graph);
-    let (statusbar, selection_info, area_info, status_widgets) = build_statusbar();
+    let (statusbar, selection_info, status_widgets) = build_statusbar();
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -30,7 +30,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
         .default_height(880)
         .width_request(480)
         .height_request(320)
-        .titlebar(&build_topbar())
+        .titlebar(&build_topbar(ctx))
         .child(&overlay)
         .build();
 
@@ -40,9 +40,10 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     crate::compose::install(&window);
     install_actions(&window, &areas, &palette);
     crate::doc_ui::install(&window, ctx, &areas, status_widgets);
-    ctx.add_command_provider(WindowCommands::new(&window));
+    ctx.add_command_provider(WindowCommands::new(&window, ctx));
     ctx.add_command_provider(AreaCommands::new(&areas));
     ctx.add_command_provider(crate::editors::scene_tree::ops::NodeCommands::new(ctx));
+    crate::palette_sources::install(&window, ctx);
 
     if let Some(notice) = ctx.preferences().load_notice() {
         let label = gtk::Label::builder()
@@ -62,56 +63,22 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
         );
     }
 
-    let engine = ctx.engine().clone();
-    let update_selection = move |sel: &crate::ctx::Selection| {
-        let name = |id: crate::ctx::NodeId| {
-            engine
-                .with(|e| e.scene().get(id).and_then(|n| n.name.clone()))
-                .unwrap_or_else(|| format!("node {id}"))
-        };
-        let selected = sel.selected();
-        let text = match selected.len() {
-            0 => "Nothing selected".to_owned(),
-            1 => name(selected[0]),
-            n => format!("{n} nodes selected"),
-        };
-        let text = match sel.hovered() {
-            Some(id) => format!("{text}  ·  hover {}", name(id)),
-            None => text,
-        };
-        selection_info.set_label(&text);
-    };
-    update_selection(ctx.selection());
-    ctx.selection().connect_changed(update_selection);
-
-    let update_info = move |areas: &Areas| {
-        let layout = areas.layout();
-        let total = layout.leaves().len();
-        let text = match (areas.active_area(), areas.active_editor()) {
-            (Some(id), Some(kind)) => {
-                let pos = layout
-                    .leaves()
-                    .iter()
-                    .position(|(a, _)| *a == id)
-                    .map_or(0, |p| p + 1);
-                let max = if layout.maximized().is_some() {
-                    "  ·  maximized"
-                } else {
-                    ""
-                };
-                format!("{}  ·  area {pos}/{total}{max}", kind.title())
-            }
-            _ => String::new(),
-        };
-        area_info.set_label(&text);
-    };
-    update_info(&areas);
-    areas.connect_changed(update_info);
+    // Selection name · eval status · dirty marker (follows renames).
+    crate::status::connect(ctx, &selection_info);
+    let tip = selection_info.downgrade();
+    areas.connect_changed(move |areas| {
+        if let Some(label) = tip.upgrade() {
+            let text = areas
+                .active_editor()
+                .map(|k| format!("Active area: {}", k.title()));
+            label.set_tooltip_text(text.as_deref());
+        }
+    });
 
     window
 }
 
-fn build_topbar() -> gtk::HeaderBar {
+fn build_topbar(ctx: &AppCtx) -> gtk::HeaderBar {
     let header = gtk::HeaderBar::builder()
         .show_title_buttons(true)
         .css_classes(["topbar"])
@@ -141,7 +108,18 @@ fn build_topbar() -> gtk::HeaderBar {
         .css_classes(["app-menu", "flat"])
         .build();
     header.pack_start(&app_menu);
-    header.pack_start(&gtk::PopoverMenuBar::from_model(Some(&menubar())));
+    let show = ctx.preferences().with(|p| p.interface.show_unfinished);
+    let bar = gtk::PopoverMenuBar::from_model(Some(&menubar(show)));
+    // "Show unfinished editors" changes the Editor Type / Workspace menus.
+    let last = std::cell::Cell::new(show);
+    ctx.preferences()
+        .connect_changed_for(bar.downgrade(), move |bar, p| {
+            let show = p.interface.show_unfinished;
+            if last.replace(show) != show {
+                bar.set_menu_model(Some(&menubar(show)));
+            }
+        });
+    header.pack_start(&bar);
 
     // Workspace tabs, radio-like through the stateful `win.workspace` action.
     let tabs = gtk::Box::builder()
@@ -162,6 +140,7 @@ fn build_topbar() -> gtk::HeaderBar {
                     .unwrap_or_default()
             ))
             .build();
+        crate::editors::bind_shown(&tab, ctx, move |p| crate::editors::workspace_shown(ws, p));
         tabs.append(&tab);
     }
     header.set_title_widget(Some(&tabs));
@@ -214,7 +193,8 @@ fn app_menu() -> gio::Menu {
     menu
 }
 
-fn menubar() -> gio::Menu {
+/// The menu bar; `show_unfinished` lists unfinished editors/workspaces.
+fn menubar(show_unfinished: bool) -> gio::Menu {
     // Items pointing at unregistered actions render insensitive; they are
     // placeholders for the document milestone (M8).
     let file = gio::Menu::new();
@@ -256,14 +236,20 @@ fn menubar() -> gio::Menu {
     area.append(Some("_Close Area"), Some("win.close-area"));
     area.append(Some("_Maximize Area"), Some("win.maximize-area"));
     let editors = gio::Menu::new();
-    for kind in EditorKind::ALL {
+    for kind in EditorKind::ALL
+        .into_iter()
+        .filter(|k| show_unfinished || !crate::editors::is_unfinished(*k))
+    {
         editors.append(
             Some(kind.title()),
             Some(&format!("win.editor::{}", kind.id())),
         );
     }
     let workspaces = gio::Menu::new();
-    for ws in Workspace::ALL {
+    for ws in Workspace::ALL
+        .into_iter()
+        .filter(|w| show_unfinished || !crate::editors::is_unfinished_workspace(*w))
+    {
         workspaces.append(
             Some(ws.title()),
             Some(&format!("win.workspace::{}", ws.id())),
@@ -287,14 +273,9 @@ fn menubar() -> gio::Menu {
     bar
 }
 
-/// Status bar; returns it with the selection and active-area labels and
-/// the widgets the document code updates (clickable mode chips, status).
-fn build_statusbar() -> (
-    gtk::Box,
-    gtk::Label,
-    gtk::Label,
-    crate::doc_ui::StatusWidgets,
-) {
+/// Status bar; returns it with the selection label and the widgets the
+/// document code updates (clickable mode chips, status).
+fn build_statusbar() -> (gtk::Box, gtk::Label, crate::doc_ui::StatusWidgets) {
     let bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
@@ -320,9 +301,6 @@ fn build_statusbar() -> (
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     let selection_info = gtk::Label::builder().css_classes(["dim"]).build();
     bar.append(&selection_info);
-    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    let area_info = gtk::Label::builder().css_classes(["faint"]).build();
-    bar.append(&area_info);
 
     let spacer = gtk::Box::builder().hexpand(true).build();
     bar.append(&spacer);
@@ -355,7 +333,7 @@ fn build_statusbar() -> (
         angle_chip,
         status: status_label,
     };
-    (bar, selection_info, area_info, widgets)
+    (bar, selection_info, widgets)
 }
 
 /// Space opens the palette like Blender's search, unless focus is in a

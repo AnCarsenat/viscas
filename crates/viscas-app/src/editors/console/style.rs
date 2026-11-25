@@ -96,13 +96,14 @@ button.console-node-link:hover {
   text-decoration: underline;
 }
 button.console-add {
-  min-height: 16px;
-  padding: 0 6px;
+  min-height: 18px;
+  padding: 0 8px;
   border-radius: 3px;
   font-size: 11px;
+  font-weight: 600;
   color: @vx_ui_accent_text;
-  background: none;
-  border: 1px dashed alpha(@vx_ui_accent, 0.45);
+  background: alpha(@vx_ui_accent, 0.10);
+  border: 1px solid alpha(@vx_ui_accent, 0.55);
   box-shadow: none;
 }
 button.console-add:hover { background: alpha(@vx_ui_accent, 0.14); border-style: solid; }
@@ -124,7 +125,26 @@ button.console-add:hover { background: alpha(@vx_ui_accent, 0.14); border-style:
   border-top: 1px solid @vx_ui_line;
   padding: 5px 8px 6px 6px;
 }
-.console-input-bar.focused { border-top-color: alpha(@vx_console_prompt, 0.55); }
+.console-field {
+  min-height: 28px;
+  padding: 0 8px 0 6px;
+  border-radius: 4px;
+  background: alpha(@vx_ui_tint, 0.06);
+  border: 1px solid @vx_ui_line;
+}
+.console-input-bar.focused .console-field {
+  border-color: @vx_ui_accent;
+  box-shadow: 0 0 0 1px alpha(@vx_ui_accent, 0.45);
+}
+.console-field .console-prompt { margin-top: 6px; }
+.console-field textview.console-input { margin-top: 6px; margin-bottom: 5px; }
+.console-placeholder {
+  font-family: __MONO__;
+  font-size: 12px;
+  color: alpha(@vx_ui_fg_dim, 0.75);
+  margin-top: 6px;
+}
+.console-examples { padding: 2px 8px 0 8px; }
 textview.console-input:focus-visible { outline: none; }
 textview.console-input,
 textview.console-input > text {

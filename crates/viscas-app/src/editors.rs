@@ -17,9 +17,78 @@ use gtk::prelude::*;
 use gtk::{cairo, gio};
 
 use crate::ctx::AppCtx;
-use crate::layout::EditorKind;
+use crate::layout::{EditorKind, Layout};
+use crate::prefs::Preferences;
 use crate::theme::model::{Color, GraphColors};
 use crate::viewport::Viewport;
+use crate::workspace::Workspace;
+
+/// Editors that only show an empty state so far.
+pub fn is_unfinished(kind: EditorKind) -> bool {
+    matches!(
+        kind,
+        EditorKind::Sheet | EditorKind::Script | EditorKind::DependencyGraph
+    )
+}
+
+/// Workspaces built around unfinished editors.
+pub fn is_unfinished_workspace(ws: Workspace) -> bool {
+    matches!(ws, Workspace::Data | Workspace::Script)
+}
+
+/// Whether `kind` is offered in tabs, menus and the palette.
+pub fn editor_shown(kind: EditorKind, prefs: &Preferences) -> bool {
+    prefs.interface.show_unfinished || !is_unfinished(kind)
+}
+
+/// Whether the workspace tab is offered.
+pub fn workspace_shown(ws: Workspace, prefs: &Preferences) -> bool {
+    prefs.interface.show_unfinished || !is_unfinished_workspace(ws)
+}
+
+/// The built editor shown instead of an unfinished one.
+pub fn substitute(kind: EditorKind) -> EditorKind {
+    match kind {
+        EditorKind::Sheet => EditorKind::Expressions,
+        EditorKind::Script => EditorKind::Console,
+        EditorKind::DependencyGraph => EditorKind::Viewport,
+        other => other,
+    }
+}
+
+/// The layout as displayed: a copy with unfinished editors swapped for
+/// built ones unless `show_unfinished` (the stored layout never changes).
+pub fn displayed_layout(layout: &Layout, show_unfinished: bool) -> Layout {
+    let mut shown = layout.clone();
+    if !show_unfinished {
+        replace_unfinished(&mut shown);
+    }
+    shown
+}
+
+/// Swaps unfinished editors of `layout` for built ones; returns whether
+/// anything changed.
+fn replace_unfinished(layout: &mut Layout) -> bool {
+    let mut changed = false;
+    for (id, kind) in layout.leaves() {
+        if is_unfinished(kind) {
+            changed |= layout.set_editor(id, substitute(kind));
+        }
+    }
+    changed
+}
+
+/// Keeps `widget` visible only while `shown(preferences)` holds.
+pub fn bind_shown(
+    widget: &impl IsA<gtk::Widget>,
+    ctx: &AppCtx,
+    shown: impl Fn(&Preferences) -> bool + 'static,
+) {
+    let widget = widget.as_ref().clone();
+    widget.set_visible(ctx.preferences().with(&shown));
+    ctx.preferences()
+        .connect_changed_for(widget.downgrade(), move |w, p| w.set_visible(shown(p)));
+}
 
 /// Candidate symbolic icons, most preferred first. Icon themes differ
 /// (Adwaita, Breeze, ...), so several names are tried.
@@ -178,11 +247,9 @@ fn header_menus(kind: EditorKind) -> &'static [(&'static str, &'static [&'static
         EditorKind::SceneTree | EditorKind::Inspector => &[],
         // Console and Expressions put their tools in the header directly.
         EditorKind::Console | EditorKind::Expressions => &[],
-        EditorKind::Sheet => &[("Table", &["Add Column", "Import CSV", "Export CSV"])],
-        EditorKind::Script => &[("Run", &["Run Script", "Stop"])],
-        EditorKind::DependencyGraph => {
-            &[("View", &["Frame All", "Show Upstream", "Show Downstream"])]
-        }
+        // Unfinished editors get their menus with their features (no
+        // dead, insensitive menus meanwhile).
+        EditorKind::Sheet | EditorKind::Script | EditorKind::DependencyGraph => &[],
     }
 }
 
@@ -237,9 +304,10 @@ fn empty_state(kind: EditorKind, ctx: &AppCtx) -> gtk::Box {
     ctx.preferences()
         .connect_changed_for(weak_quip, |quip, p| quip.set_visible(p.interface.playful));
     let milestone = gtk::Label::builder()
-        .label(format!("planned · {}", kind.milestone()))
+        .label("Coming in a later version")
+        .tooltip_text(format!("Planned for milestone {}", kind.milestone()))
         .halign(gtk::Align::Center)
-        .css_classes(["milestone", "mono"])
+        .css_classes(["placeholder-quip", "coming-later"])
         .build();
     column.append(&icon);
     column.append(&title);
@@ -358,4 +426,38 @@ fn capsule(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
     cr.arc(x + w - r, y + r, r, -PI / 2.0, PI / 2.0);
     cr.arc(x + r, y + r, r, PI / 2.0, 3.0 * PI / 2.0);
     cr.close_path();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::IdGen;
+
+    #[test]
+    fn unfinished_editors_are_swapped_for_built_ones() {
+        for ws in Workspace::ALL {
+            let mut layout = ws.default_layout(&mut IdGen::default());
+            replace_unfinished(&mut layout);
+            assert!(
+                layout.leaves().iter().all(|(_, k)| !is_unfinished(*k)),
+                "{ws:?}"
+            );
+            assert!(!replace_unfinished(&mut layout), "idempotent");
+        }
+        // View-only: the stored layout (what documents save) keeps its
+        // Sheet area; only the displayed copy swaps it.
+        let stored = Workspace::Data.default_layout(&mut IdGen::default());
+        let before = serde_json::to_value(&stored).unwrap();
+        let shown = displayed_layout(&stored, false);
+        assert!(shown.leaves().iter().all(|(_, k)| !is_unfinished(*k)));
+        assert_eq!(serde_json::to_value(&stored).unwrap(), before);
+        assert!(stored.leaves().iter().any(|(_, k)| *k == EditorKind::Sheet));
+        assert_eq!(displayed_layout(&stored, true), stored);
+        let mut prefs = Preferences::default();
+        assert!(!prefs.interface.show_unfinished, "off by default");
+        assert!(!workspace_shown(Workspace::Data, &prefs));
+        assert!(editor_shown(EditorKind::Console, &prefs));
+        prefs.interface.show_unfinished = true;
+        assert!(editor_shown(EditorKind::Sheet, &prefs));
+    }
 }

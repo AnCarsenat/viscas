@@ -772,7 +772,11 @@ impl Engine {
         let input = plan.last()?;
         self.scene()
             .iter()
-            .find(|n| n.name == input.name && n.kind == input.kind)
+            // A name only identifies defining kinds; a plot is the same
+            // plot whatever its label.
+            .find(|n| {
+                n.kind == input.kind && (n.name == input.name || !input.kind.defines_by_name())
+            })
             .map(|n| n.id)
     }
 

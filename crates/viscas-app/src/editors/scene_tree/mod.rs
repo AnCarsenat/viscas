@@ -294,16 +294,32 @@ impl SceneTree {
         };
         bar.append(&add);
         bar.append(&search);
-        bar.append(&tool(
-            &["view-list-tree-symbolic", "pan-down-symbolic"],
-            "Expand All",
-            "tree.expand-all",
-        ));
-        bar.append(&tool(
+        // One toggle: collapse everything, or expand everything again.
+        let toggle = tool(
             &["view-list-bullet-symbolic", "pan-end-symbolic"],
             "Collapse All",
             "tree.collapse-all",
-        ));
+        );
+        toggle.connect_clicked(|b| {
+            let collapse = b.action_name().as_deref() == Some("tree.collapse-all");
+            let (icons, tip, action): (&'static [&'static str], _, _) = if collapse {
+                (
+                    &["view-list-tree-symbolic", "pan-down-symbolic"],
+                    "Expand All",
+                    "tree.expand-all",
+                )
+            } else {
+                (
+                    &["view-list-bullet-symbolic", "pan-end-symbolic"],
+                    "Collapse All",
+                    "tree.collapse-all",
+                )
+            };
+            b.set_icon_name(pick_icon(icons));
+            b.set_tooltip_text(Some(tip));
+            b.set_action_name(Some(action));
+        });
+        bar.append(&toggle);
         bar
     }
 
@@ -988,9 +1004,10 @@ impl SceneTree {
         let filter = self.inner.filter.borrow().clone();
         let text = if n == 0 {
             if playful {
-                "No nodes yet. Every tree starts as a seed.\nPlant one with +".to_owned()
+                "No nodes yet. Every tree starts as a seed.\nType in the Console, or press +."
+                    .to_owned()
             } else {
-                "No nodes. Add one with +".to_owned()
+                "No nodes. Type in the Console, or press +.".to_owned()
             }
         } else if self.inner.flat.get() && self.inner.roots.n_items() == 0 {
             if playful {
@@ -1272,7 +1289,9 @@ impl SceneTree {
         let (name, locked) = self.inner.ctx.engine().with(|e| {
             let n = e.scene().get(id);
             (
-                n.and_then(|n| n.name.clone()).unwrap_or_default(),
+                n.and_then(|n| n.name.clone())
+                    .or_else(|| e.scene().auto_label(id))
+                    .unwrap_or_default(),
                 n.is_some_and(|n| n.locked),
             )
         });

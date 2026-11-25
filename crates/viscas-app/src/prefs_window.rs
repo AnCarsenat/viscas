@@ -447,6 +447,7 @@ fn page() -> gtk::Box {
 
 fn interface_page(b: &Binder) -> gtk::Box {
     let page = page();
+    page.append(appearance_panel(b).widget());
 
     let display = Panel::new("Display", true);
     let scale = b.scrub(
@@ -503,8 +504,145 @@ fn interface_page(b: &Binder) -> gtk::Box {
     );
     playful.set_tooltip_text(Some("Show the light-hearted one-liners in empty editors"));
     editors.append(&playful);
+    let unfinished = b.check(
+        "Show Unfinished Editors",
+        |p| p.interface.show_unfinished,
+        |p, v| p.interface.show_unfinished = v,
+    );
+    unfinished.set_tooltip_text(Some(
+        "List the Data and Script workspaces and the editors that are not built yet \
+         (Sheet, Script, Dependency Graph)",
+    ));
+    editors.append(&unfinished);
     page.append(editors.widget());
     page
+}
+
+/// Which appearance the segmented control shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Appearance {
+    Dark,
+    Light,
+    System,
+}
+
+fn appearance_of(p: &Preferences) -> Appearance {
+    if p.system.follow_system {
+        Appearance::System
+    } else if p.theme.dark {
+        Appearance::Dark
+    } else {
+        Appearance::Light
+    }
+}
+
+/// Appearance: Dark / Light / System segmented buttons and accent dots
+/// (the per-color swatches live under Themes ▸ Advanced Theme Editing).
+fn appearance_panel(b: &Binder) -> Panel {
+    let panel = Panel::new("Appearance", true);
+    let segments = gtk::Box::builder()
+        .css_classes(["linked", "segmented"])
+        .build();
+    let mut first: Option<gtk::ToggleButton> = None;
+    for (mode, label, tip) in [
+        (Appearance::Dark, "Dark", "Viscas Dark theme"),
+        (Appearance::Light, "Light", "Viscas Light theme"),
+        (
+            Appearance::System,
+            "System",
+            "Follow the desktop's light/dark setting (pair set in System)",
+        ),
+    ] {
+        let button = gtk::ToggleButton::builder()
+            .label(label)
+            .tooltip_text(tip)
+            .hexpand(true)
+            .build();
+        if let Some(f) = &first {
+            button.set_group(Some(f));
+        } else {
+            first = Some(button.clone());
+        }
+        let binder = b.clone();
+        button.connect_toggled(move |t| {
+            if !t.is_active() {
+                return;
+            }
+            let ctx = binder.ctx.clone();
+            match mode {
+                Appearance::System => binder.update(|p| p.system.follow_system = true),
+                Appearance::Dark | Appearance::Light => {
+                    let name = if mode == Appearance::Dark {
+                        crate::theme::model::DARK_NAME
+                    } else {
+                        crate::theme::model::LIGHT_NAME
+                    };
+                    let theme = ctx
+                        .preferences()
+                        .themes()
+                        .into_iter()
+                        .find(|t| t.name == name);
+                    if let Some(theme) = theme {
+                        binder.update_theme(|p| {
+                            if p.themes.preset != name {
+                                p.theme = theme;
+                                p.themes.preset = name.to_owned();
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        let t = button.clone();
+        b.on_refresh(move |p| {
+            let on = appearance_of(p) == mode;
+            if t.is_active() != on {
+                t.set_active(on);
+            }
+        });
+        segments.append(&button);
+    }
+    panel.append(&property_row("Appearance", &segments));
+
+    let dots = gtk::Box::builder().spacing(6).build();
+    for accent in Accent::ALL {
+        let dot = gtk::Button::builder()
+            .tooltip_text(accent.title())
+            .css_classes(["accent-dot"])
+            .valign(gtk::Align::Center)
+            .build();
+        let area = gtk::DrawingArea::builder()
+            .content_width(14)
+            .content_height(14)
+            .can_target(false)
+            .build();
+        let ctx = b.ctx.clone();
+        area.set_draw_func(move |_, cr, w, h| {
+            let color = accent
+                .color()
+                .unwrap_or_else(|| ctx.preferences().with(|p| p.theme.ui.accent));
+            let (r, g, bl, _) = color.rgba_f64();
+            let (cx, cy) = (f64::from(w) / 2.0, f64::from(h) / 2.0);
+            cr.arc(cx, cy, cx.min(cy) - 1.0, 0.0, std::f64::consts::TAU);
+            cr.set_source_rgb(r, g, bl);
+            let _ = cr.fill();
+        });
+        dot.set_child(Some(&area));
+        let binder = b.clone();
+        dot.connect_clicked(move |_| binder.update(|p| p.themes.accent = accent));
+        let (d, a) = (dot.clone(), area.clone());
+        b.on_refresh(move |p| {
+            if p.themes.accent == accent {
+                d.add_css_class("current");
+            } else {
+                d.remove_css_class("current");
+            }
+            a.queue_draw();
+        });
+        dots.append(&dot);
+    }
+    panel.append(&property_row("Accent", &dots));
+    panel
 }
 
 /// Dropdown of the installed monospace families ("Default" first).
@@ -653,6 +791,8 @@ fn themes_page(b: &Binder) -> gtk::Box {
     presets.append(&property_row("Theme File", &files));
     page.append(presets.widget());
 
+    // Per-color swatches: power-user territory, folded away by default.
+    let advanced = Panel::new("Advanced Theme Editing", false);
     for (i, (title, section, fields)) in SECTIONS.iter().enumerate() {
         let panel = Panel::new(title, i == 0);
         for field in *fields {
@@ -671,8 +811,9 @@ fn themes_page(b: &Binder) -> gtk::Box {
             b.on_refresh(move |p| s.set_color(get(&p.effective_theme())));
             panel.append(&property_row(field.label, swatch.widget()));
         }
-        page.append(panel.widget());
+        advanced.append(panel.widget());
     }
+    page.append(advanced.widget());
     page
 }
 

@@ -72,8 +72,28 @@ impl Areas {
                 listeners: RefCell::default(),
             }),
         };
+        // "Show unfinished editors" off: hidden editors and workspaces are
+        // swapped out on the next rebuild.
+        let last = Cell::new(ctx.preferences().with(|p| p.interface.show_unfinished));
+        ctx.preferences()
+            .connect_changed_for(Rc::downgrade(&areas.inner), move |inner, p| {
+                if last.replace(p.interface.show_unfinished) != p.interface.show_unfinished {
+                    Areas { inner }.schedule_rebuild();
+                }
+            });
         areas.rebuild();
         areas
+    }
+
+    /// "Show unfinished editors" is off: unfinished workspaces and
+    /// editors are only *displayed* as built ones (view-only; the stored
+    /// layouts and workspace, and so saved documents, keep them).
+    fn hiding_unfinished(&self) -> bool {
+        !self
+            .inner
+            .ctx
+            .preferences()
+            .with(|p| p.interface.show_unfinished)
     }
 
     fn downgrade(&self) -> WeakAreas {
@@ -84,8 +104,15 @@ impl Areas {
         self.inner.root.upcast_ref()
     }
 
+    /// The workspace on screen (Graph stands in for an unfinished one
+    /// while those are hidden).
     pub fn workspace(&self) -> Workspace {
-        self.inner.workspace.get()
+        let ws = self.inner.workspace.get();
+        if editors::is_unfinished_workspace(ws) && self.hiding_unfinished() {
+            Workspace::Graph
+        } else {
+            ws
+        }
     }
 
     /// Calls `f` after every change of workspace, layout or active area.
@@ -148,7 +175,7 @@ impl Areas {
     }
 
     pub fn set_workspace(&self, workspace: Workspace) {
-        if workspace == self.workspace() {
+        if workspace == self.inner.workspace.get() {
             return;
         }
         self.inner.workspace.set(workspace);
@@ -215,7 +242,7 @@ impl Areas {
         let layouts = self.inner.layouts.borrow();
         let blob = LayoutBlob {
             version: LayoutBlob::VERSION,
-            workspace: self.workspace().id().to_owned(),
+            workspace: self.inner.workspace.get().id().to_owned(),
             layouts: layouts
                 .iter()
                 .map(|(ws, l)| (ws.id().to_owned(), l.clone()))
@@ -297,7 +324,7 @@ impl Areas {
         }
         self.inner.area_widgets.borrow_mut().clear();
 
-        let layout = self.layout();
+        let layout = editors::displayed_layout(&self.layout(), !self.hiding_unfinished());
         let tree = self.build_node(&layout, layout.visible_root());
         root.append(&tree);
 
@@ -606,7 +633,11 @@ impl Areas {
         };
 
         list.append(&heading("EDITOR TYPE"));
+        let prefs = self.inner.ctx.preferences().get();
         for kind in EditorKind::ALL {
+            if !editors::editor_shown(kind, &prefs) && kind != current {
+                continue;
+            }
             let button = item(
                 editors::icon_name(kind),
                 kind.title(),

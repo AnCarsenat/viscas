@@ -102,3 +102,43 @@ fn features_follow_variable_changes() {
             .any(|h| h.feature.kind == FeatureKind::Root && (h.feature.pos.x - 2.0).abs() < 1e-9)
     );
 }
+
+#[test]
+fn node_features_lists_roots_extrema_and_intersections_by_x() {
+    let mut e = engine();
+    let (ids, _) = plotted(&mut e, &["y = x^2 - 1", "y = 3"]);
+    let hits = e.node_features(ids[0], None);
+    let roots: Vec<f64> = hits
+        .iter()
+        .filter(|h| h.feature.kind == FeatureKind::Root)
+        .map(|h| h.feature.pos.x)
+        .collect();
+    assert_eq!(roots.len(), 2);
+    assert!(roots[0] < roots[1], "sorted by x");
+    assert!(hits.iter().any(|h| h.feature.kind == FeatureKind::Minimum));
+    let crossings = |hits: &[crate::FeatureHit]| {
+        hits.iter()
+            .filter(|h| h.feature.kind == FeatureKind::Intersection)
+            .count()
+    };
+    assert_eq!(crossings(&hits), 2);
+    // The other curve lists the same intersections.
+    assert_eq!(crossings(&e.node_features(ids[1], None)), 2);
+}
+
+#[test]
+fn new_plot_nodes_get_display_only_auto_labels() {
+    let mut e = engine();
+    let a = plot(&mut e, "y = x");
+    let b = plot(&mut e, "x^2 + y^2 = 4");
+    let c = plot(&mut e, "y < x");
+    let label = |id| e.scene().auto_label(id);
+    assert_eq!(label(a).as_deref(), Some("Plot1"));
+    assert_eq!(label(b).as_deref(), Some("Circle1"));
+    assert_eq!(label(c).as_deref(), Some("Region1"));
+    assert!(
+        [a, b, c]
+            .iter()
+            .all(|id| e.scene().get(*id).unwrap().name.is_none())
+    );
+}

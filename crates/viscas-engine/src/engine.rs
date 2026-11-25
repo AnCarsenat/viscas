@@ -103,6 +103,13 @@ pub struct FeatureHit {
     pub distance: f64,
 }
 
+/// A [`Engine::node_features_task`]: run `run` on any thread.
+pub struct NodeFeaturesTask {
+    /// Equal keys give equal results.
+    pub key: Vec<u64>,
+    pub run: Box<dyn FnOnce() -> Vec<FeatureHit> + Send>,
+}
+
 /// Result of [`Engine::request_features`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeaturesResult {
@@ -884,6 +891,66 @@ impl Engine {
         };
         let opts = self.feature_options(CancelToken::none());
         compute_features(&self.feature_curves(None), view, point, radius, &opts)
+    }
+
+    /// Every feature of `node` (roots, extrema, y-intercept and its
+    /// intersections with other curves) within the view of a plotted
+    /// viewport (`viewport`, else the lowest-numbered one), sorted by x.
+    /// Bounded like [`Engine::features_near`]; runs on the calling thread
+    /// (UI code uses [`Engine::node_features_task`]).
+    pub fn node_features(&self, node: NodeId, viewport: Option<ViewportId>) -> Vec<FeatureHit> {
+        self.node_features_task(node, viewport)
+            .map(|t| (t.run)())
+            .unwrap_or_default()
+    }
+
+    /// [`Engine::node_features`] as a task to run off the UI thread, with
+    /// a key that changes when the result may (the view, or a revision of
+    /// any plotted node). `None` when no viewport was plotted yet.
+    pub fn node_features_task(
+        &self,
+        node: NodeId,
+        viewport: Option<ViewportId>,
+    ) -> Option<NodeFeaturesTask> {
+        let vp = viewport
+            .filter(|v| self.viewport_view(*v).is_some())
+            .or_else(|| {
+                let mut ids: Vec<ViewportId> = self
+                    .viewports
+                    .iter()
+                    .filter(|(_, s)| s.view.is_some())
+                    .map(|(id, _)| *id)
+                    .collect();
+                ids.sort_unstable();
+                ids.first().copied()
+            })?;
+        let view = self.viewport_view(vp)?;
+        let b = view.bounds();
+        let mut key = vec![
+            node.0,
+            b.x_min.to_bits(),
+            b.x_max.to_bits(),
+            b.y_min.to_bits(),
+            b.y_max.to_bits(),
+        ];
+        for it in self.plot_items() {
+            key.extend([it.node.0, it.revision]);
+        }
+        let curves = self.feature_curves(None);
+        let opts = self.feature_options(CancelToken::none());
+        let center = Vec2::new((b.x_min + b.x_max) / 2.0, (b.y_min + b.y_max) / 2.0);
+        Some(NodeFeaturesTask {
+            key,
+            run: Box::new(move || {
+                let mut hits: Vec<FeatureHit> =
+                    compute_features(&curves, view, center, f64::INFINITY, &opts)
+                        .into_iter()
+                        .filter(|h| h.node == node || h.other == Some(node))
+                        .collect();
+                hits.sort_by(|a, b| a.feature.pos.x.total_cmp(&b.feature.pos.x));
+                hits
+            }),
+        })
     }
 
     /// [`Engine::features_near`] on the worker pool. A newer request

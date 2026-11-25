@@ -8,6 +8,7 @@ use gtk::prelude::*;
 pub struct Panel {
     root: gtk::Box,
     body: gtk::Box,
+    revealer: gtk::Revealer,
 }
 
 impl Panel {
@@ -69,7 +70,22 @@ impl Panel {
                 }
             }
         ));
-        Self { root, body }
+        Self {
+            root,
+            body,
+            revealer,
+        }
+    }
+
+    /// Whether the body is shown.
+    pub fn is_expanded(&self) -> bool {
+        self.revealer.reveals_child()
+    }
+
+    /// Calls `f` with the new state when the panel is folded or unfolded.
+    pub fn connect_expanded(&self, f: impl Fn(bool) + 'static) {
+        self.revealer
+            .connect_reveal_child_notify(move |r| f(r.reveals_child()));
     }
 
     pub fn widget(&self) -> &gtk::Widget {

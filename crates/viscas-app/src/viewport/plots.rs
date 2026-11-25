@@ -34,6 +34,9 @@ use crate::theme::model::Color as ThemeColor;
 pub const PLOT_MARGIN: f64 = 0.25;
 /// Pointer distance (px) within which a curve counts as hovered.
 pub const HOVER_PX: f64 = 8.0;
+/// Above this many feature dots, only the hovered one is labelled.
+const MAX_DOT_LABELS: usize = 12;
+
 /// Pointer distance (px) within which a feature dot counts as hovered.
 pub const DOT_PX: f64 = 7.0;
 /// Feature search radius around a click, in px.
@@ -705,7 +708,9 @@ impl Layer for PlotsLayer {
         }
         cr.set_dash(&[], 0.0);
 
-        // Feature dots and labels.
+        // Feature dots and labels. Unpinned dots belong to the selection:
+        // they go away with their curve's selection (B7).
+        st.features.borrow_mut().retain(|h| sel.is_selected(h.node));
         let features = st.features.borrow();
         let pinned = st.pinned.borrow();
         let color_of = |id: NodeId| {
@@ -725,11 +730,15 @@ impl Layer for PlotsLayer {
             cr.set_line_width(2.0);
             let _ = cr.stroke();
         }
+        // Every dot is labelled right away (`root (−0.5, 0)`); a crowded
+        // set labels only the hovered dot.
         let hover_dot = st.hover_dot.get();
-        let hovered_dot =
-            |h: &&FeatureHit| hover_dot.is_some_and(|p| (p - h.feature.pos).length() < 1e-12);
+        let crowded = features.len() > MAX_DOT_LABELS;
+        let labelled = |h: &&FeatureHit| {
+            !crowded || hover_dot.is_some_and(|p| (p - h.feature.pos).length() < 1e-12)
+        };
         if let Some(layout) = style.layout.as_ref() {
-            for hit in pinned.iter().chain(features.iter().filter(hovered_dot)) {
+            for hit in pinned.iter().chain(features.iter().filter(labelled)) {
                 layout.set_text(&feature_label(hit));
                 let (tw, th) = layout.pixel_size();
                 let (tw, th) = (f64::from(tw), f64::from(th));

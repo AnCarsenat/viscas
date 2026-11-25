@@ -15,12 +15,17 @@ use gtk::{cairo, gdk, gio, glib};
 
 use self::draw::GridLayer;
 use self::plots::{FEATURE_RADIUS_PX, HOVER_PX, PlotState, PlotsLayer, filter_hits, nearest_curve};
+pub use self::plots::{feature_label, format_coord};
 use self::view::View;
 use crate::ctx::AppCtx;
 use crate::doc::DocEvent;
 
 /// Zoom factor applied per discrete scroll-wheel step.
 const ZOOM_PER_STEP: f64 = 1.15;
+/// Axis stretch per Stretch menu step.
+const STRETCH_STEP: f64 = 1.25;
+/// Ctrl+middle-drag stretch per pixel (exponential, so it reverses).
+const STRETCH_PER_PX: f64 = 0.004;
 /// Largest scroll delta honored in one event, to keep zoom factors sane.
 const MAX_SCROLL_DELTA: f64 = 50.0;
 /// Delay coalescing plot requests while the view keeps changing.
@@ -78,7 +83,6 @@ pub struct Viewport {
     plots: Rc<PlotState>,
     actions: gio::SimpleActionGroup,
     header: Rc<RefCell<HeaderRefs>>,
-    quick_input: Rc<Cell<bool>>,
 }
 
 impl Viewport {
@@ -124,7 +128,6 @@ impl Viewport {
             plots: PlotState::new(ctx),
             actions: gio::SimpleActionGroup::new(),
             header: Rc::default(),
-            quick_input: Rc::new(Cell::new(false)),
         };
         viewport.add_layer(GridLayer { ctx: ctx.clone() });
         viewport.add_layer(PlotsLayer {
@@ -150,6 +153,7 @@ impl Viewport {
         viewport.install_keys();
         viewport.plots.refresh();
         viewport.update_hud(None);
+        register_instance(&viewport);
         viewport
     }
 
@@ -164,6 +168,18 @@ impl Viewport {
 
     fn lock_aspect(&self) -> bool {
         self.ctx().preferences().with(|p| p.viewport.lock_aspect)
+    }
+
+    /// Stretches the axes independently (unlocking the 1:1 aspect first,
+    /// or the preference would square them again).
+    pub fn stretch_at(&self, fx: f64, fy: f64, sx: f64, sy: f64) {
+        if self.lock_aspect() && (fx - fy).abs() > f64::EPSILON {
+            self.ctx()
+                .preferences()
+                .update(|p| p.viewport.lock_aspect = false);
+        }
+        self.update_view(|v| v.stretch_at(fx, fy, sx, sy));
+        self.update_hud(None);
     }
 
     /// Recenters on the origin at the default zoom.
@@ -297,8 +313,8 @@ impl Viewport {
         chip.set_tooltip_text(Some(&tip));
     }
 
-    /// Widgets for the area header: View and Add menus, the temporary
-    /// quick input, the error chip and the reset button. Built once; later
+    /// Widgets for the area header: View and Add (▸ Examples) menus, the
+    /// error chip and the frame-all button. Built once; later
     /// calls move the same widgets out of the previous header.
     pub fn header_widgets(&self) -> Vec<gtk::Widget> {
         let cached = self.header.borrow().widgets.clone();
@@ -320,12 +336,30 @@ impl Viewport {
 
     fn build_header_widgets(&self) -> Vec<gtk::Widget> {
         let view_menu = gio::Menu::new();
-        view_menu.append(Some("Reset View"), Some("vp.reset"));
-        view_menu.append(Some("Lock Aspect"), Some("vp.lock-aspect"));
-        let add_menu = gio::Menu::new();
+        view_menu.append(Some("Frame All (Home)"), Some("vp.reset"));
+        let axes = gio::Menu::new();
+        axes.append(Some("Orthonormal (1:1 Axes)"), Some("vp.lock-aspect"));
+        axes.append(Some("Stretch Horizontally"), Some("vp.stretch::wider"));
+        axes.append(Some("Squeeze Horizontally"), Some("vp.stretch::narrower"));
+        axes.append(Some("Stretch Vertically"), Some("vp.stretch::taller"));
+        axes.append(Some("Squeeze Vertically"), Some("vp.stretch::shorter"));
+        view_menu.append_section(Some("Canvas"), &axes);
+        let hint = gio::Menu::new();
+        hint.append(
+            Some("Middle-drag pans · Ctrl+middle-drag stretches"),
+            Some("vp.none"),
+        );
+        hint.append(
+            Some("Ctrl+wheel: x only · Alt+wheel: y only"),
+            Some("vp.none"),
+        );
+        view_menu.append_section(None, &hint);
+        let examples = gio::Menu::new();
         for (target, title, _) in EXAMPLES {
-            add_menu.append(Some(title), Some(&format!("vp.add-example::{target}")));
+            examples.append(Some(title), Some(&format!("vp.add-example::{target}")));
         }
+        let add_menu = gio::Menu::new();
+        add_menu.append_submenu(Some("Examples"), &examples);
         let menu = |title: &str, model: &gio::Menu| {
             let b = gtk::MenuButton::builder()
                 .label(title)
@@ -338,58 +372,6 @@ impl Viewport {
         };
         let mut widgets = vec![menu("View", &view_menu), menu("Add", &add_menu)];
 
-        // Temporary quick input (to be replaced by Console/Expressions).
-        let toggle = gtk::ToggleButton::builder()
-            .label("Quick ›")
-            .active(self.quick_input.get())
-            .tooltip_text(
-                "Temporary quick input: type a line such as y = sin(x) and press Enter. \
-                 Will be replaced by the Console and Expressions editors.",
-            )
-            .css_classes(["header-menu", "flat"])
-            .build();
-        let entry = gtk::Entry::builder()
-            .placeholder_text("y = sin(x)   (temporary)")
-            .width_chars(22)
-            .visible(self.quick_input.get())
-            .css_classes(["mono"])
-            .build();
-        let flag = self.quick_input.clone();
-        let weak_entry = entry.downgrade();
-        toggle.connect_toggled(move |t| {
-            flag.set(t.is_active());
-            if let Some(e) = weak_entry.upgrade() {
-                e.set_visible(t.is_active());
-                if t.is_active() {
-                    e.grab_focus();
-                }
-            }
-        });
-        let ctx = self.ctx().downgrade();
-        entry.connect_activate(move |e| {
-            let Some(ctx) = ctx.upgrade() else {
-                return;
-            };
-            let text = e.text().trim().to_owned();
-            if text.is_empty() {
-                return;
-            }
-            match ctx.engine().edit(|eng| eng.add_line(None, &text)) {
-                Ok(id) => {
-                    e.set_text("");
-                    e.remove_css_class("error");
-                    e.set_tooltip_text(None);
-                    ctx.selection().set_selected([id]);
-                }
-                Err(err) => {
-                    e.add_css_class("error");
-                    e.set_tooltip_text(Some(&err.to_string()));
-                }
-            }
-        });
-        widgets.push(toggle.upcast());
-        widgets.push(entry.upcast());
-
         let errors = gtk::Label::builder()
             .css_classes(["chip", "error"])
             .visible(false)
@@ -399,10 +381,11 @@ impl Viewport {
 
         let reset = gtk::Button::builder()
             .icon_name(crate::editors::pick_icon(&[
+                "zoom-fit-best-symbolic",
+                "view-fullscreen-symbolic",
                 "zoom-original-symbolic",
-                "view-refresh-symbolic",
             ]))
-            .tooltip_text("Reset View (Home)")
+            .tooltip_text("Frame All — reset the view (Home)")
             .action_name("vp.reset")
             .css_classes(["area-tool"])
             .build();
@@ -435,6 +418,24 @@ impl Viewport {
             }
         });
         self.actions.add_action(&lock);
+
+        let stretch = gio::SimpleAction::new("stretch", Some(glib::VariantTy::STRING));
+        let this = self.downgrade();
+        stretch.connect_activate(move |_, param| {
+            let (Some(vp), Some(dir)) = (this.upgrade(), param.and_then(|p| p.str())) else {
+                return;
+            };
+            let (fx, fy) = match dir {
+                "wider" => (STRETCH_STEP, 1.0),
+                "narrower" => (1.0 / STRETCH_STEP, 1.0),
+                "taller" => (1.0, STRETCH_STEP),
+                "shorter" => (1.0, 1.0 / STRETCH_STEP),
+                _ => return,
+            };
+            let (w, h) = vp.view().size;
+            vp.stretch_at(fx, fy, w / 2.0, h / 2.0);
+        });
+        self.actions.add_action(&stretch);
 
         let add = gio::SimpleAction::new("add-example", Some(glib::VariantTy::STRING));
         let ctx = self.ctx().downgrade();
@@ -575,6 +576,61 @@ impl Viewport {
             }
         ));
         area.add_controller(drag);
+        self.install_middle_drag();
+    }
+
+    /// Middle mouse: drag pans the camera (Blender-style); with Ctrl it
+    /// stretches the axes (right/up = wider/taller), anchored at the press.
+    fn install_middle_drag(&self) {
+        let drag = gtk::GestureDrag::builder().button(2).build();
+        let last = Rc::new(Cell::new((0.0, 0.0)));
+        let this = self.downgrade();
+        drag.connect_drag_begin(glib::clone!(
+            #[strong]
+            last,
+            #[strong]
+            this,
+            move |g, _, _| {
+                last.set((0.0, 0.0));
+                if let Some(vp) = this.upgrade() {
+                    vp.area.grab_focus();
+                    let stretch = g
+                        .current_event_state()
+                        .contains(gdk::ModifierType::CONTROL_MASK);
+                    vp.area.set_cursor_from_name(Some(if stretch {
+                        "all-scroll"
+                    } else {
+                        "grabbing"
+                    }));
+                }
+            }
+        ));
+        drag.connect_drag_update(glib::clone!(
+            #[strong]
+            this,
+            move |g, ox, oy| {
+                let Some(vp) = this.upgrade() else {
+                    return;
+                };
+                let (lx, ly) = last.replace((ox, oy));
+                let (dx, dy) = (ox - lx, oy - ly);
+                if g.current_event_state()
+                    .contains(gdk::ModifierType::CONTROL_MASK)
+                {
+                    let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
+                    let k = |d: f64| (d * STRETCH_PER_PX).exp();
+                    vp.stretch_at(k(dx), k(-dy), sx, sy);
+                } else {
+                    vp.update_view(|v| v.pan_by_pixels(dx, dy));
+                }
+            }
+        ));
+        drag.connect_drag_end(move |_, _, _| {
+            if let Some(vp) = this.upgrade() {
+                vp.area.set_cursor(None::<&gdk::Cursor>);
+            }
+        });
+        self.area.add_controller(drag);
     }
 
     /// Pointer motion (HUD, hover), scroll zoom and clicks.
@@ -618,15 +674,23 @@ impl Viewport {
             this,
             #[strong]
             pointer,
-            move |_, _, dy| {
+            move |c, _, dy| {
                 let Some(vp) = this.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                vp.update_view(|v| {
-                    let (sx, sy) = pointer.get().unwrap_or((v.size.0 / 2.0, v.size.1 / 2.0));
-                    let dy = dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA);
-                    v.zoom_at(ZOOM_PER_STEP.powf(-dy), sx, sy);
-                });
+                let mods = c.current_event_state();
+                let f = ZOOM_PER_STEP.powf(-dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA));
+                let (w, h) = vp.view().size;
+                let (sx, sy) = pointer.get().unwrap_or((w / 2.0, h / 2.0));
+                if mods.contains(gdk::ModifierType::CONTROL_MASK) {
+                    // Ctrl+wheel: horizontal axis only.
+                    vp.stretch_at(f, 1.0, sx, sy);
+                } else if mods.contains(gdk::ModifierType::ALT_MASK) {
+                    // Alt+wheel: vertical axis only.
+                    vp.stretch_at(1.0, f, sx, sy);
+                } else {
+                    vp.update_view(|v| v.zoom_at(f, sx, sy));
+                }
                 vp.update_hud(pointer.get());
                 glib::Propagation::Stop
             }
@@ -793,7 +857,6 @@ impl Viewport {
             plots: Rc::downgrade(&self.plots),
             actions: self.actions.downgrade(),
             header: Rc::downgrade(&self.header),
-            quick_input: Rc::downgrade(&self.quick_input),
         }
     }
 }
@@ -810,7 +873,6 @@ struct WeakViewport {
     plots: Weak<PlotState>,
     actions: glib::WeakRef<gio::SimpleActionGroup>,
     header: Weak<RefCell<HeaderRefs>>,
-    quick_input: Weak<Cell<bool>>,
 }
 
 impl crate::ctx::WeakGuard for WeakViewport {
@@ -835,7 +897,6 @@ impl WeakViewport {
             plots: self.plots.upgrade()?,
             actions: self.actions.upgrade()?,
             header: self.header.upgrade()?,
-            quick_input: self.quick_input.upgrade()?,
         })
     }
 }
@@ -848,8 +909,194 @@ fn hud_text(view: &View, pointer: Option<(f64, f64)>) -> String {
             let (x, y) = view.screen_to_world(sx, sy);
             let dx = view::label_digits(view.scale);
             let dy = view::label_digits(view.scale_y());
-            format!("x {x:>+10.dx$}   y {y:>+10.dy$}")
+            format!("x {x:>+10.dx$}   y {y:>+10.dy$}   {}", zoom_percent(view))
         }
-        None => format!("{:.3} px/unit", view.scale),
+        None => zoom_percent(view),
+    }
+}
+
+/// Zoom relative to the default view, e.g. `250 %`.
+fn zoom_percent(view: &View) -> String {
+    let pct = view.scale / View::default().scale * 100.0;
+    if pct >= 10.0 {
+        format!("{pct:.0} %")
+    } else {
+        format!("{pct:.2e} %")
+    }
+}
+
+// ---------------------------------------------------------------------
+// Palette hooks: frame a node, show a node's features
+// ---------------------------------------------------------------------
+
+thread_local! {
+    /// Every viewport editor, newest last (palette commands act on the
+    /// newest one on screen).
+    static INSTANCES: RefCell<Vec<WeakViewport>> = const { RefCell::new(Vec::new()) };
+}
+
+fn register_instance(vp: &Viewport) {
+    INSTANCES.with_borrow_mut(|v| {
+        v.retain(|w| w.upgrade().is_some());
+        v.push(vp.downgrade());
+    });
+}
+
+/// The newest viewport editor that is on screen.
+pub fn active() -> Option<Viewport> {
+    INSTANCES.with_borrow(|v| {
+        v.iter()
+            .rev()
+            .filter_map(WeakViewport::upgrade)
+            .find(|vp| vp.area.is_mapped())
+    })
+}
+
+/// Which features [`Viewport::show_features`] shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureSet {
+    Roots,
+    Extrema,
+}
+
+impl FeatureSet {
+    fn wants(self, kind: viscas_plot::FeatureKind) -> bool {
+        use viscas_plot::FeatureKind as K;
+        match self {
+            FeatureSet::Roots => kind == K::Root,
+            FeatureSet::Extrema => matches!(kind, K::Minimum | K::Maximum),
+        }
+    }
+}
+
+impl Viewport {
+    /// The engine viewport this editor renders.
+    pub fn engine_id(&self) -> viscas_engine::ViewportId {
+        self.plots.id
+    }
+
+    /// Centers the view on `node`'s drawing (zooming out when it does
+    /// not fit). Returns whether the node has anything drawn.
+    pub fn frame_node(&self, node: viscas_scene::NodeId) -> bool {
+        let mut b: Option<(f64, f64, f64, f64)> = None;
+        for layer in self
+            .plots
+            .layers
+            .borrow()
+            .iter()
+            .filter(|l| l.node_id == node)
+        {
+            for prim in layer.primitives.iter() {
+                let pts: &[viscas_plot::Vec2] = match prim {
+                    viscas_plot::Primitive::Polyline { line, .. } => &line.points,
+                    viscas_plot::Primitive::Polygon(poly) => &poly.points,
+                    viscas_plot::Primitive::Points(p) => p,
+                };
+                for p in pts.iter().filter(|p| p.x.is_finite() && p.y.is_finite()) {
+                    b = Some(match b {
+                        None => (p.x, p.x, p.y, p.y),
+                        Some((x0, x1, y0, y1)) => {
+                            (x0.min(p.x), x1.max(p.x), y0.min(p.y), y1.max(p.y))
+                        }
+                    });
+                }
+            }
+        }
+        let Some((x0, x1, y0, y1)) = b else {
+            return false;
+        };
+        self.update_view(|v| {
+            v.center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            let (w, h) = (x1 - x0, y1 - y0);
+            // Zoom out (never in) so the drawing fits with a margin.
+            let fit_x = if w > 0.0 {
+                v.size.0 * 0.8 / w
+            } else {
+                f64::INFINITY
+            };
+            let fit_y = if h > 0.0 {
+                v.size.1 * 0.8 / (h * v.aspect)
+            } else {
+                f64::INFINITY
+            };
+            let fit = fit_x.min(fit_y);
+            if fit < v.scale {
+                v.scale = fit.max(view::MIN_SCALE);
+            }
+        });
+        true
+    }
+
+    /// Shows the roots or extrema of `node` in the view as labelled dots.
+    pub fn show_features(&self, node: viscas_scene::NodeId, set: FeatureSet) -> usize {
+        let id = self.plots.id;
+        let hits: Vec<_> = self
+            .ctx()
+            .engine()
+            .with(|e| e.node_features(node, Some(id)))
+            .into_iter()
+            .filter(|h| h.node == node && set.wants(h.feature.kind))
+            .collect();
+        let n = hits.len();
+        *self.plots.features.borrow_mut() = hits;
+        self.queue_draw();
+        n
+    }
+}
+
+/// Palette commands acting on the selection in the active viewport.
+pub struct ViewportCommands(crate::ctx::WeakCtx);
+
+impl ViewportCommands {
+    pub fn new(ctx: &AppCtx) -> Self {
+        Self(ctx.downgrade())
+    }
+}
+
+impl crate::commands::CommandProvider for ViewportCommands {
+    fn commands(&self) -> Vec<crate::commands::Command> {
+        let Some(ctx) = self.0.upgrade() else {
+            return Vec::new();
+        };
+        let Some(&node) = ctx.selection().selected().last() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (id, title, set) in [
+            (
+                "viewport.show-roots",
+                "Show Roots of Selected",
+                FeatureSet::Roots,
+            ),
+            (
+                "viewport.show-extrema",
+                "Show Extrema of Selected",
+                FeatureSet::Extrema,
+            ),
+        ] {
+            out.push(crate::commands::Command {
+                id: id.to_owned(),
+                title: title.to_owned(),
+                category: "Viewport",
+                shortcut: None,
+                run: Rc::new(move || {
+                    if let Some(vp) = active() {
+                        vp.show_features(node, set);
+                    }
+                }),
+            });
+        }
+        out.push(crate::commands::Command {
+            id: "viewport.frame-selected".to_owned(),
+            title: "Frame Selected".to_owned(),
+            category: "Viewport",
+            shortcut: None,
+            run: Rc::new(move || {
+                if let Some(vp) = active() {
+                    vp.frame_node(node);
+                }
+            }),
+        });
+        out
     }
 }

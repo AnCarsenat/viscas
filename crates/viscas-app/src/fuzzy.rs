@@ -120,13 +120,25 @@ fn best_alignment(query: &[char], folded: &[char], chars: &[char]) -> Option<Mat
     Some(Match { score, positions })
 }
 
+/// Lowest score [`rank`] keeps for `query`: a bit more than one plain
+/// match per query char, so word-start and contiguous matches pass while
+/// letters scattered across a title (gaps, late start) drop out.
+pub fn threshold(query: &str) -> i32 {
+    const PER_CHAR: i32 = MATCH + CONSECUTIVE / 2;
+    let len = query.chars().filter(|c| !c.is_whitespace()).count();
+    PER_CHAR * i32::try_from(len).unwrap_or(i32::MAX / PER_CHAR)
+}
+
 /// Filters and ranks `candidates`, best first; ties keep the input order.
-/// Returns indices into `candidates` with their matches.
+/// Matches under [`threshold`] are dropped. Returns indices into
+/// `candidates` with their matches.
 pub fn rank<'a>(query: &str, candidates: impl IntoIterator<Item = &'a str>) -> Vec<(usize, Match)> {
+    let min = threshold(query);
     let mut out: Vec<(usize, Match)> = candidates
         .into_iter()
         .enumerate()
         .filter_map(|(i, c)| fuzzy_match(query, c).map(|m| (i, m)))
+        .filter(|(_, m)| m.score >= min)
         .collect();
     out.sort_by(|(ia, a), (ib, b)| b.score.cmp(&a.score).then(ia.cmp(ib)));
     out
@@ -204,6 +216,43 @@ mod tests {
         assert_eq!(ranked, vec![1, 2]);
         let ranked: Vec<usize> = rank("ca", items).into_iter().map(|(i, _)| i).collect();
         assert_eq!(ranked[0], 0);
+    }
+
+    #[test]
+    fn threshold_drops_scattered_matches() {
+        let items = [
+            "Show Roots of Selected",
+            "Toggle Radians / Degrees",
+            "prod(L) — product of a list",
+            "Clear Console Transcript",
+        ];
+        let ranked: Vec<usize> = rank("root", items).into_iter().map(|(i, _)| i).collect();
+        assert_eq!(ranked, vec![0]);
+        assert!(fuzzy_match("sa", "Split Area").is_some_and(|m| m.score >= threshold("sa")));
+    }
+
+    #[test]
+    fn threshold_keeps_multi_word_and_partial_queries() {
+        let kept = |q: &str, c: &str| {
+            let m = fuzzy_match(q, c);
+            assert!(
+                m.as_ref().is_some_and(|m| m.score >= threshold(q)),
+                "{q:?} in {c:?}: {m:?} < {}",
+                threshold(q)
+            );
+        };
+        kept("split area", "Split Area Horizontally");
+        kept("add to board", "Add Last Result to Board");
+        kept("add to board", "Add to Board");
+        kept("spl", "Split Area Vertically");
+        kept("SplArHo", "Split Area Horizontally");
+        kept("sah", "Split Area Horizontally");
+        kept("ws graph", "Workspace: Graph");
+        kept("prefs", "Preferences…");
+        kept("goto plot", "Go to node: Plot1");
+        kept("e", "Toggle Exact / Approx");
+        // A single char only matches word starts.
+        assert!(rank("x", ["Toggle Exact / Approx"]).is_empty());
     }
 
     #[test]

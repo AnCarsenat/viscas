@@ -12,8 +12,8 @@ pub mod model;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
-use gtk::pango;
 use gtk::prelude::*;
+use gtk::{gio, glib, pango};
 use viscas_engine::{Engine, PlotKind};
 use viscas_scene::{
     AnimationMode, GridKind, KindTag, LineStyle, NodeContent, NodeId, NodeKind, PropValue, Scene,
@@ -50,6 +50,8 @@ struct Inner {
     /// re-apply itself on top of the moved history.
     scrub_suspended: Cell<bool>,
     sub: RefCell<Option<Subscription>>,
+    /// Refreshes view-dependent panels (Analysis) when fresh plots arrive.
+    view_refresher: RefCell<Option<Refresher>>,
 }
 
 /// The inspector editor. Cloning shares it.
@@ -104,6 +106,7 @@ impl Inspector {
                 scrub_base: RefCell::default(),
                 scrub_suspended: Cell::new(false),
                 sub: RefCell::default(),
+                view_refresher: RefCell::default(),
             }),
         };
         let weak = insp.downgrade();
@@ -177,6 +180,12 @@ impl Inspector {
             DocEvent::HistoryNavigating => self.interrupt_scrub(),
             DocEvent::CommitEdits => self.seal_group(),
             DocEvent::Settings(_) | DocEvent::Colors => self.update(false),
+            DocEvent::PlotsReady(_) => {
+                let r = self.inner.view_refresher.borrow().clone();
+                if let Some(r) = r {
+                    self.inner.ctx.engine().with(|e| r(e));
+                }
+            }
             _ => {}
         }
     }
@@ -206,6 +215,7 @@ impl Inspector {
             body.remove(&c);
         }
         self.inner.refreshers.borrow_mut().clear();
+        self.inner.view_refresher.borrow_mut().take();
         let shape = self.current_shape();
         *self.inner.shape.borrow_mut() = shape.clone();
         if shape.is_empty() {
@@ -222,12 +232,18 @@ impl Inspector {
             content.extend(self.expression_panel(id, tag));
             match tag {
                 KindTag::Slider => content.push(self.slider_panel(id)),
-                KindTag::Plot => content.push(self.ranges_panel(id)),
+                KindTag::Plot => {
+                    content.push(self.ranges_panel(id));
+                    content.push(self.analysis_panel(id));
+                }
                 KindTag::Viewport => content.push(self.viewport_panel(id)),
                 _ => {}
             }
         }
-        content.push(self.style_panel(&ids));
+        // Style only where it draws something.
+        if shape.iter().any(|(_, t)| style_applies(*t)) {
+            content.push(self.style_panel(&ids));
+        }
         for p in &content {
             body.append(p.widget());
         }
@@ -311,7 +327,7 @@ impl Inspector {
                 let value = e
                     .value(n.id)
                     .map(|v| v.display(e.settings().approx).to_owned());
-                label.set_label(&tree_model::row_text(n, value.as_deref()).title);
+                label.set_label(&tree_model::row_text_in(e.scene(), n, value.as_deref()).title);
             } else {
                 glyph.set_label("≡");
                 label.set_label(&model::selection_summary(&nodes));
@@ -736,6 +752,13 @@ impl Inspector {
             },
             None,
         );
+        // Unnamed drawables show the automatic name they display as.
+        let n = name.clone();
+        self.add_refresher(move |e| {
+            if let Some(label) = single.and_then(|id| e.scene().auto_label(id)) {
+                n.set_placeholder_text(Some(&label));
+            }
+        });
         // Locked nodes cannot be renamed (ops::rename refuses too).
         let n = name.clone();
         self.add_refresher(move |e| {
@@ -1212,7 +1235,21 @@ impl Inspector {
     }
 
     fn style_panel(&self, ids: &[NodeId]) -> Panel {
-        let panel = Panel::new("Style", true);
+        let folders = self.inner.ctx.engine().with(|e| {
+            ids.iter().all(|i| {
+                e.scene()
+                    .get(*i)
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Folder))
+            })
+        });
+        let panel = Panel::new(
+            if folders {
+                "Style (applies to children)"
+            } else {
+                "Style"
+            },
+            true,
+        );
         // Color: swatch (auto color shown when unset) and an Auto button.
         let swatch = ColorSwatch::new(UiColor::hex(0x808080), "Node Color");
         let weak = self.downgrade();
@@ -1330,6 +1367,89 @@ impl Inspector {
         panel
     }
 
+    /// Roots, extrema and intersections of a plot in the current view:
+    /// one toggle per group, click a value to copy it, `+` adds it to the
+    /// board as a Point node.
+    fn analysis_panel(&self, id: NodeId) -> Panel {
+        use viscas_plot::FeatureKind as K;
+        let panel = Panel::new("Analysis", true);
+        let groups: [AnalysisGroup; 3] = [
+            ("Roots", |k| k == K::Root),
+            ("Extrema", |k| matches!(k, K::Minimum | K::Maximum)),
+            ("Intersections", |k| k == K::Intersection),
+        ];
+        let mut lists = Vec::new();
+        for (title, _) in groups {
+            let list = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(1)
+                .css_classes(["analysis-list"])
+                .build();
+            let check = gtk::CheckButton::builder()
+                .label(title)
+                .active(true)
+                .build();
+            let l = list.clone();
+            check.connect_toggled(move |c| l.set_visible(c.is_active()));
+            panel.append(&check);
+            panel.append(&list);
+            lists.push(list);
+        }
+        let hint = gtk::Label::builder()
+            .label("For the visible part of the viewport on screen; updates as it moves.")
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dim", "analysis-hint"])
+            .build();
+        panel.append(&hint);
+
+        // Computed off the UI thread, only while the panel is expanded,
+        // for the viewport on screen; keyed by its view and the plotted
+        // nodes' revisions (refreshed when plots of a new view arrive).
+        let weak = self.downgrade();
+        let last: Rc<RefCell<Option<Vec<u64>>>> = Rc::default();
+        let lists = Rc::new(lists);
+        let p = panel.clone();
+        let refresh: Refresher = Rc::new(move |e: &Engine| {
+            if !p.is_expanded() {
+                return;
+            }
+            let vp = crate::viewport::active().map(|v| v.engine_id());
+            let Some(task) = e.node_features_task(id, vp) else {
+                return;
+            };
+            if last.borrow().as_ref() == Some(&task.key) {
+                return;
+            }
+            *last.borrow_mut() = Some(task.key.clone());
+            let (weak, last, lists) = (weak.clone(), last.clone(), lists.clone());
+            let key = task.key;
+            let run = task.run;
+            glib::spawn_future_local(async move {
+                let Ok(hits): Result<Vec<viscas_engine::FeatureHit>, _> =
+                    gio::spawn_blocking(run).await
+                else {
+                    return;
+                };
+                // A newer request superseded this one.
+                if last.borrow().as_ref() != Some(&key) || weak.upgrade().is_none() {
+                    return;
+                }
+                fill_analysis(&weak, &lists, &groups, &hits);
+            });
+        });
+        let r = refresh.clone();
+        let weak = self.downgrade();
+        panel.connect_expanded(move |open| {
+            if open {
+                Inspector::with_weak(&weak, |i| i.inner.ctx.engine().with(|e| r(e)));
+            }
+        });
+        *self.inner.view_refresher.borrow_mut() = Some(refresh.clone());
+        self.inner.refreshers.borrow_mut().push(refresh);
+        panel
+    }
+
     fn deps_panel(&self, id: NodeId) -> Panel {
         let panel = Panel::new("Dependencies", true);
         let make = |title: &str| {
@@ -1347,10 +1467,17 @@ impl Inspector {
                 .build();
             panel.append(&label);
             panel.append(&flow);
-            flow
+            (label, flow)
         };
-        let inputs = make("Inputs");
-        let dependents = make("Dependents");
+        let (inputs_title, inputs) = make("Inputs");
+        let (dependents_title, dependents) = make("Dependents");
+        // Shown instead of both lists when the node is unconnected.
+        let alone = gtk::Label::builder()
+            .label("No inputs or dependents")
+            .xalign(0.0)
+            .css_classes(["dim", "deps-none"])
+            .build();
+        panel.append(&alone);
         type Key = (Vec<NodeId>, Vec<NodeId>, Vec<String>);
         let last: Rc<RefCell<Key>> = Rc::default();
         let weak = self.downgrade();
@@ -1361,13 +1488,23 @@ impl Inspector {
             let titles: Vec<String> = ups
                 .iter()
                 .chain(&downs)
-                .filter_map(|i| e.scene().get(*i).map(|n| n.title()))
+                .map(|i| tree_model::display_name(e.scene(), *i))
                 .collect();
             let key = (ups.clone(), downs.clone(), titles);
             if *last.borrow() == key {
                 return;
             }
             *last.borrow_mut() = key;
+            let unconnected = ups.is_empty() && downs.is_empty();
+            alone.set_visible(unconnected);
+            for w in [
+                inputs_title.upcast_ref::<gtk::Widget>(),
+                inputs.upcast_ref(),
+                dependents_title.upcast_ref(),
+                dependents.upcast_ref(),
+            ] {
+                w.set_visible(!unconnected);
+            }
             for (flow, list, class) in
                 [(&inputs, &ups, "dep-up"), (&dependents, &downs, "dep-down")]
             {
@@ -1377,8 +1514,9 @@ impl Inspector {
                 if list.is_empty() {
                     flow.append(
                         &gtk::Label::builder()
-                            .label("none")
-                            .css_classes(["dim"])
+                            .label("—")
+                            .xalign(0.0)
+                            .css_classes(["dim", "deps-none"])
                             .build(),
                     );
                 }
@@ -1386,7 +1524,8 @@ impl Inspector {
                     let Some(n) = e.scene().get(*dep) else {
                         continue;
                     };
-                    flow.append(&chip(&weak, *dep, n, class));
+                    let title = tree_model::display_name(e.scene(), *dep);
+                    flow.append(&chip(&weak, *dep, n, &title, class));
                 }
             }
         });
@@ -1394,9 +1533,29 @@ impl Inspector {
     }
 }
 
+/// Kinds the Style panel applies to: drawables and folders (whose style
+/// their children inherit).
+fn style_applies(tag: KindTag) -> bool {
+    matches!(
+        tag,
+        KindTag::Plot | KindTag::Point | KindTag::Folder | KindTag::Regression
+    )
+}
+
+/// Point text `(x, y)` of a feature, in input syntax (ASCII minus).
+fn point_text(pos: viscas_plot::Vec2) -> String {
+    let c = |v: f64| crate::viewport::format_coord(v).replace('\u{2212}', "-");
+    format!("({}, {})", c(pos.x), c(pos.y))
+}
+
 /// A clickable node chip: click selects, hover highlights.
-fn chip(weak: &Weak<Inner>, id: NodeId, node: &viscas_scene::Node, class: &str) -> gtk::Button {
-    let text = tree_model::row_text(node, None).title;
+fn chip(
+    weak: &Weak<Inner>,
+    id: NodeId,
+    node: &viscas_scene::Node,
+    text: &str,
+    class: &str,
+) -> gtk::Button {
     let content = gtk::Box::builder().spacing(4).build();
     let tag = node.kind.tag();
     content.append(
@@ -1407,7 +1566,7 @@ fn chip(weak: &Weak<Inner>, id: NodeId, node: &viscas_scene::Node, class: &str) 
     );
     content.append(
         &gtk::Label::builder()
-            .label(tree_model::one_line(&text, 24))
+            .label(tree_model::one_line(text, 24))
             .build(),
     );
     let button = gtk::Button::builder()
@@ -1434,6 +1593,78 @@ fn chip(weak: &Weak<Inner>, id: NodeId, node: &viscas_scene::Node, class: &str) 
     });
     button.add_controller(motion);
     button
+}
+
+/// An Analysis group: title and which feature kinds it lists.
+type AnalysisGroup = (&'static str, fn(viscas_plot::FeatureKind) -> bool);
+
+/// Fills the Analysis lists from `hits`.
+fn fill_analysis(
+    weak: &Weak<Inner>,
+    lists: &[gtk::Box],
+    groups: &[AnalysisGroup],
+    hits: &[viscas_engine::FeatureHit],
+) {
+    for ((_, wanted), list) in groups.iter().zip(lists) {
+        while let Some(c) = list.first_child() {
+            list.remove(&c);
+        }
+        let mut any = false;
+        for h in hits.iter().filter(|h| wanted(h.feature.kind)) {
+            any = true;
+            list.append(&analysis_row(weak, h));
+        }
+        if !any {
+            list.append(
+                &gtk::Label::builder()
+                    .label("—")
+                    .xalign(0.0)
+                    .css_classes(["dim", "deps-none"])
+                    .build(),
+            );
+        }
+    }
+}
+
+/// One Analysis value: `min (0, −1)` (click copies `(0, -1)`) and a `+`
+/// button adding it to the board as a Point node.
+fn analysis_row(weak: &Weak<Inner>, hit: &viscas_engine::FeatureHit) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .spacing(4)
+        .css_classes(["analysis-row"])
+        .build();
+    let label = crate::viewport::feature_label(hit);
+    let text = point_text(hit.feature.pos);
+    let copy = gtk::Button::builder()
+        .label(&label)
+        .hexpand(true)
+        .tooltip_text(format!("Copy {text}"))
+        .css_classes(["flat", "mono", "analysis-value"])
+        .build();
+    if let Some(l) = copy.child().and_downcast::<gtk::Label>() {
+        l.set_xalign(0.0);
+    }
+    let t = text.clone();
+    copy.connect_clicked(move |b| b.clipboard().set_text(&t));
+    let add = gtk::Button::builder()
+        .icon_name(crate::editors::pick_icon(&["list-add-symbolic"]))
+        .tooltip_text("Add as point")
+        .css_classes(["flat", "area-tool"])
+        .build();
+    let w = weak.clone();
+    add.connect_clicked(move |_| {
+        Inspector::with_weak(&w, |i| {
+            let mut content = NodeContent::point("P", &text);
+            content.name = None;
+            let added = i.edit(|e| e.add_node(None, content));
+            if let Ok(id) = added {
+                i.inner.ctx.selection().set_selected([id]);
+            }
+        });
+    });
+    row.append(&copy);
+    row.append(&add);
+    row
 }
 
 /// Evaluated minimum, maximum and step (`None`: continuous) of a slider.
