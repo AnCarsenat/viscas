@@ -212,6 +212,36 @@ fn new_edit_clears_redo() {
 }
 
 #[test]
+fn committed_group_clears_redo_rolled_back_group_keeps_it() {
+    let mut s = Scene::new();
+    var(&mut s, "a", "1");
+    s.undo();
+    let before = snapshot(&s);
+    s.begin_group("try");
+    let mark = s.group_mark();
+    var(&mut s, "b", "1");
+    var(&mut s, "c", "1");
+    assert!(s.can_redo(), "redo survives until the group commits");
+    s.rollback_group_to(mark);
+    s.end_group();
+    assert_eq!(snapshot(&s), before);
+    assert!(s.can_redo());
+    assert_eq!(s.undo_depth(), 0);
+    // Partial rollback inside a group keeps the earlier edits.
+    s.begin_group("partial");
+    var(&mut s, "b", "1");
+    let mark = s.group_mark();
+    var(&mut s, "c", "1");
+    s.rollback_group_to(mark);
+    s.end_group();
+    assert!(s.lookup("b").is_some());
+    assert!(s.lookup("c").is_none());
+    assert!(!s.can_redo(), "a committed group clears redo");
+    assert!(s.undo());
+    assert!(s.lookup("b").is_none());
+}
+
+#[test]
 fn labels() {
     let mut s = Scene::new();
     let a = var(&mut s, "a", "1");

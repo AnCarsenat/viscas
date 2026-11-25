@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <!-- Icons for gtk::IconTheme::add_resource_path (hicolor layout). -->
+  <gresource prefix="/io/github/ancarsenat/Viscas/icons">
+    <file alias="scalable/apps/io.github.ancarsenat.Viscas.svg">icons/hicolor/scalable/apps/io.github.ancarsenat.Viscas.svg</file>
+    <file alias="scalable/apps/io.github.ancarsenat.Viscas-symbolic.svg">icons/hicolor/scalable/apps/io.github.ancarsenat.Viscas-symbolic.svg</file>
+  </gresource>
+</gresources>

@@ -5,11 +5,16 @@
 //! Name rules:
 //! - Scene nodes are visible by name and are never shadowed: `a := 1`
 //!   when a node defines `a` redefines that node (one undo step).
-//! - New names stay console-local until `:pin`. A console definition
-//!   whose name a node later takes (pin, add) yields to the node; it comes
-//!   back if the node goes away (e.g. undo of the pin).
-//! - `:pin` turns the last input into a node, pinning the console-only
-//!   definitions it depends on first, as one undo step.
+//! - New names stay console-local until added to the board (`:add`,
+//!   alias `:pin`). A console definition whose name a node later takes
+//!   yields to the node; it comes back if the node goes away (e.g. undo
+//!   of the add).
+//! - `:add` turns the last input into a node, adding the console-only
+//!   definitions it depends on first, as one undo step. `:plot <input>`
+//!   evaluates the input and adds it in one go.
+//! - [`Engine::console_eval_with`] can add inputs to the board as they
+//!   are evaluated ([`AutoAdd`]): things that draw (relations, points)
+//!   and/or new definitions.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -19,7 +24,7 @@ use viscas_core::eval::{
     canonical_name, format_value,
 };
 use viscas_core::syntax::{ExprKind, Span, StmtKind, parse_program_with, parse_statement_with};
-use viscas_scene::{NodeContent, NodeId, analyze, definition_line_with};
+use viscas_scene::{NodeContent, NodeId, NodeKind, analyze, definition_line_with};
 
 use crate::complete::{candidate_names, suggest};
 use crate::engine::Engine;
@@ -40,10 +45,15 @@ pub enum ItemKind {
     /// `a := …` redefined the scene node `a` ("updated node a"); `exact`
     /// and `approx` show its new value.
     UpdatedNode { node: NodeId, name: String },
-    /// A plot relation (`y = x^2`): no value; `:pin` turns it into a plot.
+    /// A plot relation (`y = x^2`) that stayed in the console: no value;
+    /// `:add` turns it into a plot.
     Relation { kind: String },
-    /// `:pin` created this node (dependencies first, the pinned line last).
-    Pinned { node: NodeId },
+    /// The input was added to the board as this node (dependencies
+    /// first, the input itself last).
+    Added { node: NodeId },
+    /// The input is on the board already as this identical node; nothing
+    /// was added.
+    OnBoard { node: NodeId },
     /// A `:vars` entry.
     Variable { name: String, scene: bool },
     /// Help or status text (in `exact`).
@@ -99,6 +109,28 @@ pub struct ConsoleOutput {
     pub cleared: bool,
 }
 
+/// Which console inputs [`Engine::console_eval_with`] adds to the board
+/// as soon as they evaluate (each statement is one undo step).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoAdd {
+    /// Things that draw: relations (`y = x^2`, `x^2 + y^2 = 4`, `r = θ`,
+    /// parametric curves, inequalities) and points (`(1, 2)`, `P := (1, 2)`).
+    pub plots: bool,
+    /// New definitions (`a := 3`, `f(x) := x^2`).
+    pub definitions: bool,
+    /// Plain values too (`2 + 3`); used by `:plot`.
+    pub values: bool,
+}
+
+impl AutoAdd {
+    /// Add everything that can become a node.
+    pub const ALL: AutoAdd = AutoAdd {
+        plots: true,
+        definitions: true,
+        values: true,
+    };
+}
+
 /// Console state kept by the engine.
 #[derive(Debug, Default)]
 pub(crate) struct ConsoleState {
@@ -110,6 +142,8 @@ pub(crate) struct ConsoleState {
     history: Vec<String>,
     /// The last successful non-command statement (for `:pin`).
     last: Option<String>,
+    /// The plan of the last automatic add ([`Engine::take_added_plan`]).
+    added_plan: Option<Vec<NodeContent>>,
 }
 
 impl ConsoleState {
@@ -137,8 +171,16 @@ fn shift(span: Span, by: usize) -> Span {
 
 impl Engine {
     /// Evaluate one console line (expressions, definitions, relations, or
-    /// a `:command`), statement by statement.
+    /// a `:command`), statement by statement. Nothing is added to the
+    /// board automatically; see [`Engine::console_eval_with`].
     pub fn console_eval(&mut self, line: &str) -> ConsoleOutput {
+        self.console_eval_with(line, AutoAdd::default())
+    }
+
+    /// [`Engine::console_eval`], adding the statements `auto` selects to
+    /// the board as they evaluate (their results become
+    /// [`ItemKind::Added`]).
+    pub fn console_eval_with(&mut self, line: &str, auto: AutoAdd) -> ConsoleOutput {
         let input = line.trim();
         self.push_history(input);
         let mut out = ConsoleOutput {
@@ -149,34 +191,135 @@ impl Engine {
             return out;
         }
         if let Some(cmd) = input.strip_prefix(':') {
-            self.console_command(cmd, &mut out);
+            self.console_command(cmd, input.len() - cmd.len(), &mut out);
             return out;
         }
+        self.eval_statements(input, 0, auto, &mut out);
+        out
+    }
+
+    /// Evaluates `src` (found at byte `base` of the echoed input).
+    fn eval_statements(&mut self, src: &str, base: usize, auto: AutoAdd, out: &mut ConsoleOutput) {
         self.interrupt_flag().store(false, Ordering::Relaxed);
         let settings = *self.settings();
-        let program = match parse_program_with(input, &settings.parse_options()) {
+        let program = match parse_program_with(src, &settings.parse_options()) {
             Ok(p) => p,
             Err(errs) => {
                 let e = &errs[0];
                 out.error = Some(ConsoleError {
                     message: e.message.clone(),
-                    span: span_in(input, e.span).then_some(e.span),
+                    span: span_in(src, e.span).then(|| shift(e.span, base)),
                 });
-                return out;
+                return;
             }
         };
+        // The whole input is one undo step, even with several statements.
+        self.scene_mut().begin_group("Console input");
         for stmt in &program.stmts {
             let (start, end) = (stmt.span.start, stmt.span.end);
-            if !span_in(input, stmt.span) {
+            if !span_in(src, stmt.span) {
                 continue;
             }
-            let text = &input[start..end];
-            if !self.console_statement(text, start, &mut out) {
-                return out;
+            let text = &src[start..end];
+            let before = out.results.len();
+            let ok = self.console_statement(text, base + start, out) && {
+                self.console.last = Some(text.to_string());
+                !self.wants_auto_add(text, &out.results[before..], auto)
+                    || self.auto_add(before, out)
+            };
+            if !ok {
+                break;
             }
-            self.console.last = Some(text.to_string());
         }
-        out
+        let changed = self.scene().in_group() && self.scene().group_mark() > 0;
+        self.scene_mut().end_group();
+        if out.error.is_some() && changed {
+            // Earlier statements stay on the board (one undo step).
+            out.results.push(ConsoleItem::info(
+                "the statements before the error are on the board (Undo removes them)",
+            ));
+        }
+    }
+
+    /// Should the statement `text` with results `items` go on the board?
+    fn wants_auto_add(&self, text: &str, items: &[ConsoleItem], auto: AutoAdd) -> bool {
+        if items.is_empty()
+            || items
+                .iter()
+                .any(|i| matches!(i.kind, ItemKind::UpdatedNode { .. }))
+        {
+            // Nothing to add, or already on the board (node redefined).
+            return false;
+        }
+        let draws = self
+            .line_content(text)
+            .is_ok_and(|c| matches!(c.kind, NodeKind::Plot { .. } | NodeKind::Point { .. }));
+        if draws {
+            // A named point is a definition too (`P := (1, 2)`).
+            let defines = items
+                .iter()
+                .any(|i| matches!(i.kind, ItemKind::Definition { .. }));
+            return auto.plots || auto.values || (defines && auto.definitions);
+        }
+        items.iter().all(|i| match i.kind {
+            ItemKind::Definition { .. } => auto.definitions,
+            ItemKind::Value => auto.values,
+            ItemKind::Relation { .. } => auto.plots,
+            _ => false,
+        })
+    }
+
+    /// Adds the last statement to the board, replacing its results (from
+    /// index `from`) with the added nodes; `false` after an error.
+    fn auto_add(&mut self, from: usize, out: &mut ConsoleOutput) -> bool {
+        let result = self.pin_plan().and_then(|plan| {
+            self.console.added_plan = Some(plan.clone());
+            self.add_pin_plan(plan)
+        });
+        match result {
+            Ok(items) => {
+                out.results.truncate(from);
+                out.results.extend(items);
+                self.console.last = None;
+                true
+            }
+            Err(message) => {
+                out.error = Some(ConsoleError {
+                    message: format!("could not add to the board: {message}"),
+                    span: None,
+                });
+                false
+            }
+        }
+    }
+
+    /// Forgets the last input, so `:add` has nothing to add (a UI added
+    /// it from a [`Engine::pin_plan`] snapshot already).
+    pub fn forget_console_last(&mut self) {
+        self.console.forget_pin();
+    }
+
+    /// The plan the last automatic add used (cleared by the call), so a
+    /// UI can offer to add the input again after an undo.
+    pub fn take_added_plan(&mut self) -> Option<Vec<NodeContent>> {
+        self.console.added_plan.take()
+    }
+
+    /// [`ItemKind::Added`] results for new nodes, with their values.
+    pub fn added_items(&self, ids: Vec<NodeId>) -> Vec<ConsoleItem> {
+        ids.into_iter()
+            .map(|node| {
+                let (exact, approx) = self
+                    .value(node)
+                    .map(|v| (v.exact.clone(), v.approx.clone()))
+                    .unwrap_or_default();
+                ConsoleItem {
+                    exact,
+                    approx,
+                    kind: ItemKind::Added { node },
+                }
+            })
+            .collect()
     }
 
     /// One statement; `false` after an error (reported in `out`).
@@ -363,14 +506,30 @@ impl Engine {
             .collect()
     }
 
-    fn console_command(&mut self, cmd: &str, out: &mut ConsoleOutput) {
+    /// `cmd` is the command text after `:`, found at byte `base` of the
+    /// echoed input.
+    fn console_command(&mut self, cmd: &str, base: usize, out: &mut ConsoleOutput) {
         let mut words = cmd.split_whitespace();
         let name = words.next().unwrap_or("");
         let args: Vec<&str> = words.collect();
         match name {
             "help" => self.cmd_help(&args, out),
             "mode" => self.cmd_mode(&args, out),
-            "pin" => self.cmd_pin(out),
+            "add" | "pin" | "plot" if args.is_empty() => self.cmd_pin(out),
+            "plot" => {
+                let rest = cmd.trim_start()["plot".len()..].trim();
+                let at = base + (cmd.trim_end().len() - rest.len());
+                self.eval_statements(rest, at, AutoAdd::ALL, out);
+            }
+            "add" | "pin" => {
+                out.error = Some(ConsoleError {
+                    message: format!(
+                        "`:{name}` adds the last result; `:plot {}` evaluates and adds",
+                        args.join(" ")
+                    ),
+                    span: None,
+                });
+            }
             "clear" => {
                 let history = std::mem::take(&mut self.console.history);
                 self.console = Default::default();
@@ -398,7 +557,7 @@ impl Engine {
     fn cmd_help(&self, args: &[&str], out: &mut ConsoleOutput) {
         let Some(&topic) = args.first() else {
             out.results.push(ConsoleItem::info(
-                "Type an expression (`2^10`), a definition (`a := 3`, `f(x) := x^2`) or a relation (`y = sin x`). Commands:",
+                "Type an expression (`2^10`), a definition (`a := 3`, `f(x) := x^2`) or something to draw (`y = sin x`, `(1, 2)`). `:add` puts the last input on the board. Commands:",
             ));
             for c in crate::help::COMMAND_HELP {
                 out.results.push(ConsoleItem::info(format!(
@@ -518,13 +677,13 @@ impl Engine {
                 Some(src) => {
                     let dep = self
                         .line_content(src)
-                        .map_err(|e| format!("cannot pin `{name}`: {}", e[0].message))?;
+                        .map_err(|e| format!("cannot add `{name}`: {}", e[0].message))?;
                     self.collect_pin_deps(&dep, seen, plan)?;
                     plan.push(dep);
                 }
                 None if self.console.defs.contains_key(&name) => {
                     return Err(format!(
-                        "cannot pin: `{name}` is a console value without a definition to pin"
+                        "cannot add: `{name}` is a console value without a definition to add"
                     ));
                 }
                 None => {}
@@ -542,7 +701,7 @@ impl Engine {
             .console
             .last
             .clone()
-            .ok_or_else(|| "nothing to pin yet: evaluate something first".to_string())?;
+            .ok_or_else(|| "nothing to add yet: evaluate something first".to_string())?;
         let content = self.line_content(&line).map_err(|e| e[0].message.clone())?;
         if let Some(name) = content
             .kind
@@ -570,7 +729,8 @@ impl Engine {
     pub fn apply_pin_plan(&mut self, plan: Vec<NodeContent>) -> Result<Vec<NodeId>, String> {
         let last = plan.len().saturating_sub(1);
         let scene = self.scene_mut();
-        scene.begin_group("Pin from console");
+        scene.begin_group("Add to board from console");
+        let mark = scene.group_mark();
         let mut ids = Vec::new();
         let mut error = None;
         for (i, c) in plan.into_iter().enumerate() {
@@ -590,11 +750,12 @@ impl Engine {
                 }
             }
         }
+        if error.is_some() {
+            // Leaves no undo step and keeps the redo stack.
+            scene.rollback_group_to(mark);
+        }
         scene.end_group();
         if let Some(e) = error {
-            if !ids.is_empty() {
-                self.scene_mut().undo();
-            }
             self.update();
             return Err(e);
         }
@@ -605,9 +766,34 @@ impl Engine {
         Ok(ids)
     }
 
+    /// A scene node with the same name and definition as the input of
+    /// `plan` (its last entry), if any: adding it again would duplicate it.
+    pub fn existing_node(&self, plan: &[NodeContent]) -> Option<NodeId> {
+        let input = plan.last()?;
+        self.scene()
+            .iter()
+            .find(|n| n.name == input.name && n.kind == input.kind)
+            .map(|n| n.id)
+    }
+
+    /// Adds `plan` to the board ([`Engine::apply_pin_plan`]) and returns
+    /// the transcript items, or [`ItemKind::OnBoard`] without touching
+    /// the scene when an identical node is there already.
+    pub fn add_pin_plan(&mut self, plan: Vec<NodeContent>) -> Result<Vec<ConsoleItem>, String> {
+        if let Some(node) = self.existing_node(&plan) {
+            let mut items = self.added_items(vec![node]);
+            for i in &mut items {
+                i.kind = ItemKind::OnBoard { node };
+            }
+            return Ok(items);
+        }
+        let ids = self.apply_pin_plan(plan)?;
+        Ok(self.added_items(ids))
+    }
+
     fn cmd_pin(&mut self, out: &mut ConsoleOutput) {
-        let ids = match self.pin_plan().and_then(|plan| self.apply_pin_plan(plan)) {
-            Ok(ids) => ids,
+        match self.pin_plan().and_then(|plan| self.add_pin_plan(plan)) {
+            Ok(items) => out.results.extend(items),
             Err(message) => {
                 out.error = Some(ConsoleError {
                     message,
@@ -615,17 +801,6 @@ impl Engine {
                 });
                 return;
             }
-        };
-        for id in ids {
-            let (exact, approx) = self
-                .value(id)
-                .map(|v| (v.exact.clone(), v.approx.clone()))
-                .unwrap_or_default();
-            out.results.push(ConsoleItem {
-                exact,
-                approx,
-                kind: ItemKind::Pinned { node: id },
-            });
         }
         self.console.last = None;
     }

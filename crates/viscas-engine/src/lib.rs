@@ -52,7 +52,7 @@ mod worker;
 mod tests;
 
 pub use complete::{Completion, CompletionKind, completion_start, suggest};
-pub use console::{ConsoleError, ConsoleItem, ConsoleOutput, HISTORY_LIMIT, ItemKind};
+pub use console::{AutoAdd, ConsoleError, ConsoleItem, ConsoleOutput, HISTORY_LIMIT, ItemKind};
 pub use engine::{
     DEFAULT_PALETTE, Engine, EngineError, FeatureHit, FeaturesResult, MAX_FEATURE_CURVES,
     builtins_oracle,

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Viscas
+GenericName=Math Workstation
+Comment=Visual computer algebra workstation
+Icon=io.github.ancarsenat.Viscas
+Exec=viscas
+Terminal=false
+Categories=Education;Science;Math;
+Keywords=math;graph;plot;calculator;CAS;algebra;
+StartupNotify=true
+StartupWMClass=io.github.ancarsenat.Viscas

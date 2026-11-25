@@ -60,7 +60,7 @@ fn completes_constants_and_aliases() {
 #[test]
 fn completes_commands() {
     let e = engine();
-    let c = e.complete(":p");
+    let c = e.complete(":pi");
     assert_eq!(texts(&c), vec![":pin"]);
     assert_eq!(c[0].kind, CompletionKind::Command);
     assert_eq!(e.complete(":").len(), help::COMMAND_HELP.len());

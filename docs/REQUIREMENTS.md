@@ -73,7 +73,7 @@ Editors (UI, not nodes):
 | Viewport         | Renders a Viewport node (2D now, 3D later). Several can be open at once. |
 | Scene Tree       | Godot-style tree of all nodes: typed icons, rename, reparent by drag, folders, hide/lock toggles, filter. |
 | Inspector        | Properties of the selected node(s): expression, style, ranges, metadata; compact fields, drag-to-scrub numbers, multi-edit. |
-| Console          | Primary input. REPL (qalc-grade): history, typeset output, completion, `ans`, unit conversion, exact/approx; results can be pinned into the scene as nodes. |
+| Console          | Primary input. REPL (qalc-grade): history, typeset output, completion, `ans`, unit conversion, exact/approx; plots typed in it go straight on the board, other results can be added to the board as nodes. |
 | Expressions      | Flat ordered list of statement nodes for quick editing (a view of the tree, not a separate model). |
 | Sheet            | Spreadsheet editor for table nodes. |
 | Script           | Code editor for script nodes (Viscas language or Rhai). |
@@ -183,7 +183,8 @@ capability scope, not an API to copy.
 - Primary input of the app. One-line evaluation with typeset output and exact + approx results.
 - History (persisted), up/down recall, `ans`, `ans2`.
 - Tab completion for functions, nodes, units.
-- Commands: `:help f`, `:pin` (turn result into node), `:clear`, `:mode deg|rad|exact|approx`, `to <unit>`.
+- Commands: `:help f`, `:add` (alias `:pin`: turn the last result into a board node), `:plot <input>` (evaluate and add), `:clear`, `:mode deg|rad|exact|approx`, `to <unit>`.
+- Add to board: things that draw (`y = x^2`, `x^2+y^2=4`, `(1, 2)`, `r = θ`, parametric) become board nodes as soon as they are entered (undoable; preference, on by default). Definitions stay console-local unless a node exists or "auto-add definitions" is on; every entry that can become a node has an "Add to board" button and Ctrl+Shift+Enter.
 - Shares the scene's variables: console sees `a`, `f`, etc.
 
 ## 8. Sheets
