@@ -39,6 +39,7 @@ pub fn apply(prefs: &Preferences) {
     let theme = prefs.effective_theme();
     if LAST_DARK.replace(Some(theme.dark)) != Some(theme.dark) {
         set_color_scheme(&display, theme.dark);
+        use_desktop_font_hinting(&display);
     }
     let sheet = css::stylesheet(&theme, &style_options(prefs));
     PROVIDER.with_borrow_mut(|slot| match slot {
@@ -61,6 +62,21 @@ pub fn apply(prefs: &Preferences) {
             *slot = Some((provider, sheet));
         }
     });
+}
+
+/// Renders text with the desktop's hinting settings (GTK's `manual` font
+/// rendering) instead of GTK 4.16+'s `automatic` mode. Unhinted glyphs at
+/// our 11–12 px sizes on a 1× display lose thin strokes: `=` drew as a
+/// single bar, indistinguishable from `-`, which a math app cannot afford.
+fn use_desktop_font_hinting(display: &gdk::Display) {
+    let settings = gtk::Settings::for_display(display);
+    let manual = settings
+        .find_property("gtk-font-rendering")
+        .and_then(|pspec| glib::EnumClass::with_type(pspec.value_type()))
+        .and_then(|class| class.to_value_by_nick("manual"));
+    if let Some(value) = manual {
+        settings.set_property_from_value("gtk-font-rendering", &value);
+    }
 }
 
 /// Forces GTK's built-in Adwaita (so desktop themes do not leak into

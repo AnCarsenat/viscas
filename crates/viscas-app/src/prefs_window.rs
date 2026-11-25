@@ -344,6 +344,7 @@ fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::Window {
         .build();
     window.set_transient_for(parent.as_ref());
     install_menu_actions(&window, &binder);
+    crate::compose::install(&window);
 
     // Refresh bound widgets after every change; the refreshers live as
     // long as the window (owned by the destroy handler's closure).
