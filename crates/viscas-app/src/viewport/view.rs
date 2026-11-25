@@ -177,6 +177,22 @@ impl View {
         self.clamp_center();
     }
 
+    /// Scales the x axis by `fx` and the y axis by `fy` (stretching the
+    /// canvas horizontally / vertically), keeping the world point under
+    /// `(sx, sy)` fixed.
+    pub fn stretch_at(&mut self, fx: f64, fy: f64, sx: f64, sy: f64) {
+        let ok = |f: f64| f.is_finite() && f > 0.0;
+        if !ok(fx) || !ok(fy) {
+            return;
+        }
+        let anchor = self.screen_to_world(sx, sy);
+        self.set_scales(self.scale * fx, self.scale_y() * fy);
+        let moved = self.screen_to_world(sx, sy);
+        self.center.0 += anchor.0 - moved.0;
+        self.center.1 += anchor.1 - moved.1;
+        self.clamp_center();
+    }
+
     /// Sets both axis scales, each clamped to `MIN_SCALE..=MAX_SCALE`.
     pub fn set_scales(&mut self, x: f64, y: f64) {
         let fix = |v: f64| {
@@ -519,6 +535,25 @@ mod tests {
             ..View::default()
         };
         assert!(tiny.plot_view(0.25).is_none());
+    }
+
+    #[test]
+    fn stretch_scales_one_axis_around_anchor() {
+        let mut v = View::default();
+        let anchor = v.screen_to_world(100.0, 50.0);
+        v.stretch_at(2.0, 1.0, 100.0, 50.0);
+        assert!(approx(v.scale, 120.0));
+        assert!(approx(v.scale_y(), 60.0));
+        assert!(approx(v.aspect, 0.5));
+        let after = v.screen_to_world(100.0, 50.0);
+        assert!(approx(after.0, anchor.0) && approx(after.1, anchor.1));
+        v.stretch_at(1.0, 0.5, 0.0, 0.0);
+        assert!(approx(v.scale_y(), 30.0));
+        // Bad factors are ignored.
+        v.stretch_at(0.0, f64::NAN, 0.0, 0.0);
+        assert!(approx(v.scale, 120.0));
+        v.lock_aspect();
+        assert!(approx(v.scale_y(), v.scale));
     }
 
     #[test]

@@ -22,6 +22,10 @@ use crate::doc::DocEvent;
 
 /// Zoom factor applied per discrete scroll-wheel step.
 const ZOOM_PER_STEP: f64 = 1.15;
+/// Axis stretch per Stretch menu step.
+const STRETCH_STEP: f64 = 1.25;
+/// Ctrl+middle-drag stretch per pixel (exponential, so it reverses).
+const STRETCH_PER_PX: f64 = 0.004;
 /// Largest scroll delta honored in one event, to keep zoom factors sane.
 const MAX_SCROLL_DELTA: f64 = 50.0;
 /// Delay coalescing plot requests while the view keeps changing.
@@ -164,6 +168,18 @@ impl Viewport {
 
     fn lock_aspect(&self) -> bool {
         self.ctx().preferences().with(|p| p.viewport.lock_aspect)
+    }
+
+    /// Stretches the axes independently (unlocking the 1:1 aspect first,
+    /// or the preference would square them again).
+    pub fn stretch_at(&self, fx: f64, fy: f64, sx: f64, sy: f64) {
+        if self.lock_aspect() && (fx - fy).abs() > f64::EPSILON {
+            self.ctx()
+                .preferences()
+                .update(|p| p.viewport.lock_aspect = false);
+        }
+        self.update_view(|v| v.stretch_at(fx, fy, sx, sy));
+        self.update_hud(None);
     }
 
     /// Recenters on the origin at the default zoom.
@@ -320,8 +336,24 @@ impl Viewport {
 
     fn build_header_widgets(&self) -> Vec<gtk::Widget> {
         let view_menu = gio::Menu::new();
-        view_menu.append(Some("Reset View"), Some("vp.reset"));
-        view_menu.append(Some("Lock Aspect"), Some("vp.lock-aspect"));
+        view_menu.append(Some("Frame All (Home)"), Some("vp.reset"));
+        let axes = gio::Menu::new();
+        axes.append(Some("Orthonormal (1:1 Axes)"), Some("vp.lock-aspect"));
+        axes.append(Some("Stretch Horizontally"), Some("vp.stretch::wider"));
+        axes.append(Some("Squeeze Horizontally"), Some("vp.stretch::narrower"));
+        axes.append(Some("Stretch Vertically"), Some("vp.stretch::taller"));
+        axes.append(Some("Squeeze Vertically"), Some("vp.stretch::shorter"));
+        view_menu.append_section(Some("Canvas"), &axes);
+        let hint = gio::Menu::new();
+        hint.append(
+            Some("Middle-drag pans · Ctrl+middle-drag stretches"),
+            Some("vp.none"),
+        );
+        hint.append(
+            Some("Ctrl+wheel: x only · Alt+wheel: y only"),
+            Some("vp.none"),
+        );
+        view_menu.append_section(None, &hint);
         let examples = gio::Menu::new();
         for (target, title, _) in EXAMPLES {
             examples.append(Some(title), Some(&format!("vp.add-example::{target}")));
@@ -386,6 +418,24 @@ impl Viewport {
             }
         });
         self.actions.add_action(&lock);
+
+        let stretch = gio::SimpleAction::new("stretch", Some(glib::VariantTy::STRING));
+        let this = self.downgrade();
+        stretch.connect_activate(move |_, param| {
+            let (Some(vp), Some(dir)) = (this.upgrade(), param.and_then(|p| p.str())) else {
+                return;
+            };
+            let (fx, fy) = match dir {
+                "wider" => (STRETCH_STEP, 1.0),
+                "narrower" => (1.0 / STRETCH_STEP, 1.0),
+                "taller" => (1.0, STRETCH_STEP),
+                "shorter" => (1.0, 1.0 / STRETCH_STEP),
+                _ => return,
+            };
+            let (w, h) = vp.view().size;
+            vp.stretch_at(fx, fy, w / 2.0, h / 2.0);
+        });
+        self.actions.add_action(&stretch);
 
         let add = gio::SimpleAction::new("add-example", Some(glib::VariantTy::STRING));
         let ctx = self.ctx().downgrade();
@@ -526,6 +576,61 @@ impl Viewport {
             }
         ));
         area.add_controller(drag);
+        self.install_middle_drag();
+    }
+
+    /// Middle mouse: drag pans the camera (Blender-style); with Ctrl it
+    /// stretches the axes (right/up = wider/taller), anchored at the press.
+    fn install_middle_drag(&self) {
+        let drag = gtk::GestureDrag::builder().button(2).build();
+        let last = Rc::new(Cell::new((0.0, 0.0)));
+        let this = self.downgrade();
+        drag.connect_drag_begin(glib::clone!(
+            #[strong]
+            last,
+            #[strong]
+            this,
+            move |g, _, _| {
+                last.set((0.0, 0.0));
+                if let Some(vp) = this.upgrade() {
+                    vp.area.grab_focus();
+                    let stretch = g
+                        .current_event_state()
+                        .contains(gdk::ModifierType::CONTROL_MASK);
+                    vp.area.set_cursor_from_name(Some(if stretch {
+                        "all-scroll"
+                    } else {
+                        "grabbing"
+                    }));
+                }
+            }
+        ));
+        drag.connect_drag_update(glib::clone!(
+            #[strong]
+            this,
+            move |g, ox, oy| {
+                let Some(vp) = this.upgrade() else {
+                    return;
+                };
+                let (lx, ly) = last.replace((ox, oy));
+                let (dx, dy) = (ox - lx, oy - ly);
+                if g.current_event_state()
+                    .contains(gdk::ModifierType::CONTROL_MASK)
+                {
+                    let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
+                    let k = |d: f64| (d * STRETCH_PER_PX).exp();
+                    vp.stretch_at(k(dx), k(-dy), sx, sy);
+                } else {
+                    vp.update_view(|v| v.pan_by_pixels(dx, dy));
+                }
+            }
+        ));
+        drag.connect_drag_end(move |_, _, _| {
+            if let Some(vp) = this.upgrade() {
+                vp.area.set_cursor(None::<&gdk::Cursor>);
+            }
+        });
+        self.area.add_controller(drag);
     }
 
     /// Pointer motion (HUD, hover), scroll zoom and clicks.
@@ -569,15 +674,23 @@ impl Viewport {
             this,
             #[strong]
             pointer,
-            move |_, _, dy| {
+            move |c, _, dy| {
                 let Some(vp) = this.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                vp.update_view(|v| {
-                    let (sx, sy) = pointer.get().unwrap_or((v.size.0 / 2.0, v.size.1 / 2.0));
-                    let dy = dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA);
-                    v.zoom_at(ZOOM_PER_STEP.powf(-dy), sx, sy);
-                });
+                let mods = c.current_event_state();
+                let f = ZOOM_PER_STEP.powf(-dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA));
+                let (w, h) = vp.view().size;
+                let (sx, sy) = pointer.get().unwrap_or((w / 2.0, h / 2.0));
+                if mods.contains(gdk::ModifierType::CONTROL_MASK) {
+                    // Ctrl+wheel: horizontal axis only.
+                    vp.stretch_at(f, 1.0, sx, sy);
+                } else if mods.contains(gdk::ModifierType::ALT_MASK) {
+                    // Alt+wheel: vertical axis only.
+                    vp.stretch_at(1.0, f, sx, sy);
+                } else {
+                    vp.update_view(|v| v.zoom_at(f, sx, sy));
+                }
                 vp.update_hud(pointer.get());
                 glib::Propagation::Stop
             }
