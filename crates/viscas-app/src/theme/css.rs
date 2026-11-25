@@ -7,6 +7,7 @@ use super::model::{SceneTreeColors, Theme, UiColors, trim_float};
 pub const RULES: &str = concat!(
     include_str!("../../resources/theme.css"),
     include_str!("../../resources/scene_panels.css"),
+    include_str!("../../resources/docking.css"),
 );
 
 /// Placeholder in [`RULES`] replaced by the monospace font family list.

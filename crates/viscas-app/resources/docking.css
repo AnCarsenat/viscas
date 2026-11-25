@@ -1,0 +1,182 @@
+/* ---------------------------------------------------------------- docking */
+/* Area chrome, sashes, corner grips, drop feedback and the layout toast. */
+
+/* Sash: 6px hit zone over the 3px gap; a 2px accent line on hover. */
+.sash {
+  background: none;
+}
+
+.sash.horizontal:hover {
+  background-image: linear-gradient(to right, transparent 2px, @vc_accent 2px, @vc_accent 4px, transparent 4px);
+}
+
+.sash.vertical:hover {
+  background-image: linear-gradient(to bottom, transparent 2px, @vc_accent 2px, @vc_accent 4px, transparent 4px);
+}
+
+/* Active area: accent bar on top of its header. */
+.area.active > .area-header {
+  background: @vc_header_active;
+  box-shadow: inset 0 2px @vc_accent;
+}
+
+/* Header drop target while dragging an area. */
+.area.drop-target > .area-header {
+  box-shadow: inset 0 0 0 2px @vc_accent;
+}
+
+.area-frame.drag-source > .area {
+  opacity: 0.55;
+}
+
+/* Corner grips: shown while the pointer is over the area. */
+.corner-grip {
+  color: @vc_accent;
+  opacity: 0;
+  margin: 1px;
+}
+
+.area-frame:hover > .corner-grip {
+  opacity: 0.9;
+}
+
+.corner-grip:hover {
+  opacity: 1;
+}
+
+.dock-layer {
+  color: @vc_accent;
+}
+
+/* Editor switch (a box, so it can also start a header drag). */
+.area-header .editor-switch {
+  min-height: 18px;
+  padding: 0 4px 0 3px;
+  border-radius: 3px;
+  background: @vc_bg3;
+  border: 1px solid @vc_border;
+  box-shadow: inset 0 1px alpha(@vc_tint, 0.04);
+}
+
+.area-header .editor-switch:hover { background: @vc_bg4; }
+
+.area-header .editor-switch image.editor-icon { color: @vc_accent_text; }
+
+.area-header .editor-switch .editor-title {
+  font-weight: 600;
+  color: @vc_fg;
+}
+
+.area-header .editor-switch image.arrow {
+  -gtk-icon-size: 10px;
+  color: @vc_fg_faint;
+}
+
+.area-header .area-more {
+  color: @vc_fg_dim;
+}
+
+.area-header .area-more > button {
+  padding: 0 4px;
+}
+
+.area-header .area-more:hover { color: @vc_fg; }
+
+/* Area menu: never squeezed below a readable width. */
+popover.area-menu > contents {
+  min-width: 200px;
+}
+
+.editor-menu {
+  min-width: 180px;
+}
+
+/* Ghost under the pointer while dragging an area. */
+.dock-ghost {
+  padding: 4px;
+  border-radius: 5px;
+  background: @vc_bg2;
+  border: 2px solid @vc_accent;
+  box-shadow: 0 6px 18px alpha(@vc_shadow, 0.5);
+  color: @vc_fg;
+}
+
+.dock-ghost-thumb {
+  border-radius: 3px;
+}
+
+/* Layout toast ("Area closed · Undo"). */
+.layout-toast {
+  padding: 4px 4px 4px 12px;
+  border-radius: 6px;
+  background: @vc_tooltip_bg;
+  color: @vc_tooltip_fg;
+  border: 1px solid @vc_border;
+  box-shadow: 0 6px 18px alpha(@vc_shadow, 0.5);
+}
+
+.layout-toast .toast-undo {
+  min-height: 20px;
+  padding: 0 10px;
+  font-weight: 600;
+  color: @vc_accent_fg;
+  background: @vc_accent;
+  border: none;
+}
+
+.layout-toast .toast-close {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: @vc_fg_dim;
+}
+
+/* Tab strip (areas with two or more tabs), above the header row. */
+.area-tabs-scroller {
+  background: @vc_bg2;
+  border-bottom: 1px solid @vc_line;
+}
+
+.area-tabs {
+  padding: 2px 3px 0;
+}
+
+.area-tab {
+  min-height: 20px;
+  padding: 0 2px 0 8px;
+  border-radius: 3px 3px 0 0;
+  color: @vc_fg_dim;
+}
+
+.area-tab:hover {
+  color: @vc_fg;
+  background: alpha(@vc_tint, 0.06);
+}
+
+.area-tab.active {
+  color: @vc_fg_strong;
+  background: @vc_bg1;
+  box-shadow: inset 0 -2px @vc_accent;
+}
+
+.area-tab image { -gtk-icon-size: 14px; }
+
+.area-tab.active image { color: @vc_accent_text; }
+
+.area-tab .tab-close {
+  min-height: 16px;
+  min-width: 16px;
+  padding: 0;
+  background: none;
+  border: none;
+  box-shadow: none;
+  opacity: 0;
+  color: @vc_fg_dim;
+}
+
+.area-tab:hover .tab-close,
+.area-tab.active .tab-close { opacity: 0.8; }
+
+.area-tab .tab-close:hover { opacity: 1; color: @vc_danger_text; }

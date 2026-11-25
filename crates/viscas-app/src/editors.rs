@@ -70,24 +70,13 @@ pub fn displayed_layout(layout: &Layout, show_unfinished: bool) -> Layout {
 /// anything changed.
 fn replace_unfinished(layout: &mut Layout) -> bool {
     let mut changed = false;
-    for (id, kind) in layout.leaves() {
-        if is_unfinished(kind) {
-            changed |= layout.set_editor(id, substitute(kind));
+    // Every tab, not only the shown ones.
+    for (_, tab) in layout.all_tabs() {
+        if is_unfinished(tab.editor) {
+            changed |= layout.set_tab_editor(tab.id, substitute(tab.editor));
         }
     }
     changed
-}
-
-/// Keeps `widget` visible only while `shown(preferences)` holds.
-pub fn bind_shown(
-    widget: &impl IsA<gtk::Widget>,
-    ctx: &AppCtx,
-    shown: impl Fn(&Preferences) -> bool + 'static,
-) {
-    let widget = widget.as_ref().clone();
-    widget.set_visible(ctx.preferences().with(&shown));
-    ctx.preferences()
-        .connect_changed_for(widget.downgrade(), move |w, p| w.set_visible(shown(p)));
 }
 
 /// Candidate symbolic icons, most preferred first. Icon themes differ
@@ -432,6 +421,29 @@ fn capsule(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) {
 mod tests {
     use super::*;
     use crate::layout::IdGen;
+
+    #[test]
+    fn unfinished_background_tabs_are_swapped_too() {
+        use crate::layout::Node;
+        let stored = Layout::new(
+            Node::tabbed(&[EditorKind::Viewport, EditorKind::Sheet, EditorKind::Script]),
+            &mut IdGen::default(),
+        );
+        let shown = displayed_layout(&stored, false);
+        assert!(
+            shown
+                .all_tabs()
+                .iter()
+                .all(|(_, t)| !is_unfinished(t.editor))
+        );
+        // Stored tabs are untouched.
+        assert!(
+            stored
+                .all_tabs()
+                .iter()
+                .any(|(_, t)| t.editor == EditorKind::Sheet)
+        );
+    }
 
     #[test]
     fn unfinished_editors_are_swapped_for_built_ones() {

@@ -38,6 +38,13 @@ pub fn all() -> Vec<Shortcut> {
         ("win.save-as", "<Control><Shift>s", "Save document as"),
         ("win.undo", "<Control>z", "Undo"),
         ("win.redo", "<Control><Shift>z", "Redo"),
+        ("win.layout-undo", "<Control><Alt>z", "Undo layout change"),
+        ("win.next-tab", "<Control>Tab", "Next tab in area"),
+        (
+            "win.prev-tab",
+            "<Control><Shift>Tab",
+            "Previous tab in area",
+        ),
     ];
     let mut list: Vec<Shortcut> = fixed
         .into_iter()
@@ -60,9 +67,18 @@ pub fn all() -> Vec<Shortcut> {
     list
 }
 
+/// Actions whose keys the window handles itself (see
+/// `window::install_layout_keys`) instead of application accelerators:
+/// Ctrl+Alt+Z is AltGr+Z on some layouts and must still type in text
+/// fields; Ctrl+Tab must win over focus navigation.
+pub const WINDOW_KEYS: [&str; 3] = ["win.layout-undo", "win.next-tab", "win.prev-tab"];
+
 /// Registers every accelerator of [`all`] on the application.
 pub fn install(app: &gtk::Application) {
     for shortcut in all() {
+        if WINDOW_KEYS.contains(&shortcut.action.as_str()) {
+            continue;
+        }
         app.set_accels_for_action(&shortcut.action, &[shortcut.accel]);
     }
 }

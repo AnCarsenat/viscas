@@ -54,7 +54,7 @@ impl Workspace {
             Workspace::Graph => Node::split(
                 H,
                 0.2,
-                Node::split(V, 0.55, leaf(SceneTree), leaf(Console)),
+                Node::split(V, 0.4, leaf(SceneTree), leaf(Console)),
                 Node::split(H, 0.76, leaf(Viewport), leaf(Inspector)),
             ),
             // Console | [Viewport / Expressions]

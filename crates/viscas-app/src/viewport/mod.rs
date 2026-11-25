@@ -145,6 +145,15 @@ impl Viewport {
         ctx.selection()
             .connect_changed_for(viewport.downgrade(), |vp, _| vp.queue_draw());
         viewport.subscribe();
+        let this = viewport.downgrade();
+        viewport.area.connect_map(move |_| {
+            if let Some(vp) = this.upgrade()
+                && vp.plots.replot_hidden.replace(false)
+            {
+                vp.plots.request(&vp.view(), true);
+                vp.update_error_chip();
+            }
+        });
         viewport.install_actions();
         viewport.install_draw();
         viewport.install_drag();
@@ -270,6 +279,11 @@ impl Viewport {
                     vp.refresh();
                 }
                 DocEvent::Replot(vps) if vps.contains(&id) => {
+                    // Hidden (background tab): no plotting until shown.
+                    if !vp.area.is_mapped() {
+                        vp.plots.replot_hidden.set(true);
+                        return;
+                    }
                     vp.plots.request(&vp.view(), true);
                     vp.update_error_chip();
                 }

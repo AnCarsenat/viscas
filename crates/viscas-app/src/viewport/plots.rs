@@ -98,6 +98,9 @@ pub struct PlotState {
     pub truncated: Cell<usize>,
     /// A coalesced replot is queued.
     pub replot_queued: Cell<bool>,
+    /// A replot was skipped while the viewport was hidden (e.g. in a
+    /// background tab); it is requested when the viewport is shown.
+    pub replot_hidden: Cell<bool>,
     /// Pointer position of the last hover hit test.
     pub last_hover: Cell<Option<(f64, f64)>>,
     /// The current press turned into a drag (pan or box): its release
@@ -125,6 +128,7 @@ impl PlotState {
             errors: RefCell::default(),
             truncated: Cell::new(0),
             replot_queued: Cell::new(false),
+            replot_hidden: Cell::new(false),
             last_hover: Cell::new(None),
             dragged: Cell::new(false),
             subscription: RefCell::default(),
