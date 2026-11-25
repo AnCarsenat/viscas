@@ -40,6 +40,16 @@ The window is split into **areas**, Blender-style. Each area hosts one **editor*
 and has a thin header strip with an editor-type switcher and editor-specific menus.
 Areas can be split, joined, resized, swapped and maximized (Ctrl+Space).
 
+**True docking (Blender-style):**
+- Drag from an area corner into the area to split it; drag into a neighbour to
+  join (the neighbour is absorbed, with a preview overlay).
+- Drag an area by its header onto another area: drop zones (left/right/top/
+  bottom/center) dock it there or swap.
+- Tear off an area into its own floating window (drag outside, or header menu
+  "Open in New Window"); dock it back the same way.
+- All of this is layout-model operations, undoable for layout, saved per
+  document/workspace (including floating windows).
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ top bar: menus · workspace tabs [Graph][Algebra][Data][Script] · ^P │
