@@ -1669,3 +1669,218 @@ fn definition_returns_value() {
     let mut s = session();
     assert_eq!(ev_with(&mut s, "c := 1/2 + 1/2"), "1");
 }
+
+// ----- bug-hunt regressions -------------------------------------------------------
+
+fn session_mode(mode: &str) -> Session {
+    let mut s = session();
+    match mode {
+        "float64" => s.opts.float64 = true,
+        "approx" => s.opts.approx = true,
+        _ => {}
+    }
+    s
+}
+
+#[test]
+fn hyperbolic_huge_negative_overflows_instead_of_panicking() {
+    for mode in ["exact", "approx", "float64"] {
+        let mut s = session_mode(mode);
+        for src in [
+            "sinh(-10^40)",
+            "cosh(sinh(-90))",
+            "sinh(-1e300)",
+            "cosh(-1e300)",
+            "sech(-10^40)",
+            "csch(-10^40)",
+        ] {
+            let e = s.eval(src).expect_err(src);
+            assert!(
+                matches!(
+                    e.kind,
+                    ErrorKind::Number(crate::number::NumberError::Overflow)
+                ),
+                "{mode} {src}: {e:?}"
+            );
+        }
+        // Symmetry still holds for moderate arguments.
+        let a = s.eval("sinh(-3)").unwrap().to_f64();
+        assert!(close(a, -(3f64.sinh()), 1e-12), "{mode}: {a}");
+        let c = s.eval("cosh(-3)").unwrap().to_f64();
+        assert!(close(c, 3f64.cosh(), 1e-12), "{mode}: {c}");
+    }
+}
+
+#[test]
+fn odd_root_with_inexact_integral_index() {
+    let mut s = session_mode("float64");
+    assert_eq!(s.eval("root(-8, 3)").unwrap().to_f64(), -2.0);
+    let mut s = session();
+    assert!(close(
+        s.eval("root(-8, num(3))").unwrap().to_f64(),
+        -2.0,
+        1e-12
+    ));
+    assert!(close(
+        s.eval("root(-8, 3.0)").unwrap().to_f64(),
+        -2.0,
+        1e-12
+    ));
+    assert!(s.eval("root(-8, 2.0)").is_err());
+}
+
+#[test]
+fn gcd_lcm_accept_integral_floats() {
+    let mut s = session_mode("float64");
+    assert_eq!(s.eval("gcd(4, 6)").unwrap().to_f64(), 2.0);
+    assert_eq!(s.eval("lcm(4, 6)").unwrap().to_f64(), 12.0);
+    assert!(s.eval("gcd(4.5, 6)").is_err());
+}
+
+#[test]
+fn gamma_f64_exact_at_integers() {
+    let mut s = session_mode("float64");
+    assert_eq!(s.eval("gamma(4)").unwrap().to_f64(), 6.0);
+    assert_eq!(s.eval("gamma(11)").unwrap().to_f64(), 3_628_800.0);
+    assert_eq!(s.eval("4!").unwrap().to_f64(), 24.0);
+}
+
+#[test]
+fn plot_fn_gamma_of_non_finite_does_not_panic() {
+    for src in ["(10^400)!", "gamma(1/0)", "gamma(10^400)", "(1/0)!"] {
+        let f = plot(src, &["x"], &Env::new());
+        assert!(f.eval1(1.0).is_nan(), "{src}");
+    }
+    let f = plot("sqrt(x)!", &["x"], &Env::new());
+    assert!(f.is_compiled());
+    assert!(f.eval1(-1.0).is_nan());
+    assert_eq!(f.eval1(4.0), 2.0);
+    assert_eq!(f.eval1(0.0), 1.0);
+    let g = plot("gamma(ln(x))", &["x"], &Env::new());
+    assert!(g.eval1(-1.0).is_nan());
+    assert!(close(g.eval1(std::f64::consts::E.powi(3)), 2.0, 1e-12));
+    // `gamma` itself never panics on a stray non-finite `F64`.
+    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(
+            Number::F64(x)
+                .gamma(crate::number::Precision::DEFAULT)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn plot_fn_nan_propagation_matches_evaluator() {
+    let env = Env::new();
+    assert!(plot("sqrt(x)^0", &["x"], &env).eval1(-1.0).is_nan());
+    assert_eq!(plot("sqrt(x)^0", &["x"], &env).eval1(4.0), 1.0);
+    assert!(plot("1^ln(x)", &["x"], &env).eval1(-1.0).is_nan());
+    assert!(plot("sqrt(x)^(1/3)", &["x"], &env).eval1(-1.0).is_nan());
+    assert!(plot("root(x, 0)", &["x"], &env).eval1(2.0).is_nan());
+    assert!(plot("log(x, 1)", &["x"], &env).eval1(1.0).is_nan());
+    assert!(plot("log(x, -2)", &["x"], &env).eval1(4.0).is_nan());
+    assert!(plot("log(x, 0)", &["x"], &env).eval1(4.0).is_nan());
+    assert!(plot("log(2, x)", &["x"], &env).eval1(1.0).is_nan());
+    let mut s = session_mode("float64");
+    let want = s.eval("(-1) mod (-0.05)").unwrap().to_f64();
+    assert_eq!(plot("x mod (-0.05)", &["x"], &env).eval1(-1.0), want);
+}
+
+#[test]
+fn plot_fn_booleans_in_arithmetic_are_errors() {
+    let mut s = session();
+    ev_with(&mut s, "f(t) := t + 1");
+    for src in [
+        "(x > 0) + 1",
+        "true * x",
+        "-(x > 0)",
+        "sin(x > 0)",
+        "(x > 0)!",
+        "f(x > 0)",
+    ] {
+        let f = plot(src, &["x"], &s.env);
+        assert!(f.eval1(1.0).is_nan(), "{src}");
+    }
+    // Booleans are still fine as conditions and piecewise values.
+    assert_eq!(plot("{x > 0: x, 0}", &["x"], &s.env).eval1(2.0), 2.0);
+    assert_eq!(plot("x > 0 and x < 2", &["x"], &s.env).eval1(1.0), 1.0);
+}
+
+/// Differential test: the compiled fast path agrees with the general
+/// evaluator (`float64` mode) on value, or both are undefined/errors.
+#[test]
+fn plot_fn_differential_against_evaluator() {
+    let corpus = [
+        "x^3 - 2x + 1",
+        "sqrt(x)!",
+        "x!",
+        "gamma(x)",
+        "gamma(ln(x))",
+        "sqrt(x)^0",
+        "sqrt(x)^2",
+        "1^ln(x)",
+        "x^(1/3)",
+        "x^(2/3)",
+        "x^0.5",
+        "root(x, 3)",
+        "root(x, 2)",
+        "root(-8, x)",
+        "root(x, 0)",
+        "log(x, 2)",
+        "log(2, x)",
+        "log(x, 1)",
+        "log(x)",
+        "ln(x)",
+        "x mod (-0.05)",
+        "(-1) mod x",
+        "x mod 0.3",
+        "x mod 0",
+        "sinh(x)",
+        "cosh(x)",
+        "tanh(x)",
+        "sech(x)",
+        "csch(x)",
+        "coth(x)",
+        "asin(x)",
+        "acosh(x)",
+        "atanh(x)",
+        "1/x",
+        "exp(x) / x",
+        "|x - 1| + 2^x",
+        "floor(x) + frac(x)",
+        "{x < 0: -x, x}",
+        "{x < 0: -x}",
+        "(x^2 {0 < x < 2})",
+        "(x {x > 0})^0",
+        "(x > 0) + 1",
+        "true * x",
+        "-(x > 0)",
+        "x > 0 and x < 2",
+        "not (x > 1)",
+        "(10^400)!",
+        "gamma(1/0)",
+    ];
+    let samples = [-2.5, -1.0, -0.05, 0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 10.0];
+    let mut s = session_mode("float64");
+    for src in corpus {
+        let f = plot(src, &["x"], &Env::new());
+        for &x in &samples {
+            s.eval(&format!("let x = {x:?}")).unwrap();
+            let r = s.eval(src);
+            s.env.remove("x");
+            let want = match r {
+                Ok(Value::Number(n)) if n.is_real() => {
+                    let v = n.to_f64();
+                    if v.is_finite() { v } else { f64::NAN }
+                }
+                Ok(Value::Bool(b)) => f64::from(u8::from(b)),
+                _ => f64::NAN,
+            };
+            let got = f.eval1(x);
+            assert!(
+                (got.is_nan() && want.is_nan()) || close(got, want, 1e-9),
+                "{src} at x = {x}: plot {got} vs evaluator {want}"
+            );
+        }
+    }
+}

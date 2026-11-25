@@ -453,9 +453,11 @@ impl Number {
             return Err(NumberError::Domain("0-th root"));
         }
         let inv = n.recip()?;
-        if let Number::Integer(k) = n
-            && self.is_negative()
-            && num_integer::Integer::is_odd(k)
+        // Any integral index counts (`3`, `3.0`, `num(3)`).
+        if self.is_negative()
+            && n.is_integral()
+            && let Ok(k) = n.integer_value()
+            && num_integer::Integer::is_odd(&k)
         {
             return Ok(-(-self).pow(&inv, prec)?);
         }

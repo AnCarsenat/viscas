@@ -61,6 +61,7 @@
 //! precision handling uniform across all functions.
 
 mod arith;
+pub(crate) use arith::mod_f64;
 mod complex;
 mod elementary;
 mod float;

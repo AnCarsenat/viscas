@@ -476,24 +476,32 @@ impl BigFloat {
         Ok(r.mul_pow2(1).with_prec(prec))
     }
 
-    /// Hyperbolic sine.
+    /// Hyperbolic sine. Odd: computed on `|x|`, so `exp` never underflows to
+    /// zero (huge `|x|` overflows on both sides).
     pub fn sinh(&self) -> NumResult<Self> {
         let prec = self.prec();
         if self.is_zero() {
             return Ok(BigFloat::zero(prec));
         }
+        if self.is_negative() {
+            return Ok(self.neg().sinh()?.neg());
+        }
         let wp = prec + GUARD + small_extra(self);
         let a = self.with_prec(wp).exp()?;
-        let b = BigFloat::one(wp).div_prec(&a, wp).expect("exp > 0");
+        let b = BigFloat::one(wp)
+            .div_prec(&a, wp)
+            .ok_or(NumberError::Overflow)?;
         Ok(a.sub(&b).mul_pow2(-1).with_prec(prec))
     }
 
-    /// Hyperbolic cosine.
+    /// Hyperbolic cosine. Even: computed on `|x|` (see [`BigFloat::sinh`]).
     pub fn cosh(&self) -> NumResult<Self> {
         let prec = self.prec();
         let wp = prec + GUARD;
-        let a = self.with_prec(wp).exp()?;
-        let b = BigFloat::one(wp).div_prec(&a, wp).expect("exp > 0");
+        let a = self.abs().with_prec(wp).exp()?;
+        let b = BigFloat::one(wp)
+            .div_prec(&a, wp)
+            .ok_or(NumberError::Overflow)?;
         Ok(a.add(&b).mul_pow2(-1).with_prec(prec))
     }
 
