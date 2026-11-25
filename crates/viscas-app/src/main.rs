@@ -17,6 +17,7 @@ mod prefs;
 mod prefs_window;
 mod settings;
 mod shortcuts;
+mod status;
 mod theme;
 mod viewport;
 mod widgets;

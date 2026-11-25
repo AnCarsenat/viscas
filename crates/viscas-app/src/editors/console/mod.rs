@@ -54,6 +54,28 @@ thread_local! {
     /// Every console editor, most recently used last (palette commands
     /// act on the newest one that is on screen).
     static INSTANCES: RefCell<Vec<Weak<Inner>>> = const { RefCell::new(Vec::new()) };
+    /// The one console session of the app: every Console editor (in any
+    /// workspace or area) shows this transcript.
+    static SESSION: RefCell<Session> = RefCell::new(Session::default());
+}
+
+/// Transcript records shared by every console editor.
+#[derive(Default)]
+struct Session {
+    records: Vec<(u64, ConsoleOutput, PinSnapshot)>,
+    next_id: u64,
+}
+
+impl Session {
+    /// Records an entry; returns its id.
+    fn push(&mut self, output: ConsoleOutput, pin: PinSnapshot) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.records.push((id, output, pin));
+        let excess = trim_count(self.records.len(), MAX_ENTRIES);
+        self.records.drain(..excess);
+        id
+    }
 }
 
 /// What "Add to board" does for an entry, captured when it was evaluated
@@ -89,9 +111,8 @@ struct Inner {
     completions: RefCell<Vec<Completion>>,
     nav: RefCell<HistoryNav>,
     entries: RefCell<Vec<Entry>>,
-    next_id: Cell<u64>,
-    /// Header chips (exact/approx, rad/deg) of every built header.
-    chips: RefCell<Vec<(glib::WeakRef<gtk::Button>, glib::WeakRef<gtk::Button>)>>,
+    /// Example chips shown above the input while the transcript is empty.
+    examples: gtk::FlowBox,
     /// Programmatic buffer edit in progress (keeps history browsing).
     setting_text: Cell<bool>,
     /// Scroll to the end once the transcript grows.
@@ -152,8 +173,36 @@ impl Console {
             .spacing(6)
             .css_classes(["console-input-bar"])
             .build();
-        input_bar.append(&prompt);
-        input_bar.append(&input);
+        let placeholder = gtk::Label::builder()
+            .label(format!("Type math…  y = x^2 · a {} 2", definition_op(ctx)))
+            .xalign(0.0)
+            .valign(gtk::Align::Start)
+            .can_target(false)
+            .css_classes(["console-placeholder"])
+            .build();
+        let field_overlay = gtk::Overlay::builder().child(&input).hexpand(true).build();
+        field_overlay.add_overlay(&placeholder);
+        let buffer = input.buffer();
+        buffer.connect_changed(glib::clone!(
+            #[weak]
+            placeholder,
+            move |b| placeholder.set_visible(b.char_count() == 0)
+        ));
+        let field = gtk::Box::builder()
+            .spacing(6)
+            .hexpand(true)
+            .css_classes(["console-field"])
+            .build();
+        field.append(&prompt);
+        field.append(&field_overlay);
+        input_bar.append(&field);
+        let examples = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .max_children_per_line(8)
+            .column_spacing(4)
+            .row_spacing(4)
+            .css_classes(["console-examples"])
+            .build();
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Browse)
@@ -185,6 +234,7 @@ impl Console {
             .css_classes(["console"])
             .build();
         root.append(&scroller);
+        root.append(&examples);
         root.append(&input_bar);
 
         let console = Self {
@@ -200,8 +250,7 @@ impl Console {
                 completions: RefCell::default(),
                 nav: RefCell::default(),
                 entries: RefCell::default(),
-                next_id: Cell::new(0),
-                chips: RefCell::default(),
+                examples,
                 setting_text: Cell::new(false),
                 stick: Cell::new(false),
                 error_color: RefCell::new(error_color(ctx)),
@@ -213,8 +262,41 @@ impl Console {
         console.connect_input(&input_bar);
         console.connect_scrolling();
         console.connect_updates();
+        // Show the shared session's transcript (B4: one console app-wide).
+        let records: Vec<(u64, ConsoleOutput, PinSnapshot)> =
+            SESSION.with_borrow(|s| s.records.clone());
+        for (id, output, pin) in records {
+            console.append_local(id, output, pin);
+        }
         console.register(ctx);
+        console.focus_at_startup();
         console
+    }
+
+    /// The first console grabs keyboard focus once it is on screen.
+    fn focus_at_startup(&self) {
+        thread_local! {
+            static FOCUSED: Cell<bool> = const { Cell::new(false) };
+        }
+        if FOCUSED.get() {
+            return;
+        }
+        let weak = self.downgrade();
+        self.inner.input.connect_map(move |input| {
+            if !FOCUSED.replace(true) && Console::from_weak(&weak).is_some() {
+                let input = input.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(i) = input.upgrade() {
+                        i.grab_focus();
+                    }
+                });
+            }
+        });
+    }
+
+    /// Every live console editor.
+    fn all() -> Vec<Console> {
+        INSTANCES.with_borrow(|v| v.iter().filter_map(Console::from_weak).collect())
     }
 
     /// Tracks this console for palette commands; installs the command
@@ -265,42 +347,9 @@ impl Console {
 
     // ----------------------------------------------------------- header
 
-    /// Header widgets: mode chips mirroring the engine settings (synced
-    /// with the status bar) and a Clear button. Built fresh per header.
+    /// Header widgets: the Session menu and a Clear button (the exact /
+    /// radians chips live in the status bar only). Built fresh per header.
     pub fn header_content(&self) -> Vec<gtk::Widget> {
-        let chip = |tip: &str| {
-            gtk::Button::builder()
-                .tooltip_text(tip)
-                .css_classes(["chip", "flat"])
-                .valign(gtk::Align::Center)
-                .build()
-        };
-        let mode = chip("Exact or decimal results");
-        let angle = chip("Angle unit");
-        let ctx = self.inner.ctx.downgrade();
-        mode.connect_clicked(glib::clone!(
-            #[strong]
-            ctx,
-            move |_| {
-                if let Some(ctx) = ctx.upgrade() {
-                    let e = ctx.engine();
-                    e.set_settings_deferred(crate::doc_ui::toggled_approx(e.effective_settings()));
-                }
-            }
-        ));
-        angle.connect_clicked(move |_| {
-            if let Some(ctx) = ctx.upgrade() {
-                let e = ctx.engine();
-                e.set_settings_deferred(crate::doc_ui::toggled_angle(e.effective_settings()));
-            }
-        });
-        let settings = self.inner.ctx.engine().effective_settings();
-        update_mode_chips(&mode, &angle, &settings);
-        {
-            let mut chips = self.inner.chips.borrow_mut();
-            chips.retain(|(m, _)| m.upgrade().is_some());
-            chips.push((mode.downgrade(), angle.downgrade()));
-        }
         let clear = gtk::Button::builder()
             .icon_name(pick_icon(&[
                 "edit-clear-all-symbolic",
@@ -348,7 +397,7 @@ impl Console {
                 ("Forget Console Definitions", "forget", None),
             ],
         );
-        vec![menu.upcast(), mode.upcast(), angle.upcast(), clear.upcast()]
+        vec![menu.upcast(), clear.upcast()]
     }
 
     /// The newest entry matching `f`.
@@ -461,14 +510,11 @@ impl Console {
             .ctx
             .preferences()
             .connect_changed_for(quip.downgrade(), |q, p| q.set_visible(p.interface.playful));
-        let tries = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .max_children_per_line(6)
-            .halign(gtk::Align::Center)
-            .margin_top(8)
-            .column_spacing(4)
-            .row_spacing(4)
-            .build();
+        // Example chips sit just above the input (not in the empty state).
+        let tries = &self.inner.examples;
+        while let Some(child) = tries.first_child() {
+            tries.remove(&child);
+        }
         let examples = [
             "y = x^2".to_owned(),
             format!("a {op} 3"),
@@ -496,7 +542,6 @@ impl Console {
         empty.append(&hint);
         empty.append(&desc);
         empty.append(&quip);
-        empty.append(&tries);
         self.update_empty();
     }
 
@@ -504,6 +549,7 @@ impl Console {
         let has = !self.inner.entries.borrow().is_empty();
         self.inner.empty.set_visible(!has);
         self.inner.transcript.set_visible(has);
+        self.inner.examples.set_visible(!has);
     }
 
     // ------------------------------------------------------------ input
@@ -784,11 +830,22 @@ impl Console {
 
     // ------------------------------------------------------- transcript
 
+    /// Adds an entry to the shared session and to every console editor.
     fn append(&self, output: ConsoleOutput, pin: PinSnapshot) {
+        let id = SESSION.with_borrow_mut(|s| s.push(output.clone(), pin.clone()));
+        let mut all = Console::all();
+        if !all.iter().any(|c| Rc::ptr_eq(&c.inner, &self.inner)) {
+            all.push(self.clone());
+        }
+        for c in all {
+            c.append_local(id, output.clone(), pin.clone());
+        }
+    }
+
+    /// Adds an entry to this editor's transcript widgets.
+    fn append_local(&self, id: u64, output: ConsoleOutput, pin: PinSnapshot) {
         // The input may have changed the board: update older entries.
         self.refresh_entries();
-        let id = self.inner.next_id.get();
-        self.inner.next_id.set(id + 1);
         let (widget, state) = self.render_entry(&output, &pin, id);
         self.inner.transcript.append(&widget);
         self.inner.entries.borrow_mut().push(Entry {
@@ -810,7 +867,19 @@ impl Console {
         self.scroll_to_end();
     }
 
+    /// Clears the shared transcript in every console editor.
     fn clear_transcript(&self) {
+        SESSION.with_borrow_mut(|s| s.records.clear());
+        let mut all = Console::all();
+        if !all.iter().any(|c| Rc::ptr_eq(&c.inner, &self.inner)) {
+            all.push(self.clone());
+        }
+        for c in all {
+            c.clear_local();
+        }
+    }
+
+    fn clear_local(&self) {
         let entries = std::mem::take(&mut *self.inner.entries.borrow_mut());
         for e in entries {
             self.inner.transcript.remove(&e.widget);
@@ -1487,16 +1556,7 @@ impl Console {
             ) {
                 c.refresh_entries();
             }
-            if let DocEvent::Settings(s) = ev {
-                let mut chips = c.inner.chips.borrow_mut();
-                chips.retain(|(m, a)| match (m.upgrade(), a.upgrade()) {
-                    (Some(m), Some(a)) => {
-                        update_mode_chips(&m, &a, s);
-                        true
-                    }
-                    _ => false,
-                });
-                drop(chips);
+            if let DocEvent::Settings(_) = ev {
                 c.build_empty_state();
             }
         });
@@ -1513,29 +1573,6 @@ impl Console {
                     c.rebuild_entries();
                 }
             });
-    }
-}
-
-/// Status-bar-like labels for the header chips.
-fn update_mode_chips(mode: &gtk::Button, angle: &gtk::Button, s: &viscas_engine::EngineSettings) {
-    if s.approx {
-        mode.set_label("APPROX");
-        mode.remove_css_class("accent");
-        mode.set_tooltip_text(Some("Results shown as decimals — click for exact"));
-    } else {
-        mode.set_label("EXACT");
-        mode.add_css_class("accent");
-        mode.set_tooltip_text(Some("Results stay exact — click for decimals"));
-    }
-    match s.angle {
-        viscas_core::eval::AngleUnit::Radians => {
-            angle.set_label("RAD");
-            angle.set_tooltip_text(Some("Angle unit: radians — click for degrees"));
-        }
-        viscas_core::eval::AngleUnit::Degrees => {
-            angle.set_label("DEG");
-            angle.set_tooltip_text(Some("Angle unit: degrees — click for radians"));
-        }
     }
 }
 

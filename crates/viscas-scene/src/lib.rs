@@ -14,6 +14,7 @@
 //! - [`document`]: the versioned, human-readable `.viscas` format (RON).
 
 pub mod analysis;
+pub mod auto_name;
 pub mod document;
 pub mod eval;
 pub mod events;

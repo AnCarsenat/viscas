@@ -13,7 +13,7 @@ use crate::workspace::Workspace;
 /// Builds and returns the main window for `app`.
 pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     let areas = Areas::new(ctx, Workspace::Graph);
-    let (statusbar, selection_info, area_info, status_widgets) = build_statusbar();
+    let (statusbar, selection_info, status_widgets) = build_statusbar();
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -62,51 +62,17 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
         );
     }
 
-    let engine = ctx.engine().clone();
-    let update_selection = move |sel: &crate::ctx::Selection| {
-        let name = |id: crate::ctx::NodeId| {
-            engine
-                .with(|e| e.scene().get(id).and_then(|n| n.name.clone()))
-                .unwrap_or_else(|| format!("node {id}"))
-        };
-        let selected = sel.selected();
-        let text = match selected.len() {
-            0 => "Nothing selected".to_owned(),
-            1 => name(selected[0]),
-            n => format!("{n} nodes selected"),
-        };
-        let text = match sel.hovered() {
-            Some(id) => format!("{text}  ·  hover {}", name(id)),
-            None => text,
-        };
-        selection_info.set_label(&text);
-    };
-    update_selection(ctx.selection());
-    ctx.selection().connect_changed(update_selection);
-
-    let update_info = move |areas: &Areas| {
-        let layout = areas.layout();
-        let total = layout.leaves().len();
-        let text = match (areas.active_area(), areas.active_editor()) {
-            (Some(id), Some(kind)) => {
-                let pos = layout
-                    .leaves()
-                    .iter()
-                    .position(|(a, _)| *a == id)
-                    .map_or(0, |p| p + 1);
-                let max = if layout.maximized().is_some() {
-                    "  ·  maximized"
-                } else {
-                    ""
-                };
-                format!("{}  ·  area {pos}/{total}{max}", kind.title())
-            }
-            _ => String::new(),
-        };
-        area_info.set_label(&text);
-    };
-    update_info(&areas);
-    areas.connect_changed(update_info);
+    // Selection name · eval status · dirty marker (follows renames).
+    crate::status::connect(ctx, &selection_info);
+    let tip = selection_info.downgrade();
+    areas.connect_changed(move |areas| {
+        if let Some(label) = tip.upgrade() {
+            let text = areas
+                .active_editor()
+                .map(|k| format!("Active area: {}", k.title()));
+            label.set_tooltip_text(text.as_deref());
+        }
+    });
 
     window
 }
@@ -287,14 +253,9 @@ fn menubar() -> gio::Menu {
     bar
 }
 
-/// Status bar; returns it with the selection and active-area labels and
-/// the widgets the document code updates (clickable mode chips, status).
-fn build_statusbar() -> (
-    gtk::Box,
-    gtk::Label,
-    gtk::Label,
-    crate::doc_ui::StatusWidgets,
-) {
+/// Status bar; returns it with the selection label and the widgets the
+/// document code updates (clickable mode chips, status).
+fn build_statusbar() -> (gtk::Box, gtk::Label, crate::doc_ui::StatusWidgets) {
     let bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
@@ -320,9 +281,6 @@ fn build_statusbar() -> (
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     let selection_info = gtk::Label::builder().css_classes(["dim"]).build();
     bar.append(&selection_info);
-    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    let area_info = gtk::Label::builder().css_classes(["faint"]).build();
-    bar.append(&area_info);
 
     let spacer = gtk::Box::builder().hexpand(true).build();
     bar.append(&spacer);
@@ -355,7 +313,7 @@ fn build_statusbar() -> (
         angle_chip,
         status: status_label,
     };
-    (bar, selection_info, area_info, widgets)
+    (bar, selection_info, widgets)
 }
 
 /// Space opens the palette like Blender's search, unless focus is in a

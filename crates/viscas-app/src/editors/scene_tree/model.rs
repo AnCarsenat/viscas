@@ -55,6 +55,26 @@ pub fn main_source(kind: &NodeKind) -> Option<&str> {
 
 /// Row text for `node`; `value` is the evaluated display (`1/3`), if any.
 pub fn row_text(node: &Node, value: Option<&str>) -> RowText {
+    row_text_auto(node, value, None)
+}
+
+/// Row text in `scene`: unnamed drawable nodes show their automatic
+/// label (`Plot2`) with the expression as dim secondary text.
+pub fn row_text_in(scene: &Scene, node: &Node, value: Option<&str>) -> RowText {
+    row_text_auto(node, value, scene.auto_label(node.id))
+}
+
+/// The name shown for a node everywhere (tree, inspector, status bar):
+/// its name, its automatic label, or an expression preview.
+pub fn display_name(scene: &Scene, id: NodeId) -> String {
+    match scene.get(id) {
+        Some(node) => row_text_in(scene, node, None).title,
+        None => "(deleted)".to_owned(),
+    }
+}
+
+/// [`row_text`] with an automatic label for unnamed nodes.
+pub fn row_text_auto(node: &Node, value: Option<&str>, auto: Option<String>) -> RowText {
     const MAX: usize = 48;
     let value_detail = value
         .filter(|v| !v.is_empty())
@@ -79,6 +99,13 @@ pub fn row_text(node: &Node, value: Option<&str>) -> RowText {
             title: name.clone(),
             title_is_source: false,
             detail: value_detail,
+        },
+        (None, kind) if auto.is_some() => RowText {
+            title: auto.unwrap_or_default(),
+            title_is_source: false,
+            detail: main_source(kind)
+                .map(|s| one_line(s, 28))
+                .filter(|s| !s.is_empty()),
         },
         (None, kind) => match main_source(kind).map(|s| one_line(s, MAX)) {
             Some(src) if !src.is_empty() => RowText {
@@ -403,8 +430,8 @@ pub fn filter_nodes(scene: &Scene, query: &str) -> Vec<NodeId> {
         .enumerate()
         .filter_map(|(order, id)| {
             let node = scene.get(*id)?;
-            let by_title =
-                fuzzy::fuzzy_match(query, &row_text(node, None).title).map(|m| m.score + 1000);
+            let by_title = fuzzy::fuzzy_match(query, &row_text_in(scene, node, None).title)
+                .map(|m| m.score + 1000);
             let by_text = fuzzy::fuzzy_match(query, &search_text(node)).map(|m| m.score);
             by_title.or(by_text).map(|s| (s, order, *id))
         })

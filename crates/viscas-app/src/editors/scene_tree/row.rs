@@ -160,7 +160,7 @@ impl Row {
                 NodeKind::Variable { .. } | NodeKind::Slider { .. } | NodeKind::List { .. }
             ) || matches!(node.kind, NodeKind::Point { .. })
         });
-        let text = model::row_text(node, value.as_deref());
+        let text = model::row_text_in(engine.scene(), node, value.as_deref());
         self.title.set_label(&text.title);
         if text.title_is_source {
             self.title.add_css_class("mono");

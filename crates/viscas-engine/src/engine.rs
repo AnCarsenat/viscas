@@ -412,10 +412,20 @@ impl Engine {
         parent: Option<NodeId>,
         content: NodeContent,
     ) -> Result<NodeId, EngineError> {
+        let content = self.with_auto_name(content);
         let id = self.scene.add(parent, content)?;
         self.assign_auto_color(id);
         self.update();
         Ok(id)
+    }
+
+    /// Gives an unnamed drawable node its Godot-style automatic name
+    /// (`Plot1`, `Circle1`, `Point1`, ...; see [`viscas_scene::auto_name`]).
+    pub(crate) fn with_auto_name(&self, mut content: NodeContent) -> NodeContent {
+        if content.name.as_deref().is_none_or(|n| n.trim().is_empty()) {
+            content.name = self.scene.next_auto_name(&content.kind);
+        }
+        content
     }
 
     pub(crate) fn assign_auto_color(&mut self, id: NodeId) {
