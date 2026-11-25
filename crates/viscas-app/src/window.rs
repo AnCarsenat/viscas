@@ -30,9 +30,9 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
         .default_height(880)
         .width_request(480)
         .height_request(320)
-        .titlebar(&build_topbar(ctx))
         .child(&overlay)
         .build();
+    window.set_titlebar(Some(&build_topbar(ctx, &areas)));
 
     let palette = Palette::new(&overlay, ctx);
     palette.contain_focus(&window);
@@ -78,7 +78,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     window
 }
 
-fn build_topbar(ctx: &AppCtx) -> gtk::HeaderBar {
+fn build_topbar(ctx: &AppCtx, areas: &Areas) -> gtk::HeaderBar {
     let header = gtk::HeaderBar::builder()
         .show_title_buttons(true)
         .css_classes(["topbar"])
@@ -109,41 +109,39 @@ fn build_topbar(ctx: &AppCtx) -> gtk::HeaderBar {
         .build();
     header.pack_start(&app_menu);
     let show = ctx.preferences().with(|p| p.interface.show_unfinished);
-    let bar = gtk::PopoverMenuBar::from_model(Some(&menubar(show)));
+    let (model, section) = menubar(show);
+    let bar = gtk::PopoverMenuBar::from_model(Some(&model));
+    // The View ▸ area section of the current menu model.
+    let area_section = std::rc::Rc::new(std::cell::RefCell::new(section));
+    // Area items name the area they act on: "Close Area (Viewport)".
+    let last_label = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
     // "Show unfinished editors" changes the Editor Type / Workspace menus.
     let last = std::cell::Cell::new(show);
+    let (sec, lbl) = (area_section.clone(), last_label.clone());
     ctx.preferences()
         .connect_changed_for(bar.downgrade(), move |bar, p| {
             let show = p.interface.show_unfinished;
             if last.replace(show) != show {
-                bar.set_menu_model(Some(&menubar(show)));
+                let (model, section) = menubar(show);
+                let name = lbl.borrow().clone().unwrap_or_else(|| "Area".to_owned());
+                fill_area_section(&section, &name);
+                sec.replace(section);
+                bar.set_menu_model(Some(&model));
             }
         });
     header.pack_start(&bar);
+    let update_area_section = move |areas: &Areas| {
+        let name = areas.target_editor().map(|k| k.title()).unwrap_or("Area");
+        if last_label.borrow().as_deref() == Some(name) {
+            return;
+        }
+        last_label.replace(Some(name.to_owned()));
+        fill_area_section(&area_section.borrow(), name);
+    };
+    update_area_section(areas);
+    areas.connect_changed(update_area_section);
 
-    // Workspace tabs, radio-like through the stateful `win.workspace` action.
-    let tabs = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(1)
-        .valign(gtk::Align::Center)
-        .css_classes(["workspace-tabs"])
-        .build();
-    for ws in Workspace::ALL {
-        let tab = gtk::ToggleButton::builder()
-            .label(ws.title())
-            .action_name("win.workspace")
-            .action_target(&ws.id().to_variant())
-            .tooltip_text(format!(
-                "{} workspace ({})",
-                ws.title(),
-                crate::shortcuts::label_for(&format!("win.workspace::{}", ws.id()))
-                    .unwrap_or_default()
-            ))
-            .build();
-        crate::editors::bind_shown(&tab, ctx, move |p| crate::editors::workspace_shown(ws, p));
-        tabs.append(&tab);
-    }
-    header.set_title_widget(Some(&tabs));
+    header.set_title_widget(Some(&workspace_tabs(ctx, areas)));
 
     // Command palette button with keycap hint.
     let content = gtk::Box::builder()
@@ -178,6 +176,116 @@ fn build_topbar(ctx: &AppCtx) -> gtk::HeaderBar {
     header
 }
 
+/// Workspace tabs. Their checked state is driven by the area system
+/// rather than by a stateful action (which left the old tab highlighted
+/// after a round trip, audit B5). Right-click resets a workspace.
+fn workspace_tabs(ctx: &AppCtx, areas: &Areas) -> gtk::Box {
+    let tabs = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(1)
+        .valign(gtk::Align::Center)
+        .css_classes(["workspace-tabs"])
+        .build();
+    let mut buttons = Vec::new();
+    for ws in Workspace::ALL {
+        let tab = gtk::ToggleButton::builder()
+            .label(ws.title())
+            .tooltip_text(format!(
+                "{} workspace ({}) · right-click to reset its layout",
+                ws.title(),
+                crate::shortcuts::label_for(&format!("win.workspace::{}", ws.id()))
+                    .unwrap_or_default()
+            ))
+            .build();
+        tab.connect_clicked(move |tab| {
+            // Undo GTK's own toggle; the listener below sets the state.
+            tab.set_active(!tab.is_active());
+            let _ = WidgetExt::activate_action(tab, "win.workspace", Some(&ws.id().to_variant()));
+        });
+
+        let menu = gio::Menu::new();
+        menu.append(Some("Reset Workspace Layout"), Some("tab.reset"));
+        menu.append(
+            Some("Reset All Workspaces"),
+            Some("win.reset-all-workspaces"),
+        );
+        let group = gio::SimpleActionGroup::new();
+        let reset = gio::SimpleAction::new("reset", None);
+        // Goes through a window action: capturing `Areas` here would keep
+        // it alive through its own listener.
+        reset.connect_activate(glib::clone!(
+            #[weak]
+            tab,
+            move |_, _| {
+                let _ = WidgetExt::activate_action(
+                    &tab,
+                    "win.reset-workspace-id",
+                    Some(&ws.id().to_variant()),
+                );
+            }
+        ));
+        group.add_action(&reset);
+        tab.insert_action_group("tab", Some(&group));
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_has_arrow(false);
+        popover.set_parent(&tab);
+        tab.connect_destroy(glib::clone!(
+            #[strong]
+            popover,
+            move |_| popover.unparent()
+        ));
+        let right = gtk::GestureClick::builder().button(3).build();
+        right.connect_pressed(move |_, _, _, _| popover.popup());
+        tab.add_controller(right);
+
+        tabs.append(&tab);
+        buttons.push((ws, tab));
+    }
+    // Visible unless hidden through `Areas::set_workspace_visible` or as an
+    // unfinished workspace ("Show unfinished editors" off); the current
+    // one always shows. The area system re-notifies on preference changes.
+    let ctx = ctx.clone();
+    let sync = move |areas: &Areas| {
+        let current = areas.workspace();
+        let p = ctx.preferences().get();
+        for (ws, tab) in &buttons {
+            if tab.is_active() != (*ws == current) {
+                tab.set_active(*ws == current);
+            }
+            let shown = areas.workspace_visible(*ws) && crate::editors::workspace_shown(*ws, &p);
+            tab.set_visible(shown || *ws == current);
+        }
+    };
+    sync(areas);
+    areas.connect_changed(sync);
+    tabs
+}
+
+/// Fills the View menu's area section, naming the target area.
+fn fill_area_section(section: &gio::Menu, name: &str) {
+    section.remove_all();
+    section.append(
+        Some(&format!("Split Area _Horizontally ({name})")),
+        Some("win.split-area::horizontal"),
+    );
+    section.append(
+        Some(&format!("Split Area _Vertically ({name})")),
+        Some("win.split-area::vertical"),
+    );
+    section.append(
+        Some(&format!("_Maximize Area ({name})")),
+        Some("win.maximize-area"),
+    );
+    section.append(
+        Some(&format!("Open Area in New _Window ({name})")),
+        Some("win.float-area"),
+    );
+    section.append(
+        Some(&format!("_Close Area ({name})")),
+        Some("win.close-area"),
+    );
+}
+
 fn app_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     let prefs = gio::Menu::new();
@@ -193,8 +301,9 @@ fn app_menu() -> gio::Menu {
     menu
 }
 
-/// The menu bar; `show_unfinished` lists unfinished editors/workspaces.
-fn menubar(show_unfinished: bool) -> gio::Menu {
+/// The menu bar and its View ▸ area section (relabelled as the target
+/// area changes).
+fn menubar(show_unfinished: bool) -> (gio::Menu, gio::Menu) {
     // Items pointing at unregistered actions render insensitive; they are
     // placeholders for the document milestone (M8).
     let file = gio::Menu::new();
@@ -225,16 +334,13 @@ fn menubar(show_unfinished: bool) -> gio::Menu {
 
     let view = gio::Menu::new();
     let area = gio::Menu::new();
-    area.append(
-        Some("Split Area _Horizontally"),
-        Some("win.split-area::horizontal"),
-    );
-    area.append(
-        Some("Split Area _Vertically"),
-        Some("win.split-area::vertical"),
-    );
-    area.append(Some("_Close Area"), Some("win.close-area"));
-    area.append(Some("_Maximize Area"), Some("win.maximize-area"));
+    fill_area_section(&area, "Area");
+    let layout_history = gio::Menu::new();
+    let undo_item = gio::MenuItem::new(Some("_Undo Layout Change"), Some("win.layout-undo"));
+    // Handled by the window, not an app accelerator: show it here.
+    undo_item.set_attribute_value("accel", Some(&"<Control><Alt>z".to_variant()));
+    layout_history.append_item(&undo_item);
+    layout_history.append(Some("Redo Layout Change"), Some("win.layout-redo"));
     let editors = gio::Menu::new();
     for kind in EditorKind::ALL
         .into_iter()
@@ -246,19 +352,29 @@ fn menubar(show_unfinished: bool) -> gio::Menu {
         );
     }
     let workspaces = gio::Menu::new();
+    let list = gio::Menu::new();
     for ws in Workspace::ALL
         .into_iter()
         .filter(|w| show_unfinished || !crate::editors::is_unfinished_workspace(*w))
     {
-        workspaces.append(
+        list.append(
             Some(ws.title()),
             Some(&format!("win.workspace::{}", ws.id())),
         );
     }
+    let reset = gio::Menu::new();
+    reset.append(Some("_Reset Workspace Layout"), Some("win.reset-workspace"));
+    reset.append(
+        Some("Reset _All Workspaces"),
+        Some("win.reset-all-workspaces"),
+    );
+    workspaces.append_section(None, &list);
+    workspaces.append_section(None, &reset);
     let subs = gio::Menu::new();
     subs.append_submenu(Some("_Editor Type"), &editors);
     subs.append_submenu(Some("_Workspace"), &workspaces);
     view.append_section(None, &area);
+    view.append_section(None, &layout_history);
     view.append_section(None, &subs);
 
     let help = gio::Menu::new();
@@ -270,7 +386,7 @@ fn menubar(show_unfinished: bool) -> gio::Menu {
     bar.append_submenu(Some("_Edit"), &edit);
     bar.append_submenu(Some("_View"), &view);
     bar.append_submenu(Some("_Help"), &help);
-    bar
+    (bar, area)
 }
 
 /// Status bar; returns it with the selection label and the widgets the
@@ -405,9 +521,59 @@ pub fn text_undo_target(window: &gtk::Window, redo: bool) -> Option<gtk::Widget>
     None
 }
 
+/// Keys handled here rather than as application accelerators (see
+/// `shortcuts::WINDOW_KEYS`): Ctrl+Tab / Ctrl+Shift+Tab cycle the tabs
+/// of the area under the pointer (capture phase, before focus
+/// navigation); Ctrl+Alt+Z undoes a layout change unless a text field
+/// has focus (AltGr+Z types there on some layouts).
+pub fn install_layout_keys(window: &gtk::Window) {
+    use gtk::gdk::{Key, ModifierType};
+    let tabs = gtk::EventControllerKey::new();
+    tabs.set_propagation_phase(gtk::PropagationPhase::Capture);
+    tabs.connect_key_pressed(glib::clone!(
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, key, _, mods| {
+            let ctrl = mods.contains(ModifierType::CONTROL_MASK)
+                && !mods.intersects(ModifierType::ALT_MASK | ModifierType::SUPER_MASK);
+            let action = match key {
+                Key::Tab if ctrl && !mods.contains(ModifierType::SHIFT_MASK) => "win.next-tab",
+                Key::ISO_Left_Tab | Key::Tab if ctrl => "win.prev-tab",
+                _ => return glib::Propagation::Proceed,
+            };
+            let _ = WidgetExt::activate_action(&window, action, None);
+            glib::Propagation::Stop
+        }
+    ));
+    window.add_controller(tabs);
+
+    let undo = gtk::EventControllerKey::new();
+    undo.connect_key_pressed(glib::clone!(
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, key, _, mods| {
+            let wanted = ModifierType::CONTROL_MASK | ModifierType::ALT_MASK;
+            let is_z = matches!(key, Key::z | Key::Z);
+            if !is_z
+                || mods & (wanted | ModifierType::SHIFT_MASK | ModifierType::SUPER_MASK) != wanted
+                || focus_is_text(&window)
+            {
+                return glib::Propagation::Proceed;
+            }
+            let _ = WidgetExt::activate_action(&window, "win.layout-undo", None);
+            glib::Propagation::Stop
+        }
+    ));
+    window.add_controller(undo);
+}
+
 /// Whether the focused widget takes text input.
-fn focus_is_text(window: &gtk::ApplicationWindow) -> bool {
-    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else {
+fn focus_is_text(window: &impl IsA<gtk::Window>) -> bool {
+    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window.upcast_ref()) else {
         return false;
     };
     focus.is::<gtk::Text>()
@@ -451,6 +617,55 @@ fn install_actions(window: &gtk::ApplicationWindow, areas: &Areas, palette: &Pal
         move |_, _| areas.toggle_maximize(None)
     ));
     window.add_action(&maximize);
+
+    let simple = |name: &str, f: fn(&Areas)| {
+        let action = gio::SimpleAction::new(name, None);
+        action.connect_activate(glib::clone!(
+            #[strong]
+            areas,
+            move |_, _| f(&areas)
+        ));
+        window.add_action(&action);
+    };
+    simple("float-area", |a| a.tear_off(None));
+    simple("layout-undo", Areas::undo_layout);
+    simple("layout-redo", Areas::redo_layout);
+    simple("next-tab", |a| a.cycle_tab(1));
+    simple("prev-tab", |a| a.cycle_tab(-1));
+    install_layout_keys(window.upcast_ref());
+    // Enabled only with something to undo/redo.
+    let sync_history = glib::clone!(
+        #[weak]
+        window,
+        move |areas: &Areas| {
+            for (name, enabled) in [
+                ("layout-undo", areas.can_undo_layout()),
+                ("layout-redo", areas.can_redo_layout()),
+            ] {
+                if let Some(a) = window
+                    .lookup_action(name)
+                    .and_downcast::<gio::SimpleAction>()
+                {
+                    a.set_enabled(enabled);
+                }
+            }
+        }
+    );
+    sync_history(areas);
+    areas.connect_changed(sync_history);
+    simple("reset-workspace", |a| a.reset_workspace(None));
+    simple("reset-all-workspaces", Areas::reset_all_workspaces);
+    let reset_id = gio::SimpleAction::new("reset-workspace-id", Some(glib::VariantTy::STRING));
+    reset_id.connect_activate(glib::clone!(
+        #[strong]
+        areas,
+        move |_, param| {
+            if let Some(ws) = param.and_then(|p| p.str()).and_then(Workspace::from_id) {
+                areas.reset_workspace(Some(ws));
+            }
+        }
+    ));
+    window.add_action(&reset_id);
 
     let editor = gio::SimpleAction::new("editor", Some(glib::VariantTy::STRING));
     editor.connect_activate(glib::clone!(

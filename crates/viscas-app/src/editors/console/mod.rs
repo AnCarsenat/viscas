@@ -247,6 +247,13 @@ impl Console {
         // knows its own children and would loop on a foreign one when the
         // editor is destroyed (closing the area, File > New/Open).
         popover.set_parent(&input_bar);
+        // Moving the console to another area or window unmaps it: never
+        // leave the completion popover open on the old surface.
+        input_bar.connect_unmap(glib::clone!(
+            #[weak]
+            popover,
+            move |_| popover.popdown()
+        ));
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)

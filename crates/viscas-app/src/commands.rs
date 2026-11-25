@@ -7,7 +7,7 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::layout::{Dir, EditorKind};
+use crate::layout::EditorKind;
 use crate::shortcuts;
 use crate::workspace::Workspace;
 
@@ -91,21 +91,22 @@ pub fn specs() -> Vec<(String, String, &'static str)> {
         ("app.about", "About Viscas", "Help"),
         ("app.quit", "Quit", "General"),
         ("win.maximize-area", "Maximize / Restore Area", "Area"),
-        ("win.close-area", "Close Area (Join)", "Area"),
+        ("win.layout-undo", "Undo Layout Change", "Area"),
+        ("win.layout-redo", "Redo Layout Change", "Area"),
+        ("win.next-tab", "Next Tab in Area", "Area"),
+        ("win.prev-tab", "Previous Tab in Area", "Area"),
+        ("win.reset-workspace", "Reset Workspace Layout", "Workspace"),
+        (
+            "win.reset-all-workspaces",
+            "Reset All Workspaces",
+            "Workspace",
+        ),
     ]
     .into_iter()
     .map(|(a, t, c)| (a.to_owned(), t.to_owned(), c))
     .collect();
-    for (dir, title) in [
-        (Dir::Horizontal, "Split Area Horizontally"),
-        (Dir::Vertical, "Split Area Vertically"),
-    ] {
-        list.push((
-            format!("win.split-area::{}", dir.id()),
-            title.to_owned(),
-            "Area",
-        ));
-    }
+    // Split, close, swap and tear-off commands come labelled with their
+    // target area from `areas::AreaCommands`.
     for ws in Workspace::ALL {
         list.push((
             format!("win.workspace::{}", ws.id()),

@@ -9,6 +9,7 @@ mod compose;
 mod ctx;
 mod doc;
 mod doc_ui;
+mod docking;
 mod editors;
 mod fuzzy;
 mod layout;

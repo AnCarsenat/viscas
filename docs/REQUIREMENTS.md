@@ -44,11 +44,40 @@ Areas can be split, joined, resized, swapped and maximized (Ctrl+Space).
 - Drag from an area corner into the area to split it; drag into a neighbour to
   join (the neighbour is absorbed, with a preview overlay).
 - Drag an area by its header onto another area: drop zones (left/right/top/
-  bottom/center) dock it there or swap.
+  bottom/center) dock it there. Center docks it as a **tab** (Shift+center
+  swaps the areas, Ctrl+center replaces the target); the center zone shows
+  which ("Tab" / "Swap" / "Replace").
+- **Tabs:** an area holds an ordered list of editors. With two or more, a
+  compact tab strip (icon + name, accent underline on the shown tab, close
+  × on hover, middle-click closes) sits above the header. Click shows a
+  tab; drag a tab to reorder it, onto another strip or area (same drop
+  zones) or out of the window. Ctrl+Tab / Ctrl+Shift+Tab cycle the tabs of
+  the area under the pointer. The editor-type switch changes the shown
+  tab's editor; closing the last tab closes the area. Each tab keeps its
+  editor state; hidden tabs do no plotting work.
 - Tear off an area into its own floating window (drag outside, or header menu
   "Open in New Window"); dock it back the same way.
 - All of this is layout-model operations, undoable for layout, saved per
   document/workspace (including floating windows).
+- **Layout undo is separate from document undo.** Ctrl+Z only ever undoes
+  document (or in-field text) edits. Layout changes (split, close, join,
+  dock, tear off, editor change, reset, divider drags) go on their own
+  history: View ▸ Undo Layout Change (Ctrl+Alt+Z), the palette, or the
+  Undo button of the toast shown after closing/joining/moving areas
+  ("Area closed · Undo"). The layout history is cleared when a document
+  is opened or created.
+- Header: editor-type switch (icon-only when narrow), editor menus (whole
+  menus hide when they do not fit), and one "⋯" area menu (also on header
+  right-click): Split Horizontal/Vertical, Maximize (Ctrl+Space), Swap
+  with…, Open in New Window, Close. The active area (last clicked) has an
+  accent bar on its header; menu and palette area actions target the area
+  under the pointer, else the active one, and name it ("Close Area
+  (Viewport)").
+- Dividers keep their ratio whatever the editors' content; 6 px hit zone,
+  double-click equalizes, Ctrl while dragging snaps to 10%; areas stay at
+  least 120×80 px when dragging. A workspace always keeps one Viewport.
+  View ▸ Workspace (and a tab's right-click menu) offers Reset Workspace
+  Layout and Reset All Workspaces.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
