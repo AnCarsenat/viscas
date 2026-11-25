@@ -30,7 +30,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
         .default_height(880)
         .width_request(480)
         .height_request(320)
-        .titlebar(&build_topbar())
+        .titlebar(&build_topbar(ctx))
         .child(&overlay)
         .build();
 
@@ -40,9 +40,10 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     crate::compose::install(&window);
     install_actions(&window, &areas, &palette);
     crate::doc_ui::install(&window, ctx, &areas, status_widgets);
-    ctx.add_command_provider(WindowCommands::new(&window));
+    ctx.add_command_provider(WindowCommands::new(&window, ctx));
     ctx.add_command_provider(AreaCommands::new(&areas));
     ctx.add_command_provider(crate::editors::scene_tree::ops::NodeCommands::new(ctx));
+    crate::palette_sources::install(&window, ctx);
 
     if let Some(notice) = ctx.preferences().load_notice() {
         let label = gtk::Label::builder()
@@ -77,7 +78,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     window
 }
 
-fn build_topbar() -> gtk::HeaderBar {
+fn build_topbar(ctx: &AppCtx) -> gtk::HeaderBar {
     let header = gtk::HeaderBar::builder()
         .show_title_buttons(true)
         .css_classes(["topbar"])
@@ -107,7 +108,23 @@ fn build_topbar() -> gtk::HeaderBar {
         .css_classes(["app-menu", "flat"])
         .build();
     header.pack_start(&app_menu);
-    header.pack_start(&gtk::PopoverMenuBar::from_model(Some(&menubar())));
+    let show = ctx.preferences().with(|p| p.interface.show_unfinished);
+    let bar = gtk::PopoverMenuBar::from_model(Some(&menubar(show)));
+    // "Show unfinished editors" changes the Editor Type / Workspace menus.
+    let weak = bar.downgrade();
+    let last = std::cell::Cell::new(show);
+    ctx.preferences()
+        .connect_changed(move |p| match weak.upgrade() {
+            Some(bar) => {
+                let show = p.interface.show_unfinished;
+                if last.replace(show) != show {
+                    bar.set_menu_model(Some(&menubar(show)));
+                }
+                true
+            }
+            None => false,
+        });
+    header.pack_start(&bar);
 
     // Workspace tabs, radio-like through the stateful `win.workspace` action.
     let tabs = gtk::Box::builder()
@@ -128,6 +145,7 @@ fn build_topbar() -> gtk::HeaderBar {
                     .unwrap_or_default()
             ))
             .build();
+        crate::editors::bind_shown(&tab, ctx, move |p| crate::editors::workspace_shown(ws, p));
         tabs.append(&tab);
     }
     header.set_title_widget(Some(&tabs));
@@ -180,7 +198,8 @@ fn app_menu() -> gio::Menu {
     menu
 }
 
-fn menubar() -> gio::Menu {
+/// The menu bar; `show_unfinished` lists unfinished editors/workspaces.
+fn menubar(show_unfinished: bool) -> gio::Menu {
     // Items pointing at unregistered actions render insensitive; they are
     // placeholders for the document milestone (M8).
     let file = gio::Menu::new();
@@ -222,14 +241,20 @@ fn menubar() -> gio::Menu {
     area.append(Some("_Close Area"), Some("win.close-area"));
     area.append(Some("_Maximize Area"), Some("win.maximize-area"));
     let editors = gio::Menu::new();
-    for kind in EditorKind::ALL {
+    for kind in EditorKind::ALL
+        .into_iter()
+        .filter(|k| show_unfinished || !crate::editors::is_unfinished(*k))
+    {
         editors.append(
             Some(kind.title()),
             Some(&format!("win.editor::{}", kind.id())),
         );
     }
     let workspaces = gio::Menu::new();
-    for ws in Workspace::ALL {
+    for ws in Workspace::ALL
+        .into_iter()
+        .filter(|w| show_unfinished || !crate::editors::is_unfinished_workspace(*w))
+    {
         workspaces.append(
             Some(ws.title()),
             Some(&format!("win.workspace::{}", ws.id())),

@@ -149,6 +149,7 @@ impl Viewport {
         viewport.install_keys();
         viewport.plots.refresh();
         viewport.update_hud(None);
+        register_instance(&viewport);
         viewport
     }
 
@@ -808,5 +809,176 @@ fn zoom_percent(view: &View) -> String {
         format!("{pct:.0} %")
     } else {
         format!("{pct:.2e} %")
+    }
+}
+
+// ---------------------------------------------------------------------
+// Palette hooks: frame a node, show a node's features
+// ---------------------------------------------------------------------
+
+thread_local! {
+    /// Every viewport editor, newest last (palette commands act on the
+    /// newest one on screen).
+    static INSTANCES: RefCell<Vec<WeakViewport>> = const { RefCell::new(Vec::new()) };
+}
+
+fn register_instance(vp: &Viewport) {
+    INSTANCES.with_borrow_mut(|v| {
+        v.retain(|w| w.upgrade().is_some());
+        v.push(vp.downgrade());
+    });
+}
+
+/// The newest viewport editor that is on screen.
+pub fn active() -> Option<Viewport> {
+    INSTANCES.with_borrow(|v| {
+        v.iter()
+            .rev()
+            .filter_map(WeakViewport::upgrade)
+            .find(|vp| vp.area.is_mapped())
+    })
+}
+
+/// Which features [`Viewport::show_features`] shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureSet {
+    Roots,
+    Extrema,
+}
+
+impl FeatureSet {
+    fn wants(self, kind: viscas_plot::FeatureKind) -> bool {
+        use viscas_plot::FeatureKind as K;
+        match self {
+            FeatureSet::Roots => kind == K::Root,
+            FeatureSet::Extrema => matches!(kind, K::Minimum | K::Maximum),
+        }
+    }
+}
+
+impl Viewport {
+    /// Centers the view on `node`'s drawing (zooming out when it does
+    /// not fit). Returns whether the node has anything drawn.
+    pub fn frame_node(&self, node: viscas_scene::NodeId) -> bool {
+        let mut b: Option<(f64, f64, f64, f64)> = None;
+        for layer in self
+            .plots
+            .layers
+            .borrow()
+            .iter()
+            .filter(|l| l.node_id == node)
+        {
+            for prim in layer.primitives.iter() {
+                let pts: &[viscas_plot::Vec2] = match prim {
+                    viscas_plot::Primitive::Polyline { line, .. } => &line.points,
+                    viscas_plot::Primitive::Polygon(poly) => &poly.points,
+                    viscas_plot::Primitive::Points(p) => p,
+                };
+                for p in pts.iter().filter(|p| p.x.is_finite() && p.y.is_finite()) {
+                    b = Some(match b {
+                        None => (p.x, p.x, p.y, p.y),
+                        Some((x0, x1, y0, y1)) => {
+                            (x0.min(p.x), x1.max(p.x), y0.min(p.y), y1.max(p.y))
+                        }
+                    });
+                }
+            }
+        }
+        let Some((x0, x1, y0, y1)) = b else {
+            return false;
+        };
+        self.update_view(|v| {
+            v.center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            let (w, h) = (x1 - x0, y1 - y0);
+            // Zoom out (never in) so the drawing fits with a margin.
+            let fit_x = if w > 0.0 {
+                v.size.0 * 0.8 / w
+            } else {
+                f64::INFINITY
+            };
+            let fit_y = if h > 0.0 {
+                v.size.1 * 0.8 / (h * v.aspect)
+            } else {
+                f64::INFINITY
+            };
+            let fit = fit_x.min(fit_y);
+            if fit < v.scale {
+                v.scale = fit.max(view::MIN_SCALE);
+            }
+        });
+        true
+    }
+
+    /// Shows the roots or extrema of `node` in the view as labelled dots.
+    pub fn show_features(&self, node: viscas_scene::NodeId, set: FeatureSet) -> usize {
+        let id = self.plots.id;
+        let hits: Vec<_> = self
+            .ctx()
+            .engine()
+            .with(|e| e.node_features(node, Some(id)))
+            .into_iter()
+            .filter(|h| h.node == node && set.wants(h.feature.kind))
+            .collect();
+        let n = hits.len();
+        *self.plots.features.borrow_mut() = hits;
+        self.queue_draw();
+        n
+    }
+}
+
+/// Palette commands acting on the selection in the active viewport.
+pub struct ViewportCommands(crate::ctx::WeakCtx);
+
+impl ViewportCommands {
+    pub fn new(ctx: &AppCtx) -> Self {
+        Self(ctx.downgrade())
+    }
+}
+
+impl crate::commands::CommandProvider for ViewportCommands {
+    fn commands(&self) -> Vec<crate::commands::Command> {
+        let Some(ctx) = self.0.upgrade() else {
+            return Vec::new();
+        };
+        let Some(&node) = ctx.selection().selected().last() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (id, title, set) in [
+            (
+                "viewport.show-roots",
+                "Show Roots of Selected",
+                FeatureSet::Roots,
+            ),
+            (
+                "viewport.show-extrema",
+                "Show Extrema of Selected",
+                FeatureSet::Extrema,
+            ),
+        ] {
+            out.push(crate::commands::Command {
+                id: id.to_owned(),
+                title: title.to_owned(),
+                category: "Viewport",
+                shortcut: None,
+                run: Rc::new(move || {
+                    if let Some(vp) = active() {
+                        vp.show_features(node, set);
+                    }
+                }),
+            });
+        }
+        out.push(crate::commands::Command {
+            id: "viewport.frame-selected".to_owned(),
+            title: "Frame Selected".to_owned(),
+            category: "Viewport",
+            shortcut: None,
+            run: Rc::new(move || {
+                if let Some(vp) = active() {
+                    vp.frame_node(node);
+                }
+            }),
+        });
+        out
     }
 }

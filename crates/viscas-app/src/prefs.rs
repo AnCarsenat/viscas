@@ -98,6 +98,9 @@ pub struct Interface {
     pub playful: bool,
     /// How GTK rasterizes text.
     pub font_rendering: FontRendering,
+    /// Show the Data/Script workspaces and the editors that are not built
+    /// yet (Sheet, Script, Dependency Graph).
+    pub show_unfinished: bool,
 }
 
 impl Default for Interface {
@@ -109,6 +112,7 @@ impl Default for Interface {
             tooltips: true,
             playful: true,
             font_rendering: FontRendering::default(),
+            show_unfinished: false,
         }
     }
 }

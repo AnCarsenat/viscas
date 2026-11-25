@@ -43,6 +43,15 @@ use history::HistoryNav;
 /// A header-menu action: name and what it does.
 type MenuAction = (&'static str, fn(&Console));
 
+/// Inserts `text` at the cursor of the active console (palette: insert
+/// a function).
+pub fn insert_into_active(text: &str) {
+    let console = Console::active().or_else(|| Console::all().into_iter().next());
+    if let Some(c) = console {
+        c.insert_at_cursor(text);
+    }
+}
+
 /// Entries kept in the transcript; older ones are dropped.
 const MAX_ENTRIES: usize = 400;
 /// Completion candidates shown at once.

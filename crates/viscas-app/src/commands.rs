@@ -33,23 +33,45 @@ pub trait CommandProvider {
 /// The window's static commands (app and window actions).
 pub struct WindowCommands {
     window: glib::WeakRef<gtk::ApplicationWindow>,
+    ctx: crate::ctx::WeakCtx,
 }
 
 impl WindowCommands {
-    pub fn new(window: &gtk::ApplicationWindow) -> Self {
+    pub fn new(window: &gtk::ApplicationWindow, ctx: &crate::ctx::AppCtx) -> Self {
         Self {
             window: window.downgrade(),
+            ctx: ctx.downgrade(),
         }
     }
 }
 
 impl CommandProvider for WindowCommands {
     fn commands(&self) -> Vec<Command> {
-        self.window
+        let show = self
+            .ctx
+            .upgrade()
+            .is_some_and(|c| c.preferences().with(|p| p.interface.show_unfinished));
+        let mut list = self
+            .window
             .upgrade()
             .map(|w| registry(&w))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !show {
+            list.retain(|c| !is_unfinished_command(&c.id));
+        }
+        list
     }
+}
+
+/// Commands that open an unfinished editor or workspace.
+fn is_unfinished_command(id: &str) -> bool {
+    let target = |prefix: &str| id.strip_prefix(prefix);
+    target("win.editor::")
+        .and_then(EditorKind::from_id)
+        .is_some_and(crate::editors::is_unfinished)
+        || target("win.workspace::")
+            .and_then(Workspace::from_id)
+            .is_some_and(crate::editors::is_unfinished_workspace)
 }
 
 /// Static description of a command: detailed action name, title, category.
@@ -148,6 +170,14 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
+    }
+
+    #[test]
+    fn unfinished_commands_are_recognized() {
+        assert!(super::is_unfinished_command("win.editor::sheet"));
+        assert!(super::is_unfinished_command("win.workspace::data"));
+        assert!(!super::is_unfinished_command("win.editor::console"));
+        assert!(!super::is_unfinished_command("win.workspace::graph"));
     }
 
     #[test]

@@ -443,21 +443,13 @@ impl DocUi {
             return;
         }
         let name = crate::doc::document_name(self.ctx.engine().path().as_deref());
-        let dialog = gtk::AlertDialog::builder()
-            .message(format!("Save changes to “{name}”?"))
-            .detail("Your changes will be lost if you don't save them.")
-            .buttons(["Cancel", "Discard", "Save"])
-            .cancel_button(0)
-            .default_button(2)
-            .modal(true)
-            .build();
         let this = self.clone();
-        dialog.choose(self.window().as_ref(), gio::Cancellable::NONE, move |res| {
+        save_prompt(self.window().as_ref(), &name, move |choice| {
             ASKING.set(false);
-            match res {
-                Ok(1) => then(true),
-                Ok(2) => this.save(then),
-                _ => then(false),
+            match choice {
+                SaveChoice::Discard => then(true),
+                SaveChoice::Save => this.save(then),
+                SaveChoice::Cancel => then(false),
             }
         });
     }
@@ -479,6 +471,117 @@ impl DocUi {
             }
         });
     }
+}
+
+/// Answer of the save prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveChoice {
+    Cancel,
+    Discard,
+    Save,
+}
+
+/// "Save changes?" prompt: Save is the suggested (default) action and
+/// Discard is styled destructive; Escape or closing cancels.
+fn save_prompt(
+    parent: Option<&gtk::ApplicationWindow>,
+    name: &str,
+    then: impl FnOnce(SaveChoice) + 'static,
+) {
+    let window = gtk::Window::builder()
+        .modal(true)
+        .resizable(false)
+        .title("Save Changes")
+        .css_classes(["dialog", "save-prompt"])
+        .build();
+    window.set_transient_for(parent);
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(18)
+        .margin_bottom(14)
+        .margin_start(20)
+        .margin_end(20)
+        .build();
+    column.append(
+        &gtk::Label::builder()
+            .label(format!("Save changes to “{name}”?"))
+            .xalign(0.0)
+            .css_classes(["save-prompt-title"])
+            .build(),
+    );
+    column.append(
+        &gtk::Label::builder()
+            .label("Your changes will be lost if you don't save them.")
+            .xalign(0.0)
+            .css_classes(["dim"])
+            .build(),
+    );
+    let buttons = gtk::Box::builder()
+        .spacing(6)
+        .halign(gtk::Align::End)
+        .margin_top(12)
+        .build();
+    let cancel = gtk::Button::with_label("Cancel");
+    let discard = gtk::Button::builder()
+        .label("Discard")
+        .css_classes(["destructive-action"])
+        .build();
+    let save = gtk::Button::builder()
+        .label("Save")
+        .css_classes(["suggested-action"])
+        .build();
+    buttons.append(&cancel);
+    buttons.append(&discard);
+    buttons.append(&save);
+    column.append(&buttons);
+    window.set_child(Some(&column));
+    window.set_default_widget(Some(&save));
+
+    let then: Rc<RefCell<Option<Box<dyn FnOnce(SaveChoice)>>>> =
+        Rc::new(RefCell::new(Some(Box::new(then))));
+    let answer = {
+        let then = then.clone();
+        let window = window.downgrade();
+        move |choice: SaveChoice| {
+            let f = then.borrow_mut().take();
+            if let Some(w) = window.upgrade() {
+                w.close();
+            }
+            if let Some(f) = f {
+                f(choice);
+            }
+        }
+    };
+    for (button, choice) in [
+        (&cancel, SaveChoice::Cancel),
+        (&discard, SaveChoice::Discard),
+        (&save, SaveChoice::Save),
+    ] {
+        let answer = answer.clone();
+        button.connect_clicked(move |_| answer(choice));
+    }
+    // Escape / the close button cancel (once).
+    let keys = gtk::EventControllerKey::new();
+    let w = window.downgrade();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            if let Some(w) = w.upgrade() {
+                w.close();
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    window.add_controller(keys);
+    window.connect_close_request(move |_| {
+        if let Some(f) = then.borrow_mut().take() {
+            f(SaveChoice::Cancel);
+        }
+        glib::Propagation::Proceed
+    });
+    window.present();
+    save.grab_focus();
 }
 
 fn file_dialog(title: &str) -> gtk::FileDialog {

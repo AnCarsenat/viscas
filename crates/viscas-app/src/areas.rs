@@ -72,8 +72,42 @@ impl Areas {
                 listeners: RefCell::default(),
             }),
         };
+        // "Show unfinished editors" off: hidden editors and workspaces are
+        // swapped out on the next rebuild.
+        let weak = areas.downgrade();
+        let last = Cell::new(ctx.preferences().with(|p| p.interface.show_unfinished));
+        ctx.preferences().connect_changed(move |p| {
+            let Some(areas) = weak.upgrade() else {
+                return false;
+            };
+            if last.replace(p.interface.show_unfinished) != p.interface.show_unfinished {
+                areas.schedule_rebuild();
+            }
+            true
+        });
         areas.rebuild();
         areas
+    }
+
+    /// Hook for "Show unfinished editors": while off, an unfinished
+    /// workspace falls back to Graph and unfinished editors in any layout
+    /// are swapped for built ones (see [`editors::replace_unfinished`]).
+    fn hide_unfinished(&self) {
+        if self
+            .inner
+            .ctx
+            .preferences()
+            .with(|p| p.interface.show_unfinished)
+        {
+            return;
+        }
+        if editors::is_unfinished_workspace(self.workspace()) {
+            self.inner.workspace.set(Workspace::Graph);
+            self.inner.active.set(None);
+        }
+        for layout in self.inner.layouts.borrow_mut().values_mut() {
+            editors::replace_unfinished(layout);
+        }
     }
 
     fn downgrade(&self) -> WeakAreas {
@@ -291,6 +325,7 @@ impl Areas {
 
     /// Replaces the widget tree with one built from the current layout.
     fn rebuild(&self) {
+        self.hide_unfinished();
         let root = &self.inner.root;
         while let Some(child) = root.first_child() {
             root.remove(&child);
@@ -606,7 +641,11 @@ impl Areas {
         };
 
         list.append(&heading("EDITOR TYPE"));
+        let prefs = self.inner.ctx.preferences().get();
         for kind in EditorKind::ALL {
+            if !editors::editor_shown(kind, &prefs) && kind != current {
+                continue;
+            }
             let button = item(
                 editors::icon_name(kind),
                 kind.title(),

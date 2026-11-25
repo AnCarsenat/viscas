@@ -17,9 +17,75 @@ use gtk::prelude::*;
 use gtk::{cairo, gio};
 
 use crate::ctx::AppCtx;
-use crate::layout::EditorKind;
+use crate::layout::{EditorKind, Layout};
+use crate::prefs::Preferences;
 use crate::theme::model::{Color, GraphColors};
 use crate::viewport::Viewport;
+use crate::workspace::Workspace;
+
+/// Editors that only show an empty state so far.
+pub fn is_unfinished(kind: EditorKind) -> bool {
+    matches!(
+        kind,
+        EditorKind::Sheet | EditorKind::Script | EditorKind::DependencyGraph
+    )
+}
+
+/// Workspaces built around unfinished editors.
+pub fn is_unfinished_workspace(ws: Workspace) -> bool {
+    matches!(ws, Workspace::Data | Workspace::Script)
+}
+
+/// Whether `kind` is offered in tabs, menus and the palette.
+pub fn editor_shown(kind: EditorKind, prefs: &Preferences) -> bool {
+    prefs.interface.show_unfinished || !is_unfinished(kind)
+}
+
+/// Whether the workspace tab is offered.
+pub fn workspace_shown(ws: Workspace, prefs: &Preferences) -> bool {
+    prefs.interface.show_unfinished || !is_unfinished_workspace(ws)
+}
+
+/// The built editor shown instead of an unfinished one.
+pub fn substitute(kind: EditorKind) -> EditorKind {
+    match kind {
+        EditorKind::Sheet => EditorKind::Expressions,
+        EditorKind::Script => EditorKind::Console,
+        EditorKind::DependencyGraph => EditorKind::Viewport,
+        other => other,
+    }
+}
+
+/// Swaps unfinished editors of `layout` for built ones; returns whether
+/// anything changed.
+pub fn replace_unfinished(layout: &mut Layout) -> bool {
+    let mut changed = false;
+    for (id, kind) in layout.leaves() {
+        if is_unfinished(kind) {
+            changed |= layout.set_editor(id, substitute(kind));
+        }
+    }
+    changed
+}
+
+/// Keeps `widget` visible only while `shown(preferences)` holds.
+pub fn bind_shown(
+    widget: &impl IsA<gtk::Widget>,
+    ctx: &AppCtx,
+    shown: impl Fn(&Preferences) -> bool + 'static,
+) {
+    let widget = widget.as_ref().clone();
+    widget.set_visible(ctx.preferences().with(&shown));
+    let weak = widget.downgrade();
+    ctx.preferences()
+        .connect_changed(move |p| match weak.upgrade() {
+            Some(w) => {
+                w.set_visible(shown(p));
+                true
+            }
+            None => false,
+        });
+}
 
 /// Candidate symbolic icons, most preferred first. Icon themes differ
 /// (Adwaita, Breeze, ...), so several names are tried.
@@ -178,11 +244,9 @@ fn header_menus(kind: EditorKind) -> &'static [(&'static str, &'static [&'static
         EditorKind::SceneTree | EditorKind::Inspector => &[],
         // Console and Expressions put their tools in the header directly.
         EditorKind::Console | EditorKind::Expressions => &[],
-        EditorKind::Sheet => &[("Table", &["Add Column", "Import CSV", "Export CSV"])],
-        EditorKind::Script => &[("Run", &["Run Script", "Stop"])],
-        EditorKind::DependencyGraph => {
-            &[("View", &["Frame All", "Show Upstream", "Show Downstream"])]
-        }
+        // Unfinished editors get their menus with their features (no
+        // dead, insensitive menus meanwhile).
+        EditorKind::Sheet | EditorKind::Script | EditorKind::DependencyGraph => &[],
     }
 }
 
@@ -237,9 +301,10 @@ fn empty_state(kind: EditorKind, ctx: &AppCtx) -> gtk::Box {
     ctx.preferences()
         .connect_changed_for(weak_quip, |quip, p| quip.set_visible(p.interface.playful));
     let milestone = gtk::Label::builder()
-        .label(format!("planned · {}", kind.milestone()))
+        .label("Coming in a later version")
+        .tooltip_text(format!("Planned for milestone {}", kind.milestone()))
         .halign(gtk::Align::Center)
-        .css_classes(["milestone", "mono"])
+        .css_classes(["placeholder-quip", "coming-later"])
         .build();
     column.append(&icon);
     column.append(&title);

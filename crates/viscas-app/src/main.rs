@@ -13,6 +13,7 @@ mod editors;
 mod fuzzy;
 mod layout;
 mod palette;
+mod palette_sources;
 mod prefs;
 mod prefs_window;
 mod settings;
