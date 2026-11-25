@@ -127,13 +127,18 @@ fn node_features_lists_roots_extrema_and_intersections_by_x() {
 }
 
 #[test]
-fn new_plot_nodes_get_auto_names() {
+fn new_plot_nodes_get_display_only_auto_labels() {
     let mut e = engine();
     let a = plot(&mut e, "y = x");
     let b = plot(&mut e, "x^2 + y^2 = 4");
     let c = plot(&mut e, "y < x");
-    let name = |id| e.scene().get(id).and_then(|n| n.name.clone());
-    assert_eq!(name(a).as_deref(), Some("Plot1"));
-    assert_eq!(name(b).as_deref(), Some("Circle1"));
-    assert_eq!(name(c).as_deref(), Some("Region1"));
+    let label = |id| e.scene().auto_label(id);
+    assert_eq!(label(a).as_deref(), Some("Plot1"));
+    assert_eq!(label(b).as_deref(), Some("Circle1"));
+    assert_eq!(label(c).as_deref(), Some("Region1"));
+    assert!(
+        [a, b, c]
+            .iter()
+            .all(|id| e.scene().get(*id).unwrap().name.is_none())
+    );
 }

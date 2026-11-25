@@ -232,6 +232,30 @@ mod tests {
     }
 
     #[test]
+    fn threshold_keeps_multi_word_and_partial_queries() {
+        let kept = |q: &str, c: &str| {
+            let m = fuzzy_match(q, c);
+            assert!(
+                m.as_ref().is_some_and(|m| m.score >= threshold(q)),
+                "{q:?} in {c:?}: {m:?} < {}",
+                threshold(q)
+            );
+        };
+        kept("split area", "Split Area Horizontally");
+        kept("add to board", "Add Last Result to Board");
+        kept("add to board", "Add to Board");
+        kept("spl", "Split Area Vertically");
+        kept("SplArHo", "Split Area Horizontally");
+        kept("sah", "Split Area Horizontally");
+        kept("ws graph", "Workspace: Graph");
+        kept("prefs", "Preferences…");
+        kept("goto plot", "Go to node: Plot1");
+        kept("e", "Toggle Exact / Approx");
+        // A single char only matches word starts.
+        assert!(rank("x", ["Toggle Exact / Approx"]).is_empty());
+    }
+
+    #[test]
     fn consecutive_beats_scattered() {
         let a = fuzzy_match("max", "Maximize Area").unwrap();
         let b = fuzzy_match("max", "Make Axes").unwrap();

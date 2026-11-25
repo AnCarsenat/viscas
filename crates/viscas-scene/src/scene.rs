@@ -147,6 +147,12 @@ pub struct Scene {
     /// name → nodes reading (incl. split letters) or writing it.
     mentions: HashMap<String, BTreeSet<NodeId>>,
     graph: OnceCell<DepGraph>,
+    /// Automatic labels of unnamed drawables (see [`crate::auto_name`]),
+    /// rebuilt on first use after any change.
+    pub(crate) auto_labels: OnceCell<HashMap<NodeId, String>>,
+    /// Bumped by every structural or content change (cache key for
+    /// derived views such as palette indexes).
+    revision: u64,
     results: HashMap<NodeId, NodeResult>,
     dirty: BTreeSet<NodeId>,
     selection: Vec<NodeId>,
@@ -200,6 +206,8 @@ impl Scene {
             definers: HashMap::new(),
             mentions: HashMap::new(),
             graph: OnceCell::new(),
+            auto_labels: OnceCell::new(),
+            revision: 0,
             results: HashMap::new(),
             dirty: BTreeSet::new(),
             selection: Vec::new(),
@@ -343,6 +351,11 @@ impl Scene {
         self.definers
             .get(name)
             .is_some_and(|s| s.iter().any(|&d| Some(d) != except))
+    }
+
+    /// Changes whenever a node is added, removed, moved or edited.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// A free name derived from `base` (`a`, `a_2`, …).
@@ -1418,6 +1431,8 @@ impl Scene {
     // ------------------------------------------------------------------
 
     pub(crate) fn apply(&mut self, cmd: &Command) -> Result<()> {
+        self.auto_labels = OnceCell::new();
+        self.revision += 1;
         match cmd {
             Command::Insert {
                 nodes,
@@ -1604,6 +1619,8 @@ impl Scene {
         self.roots = roots;
         self.next_id = next_id;
         self.graph = OnceCell::new();
+        self.auto_labels = OnceCell::new();
+        self.revision += 1;
         self.mark_all_dirty();
         self.events.clear();
     }

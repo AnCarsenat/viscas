@@ -13,8 +13,11 @@ use crate::editors::scene_tree::model;
 
 /// Registers every source for `window`.
 pub fn install(window: &gtk::ApplicationWindow, ctx: &AppCtx) {
-    ctx.add_command_provider(NodeIndex(ctx.downgrade()));
-    ctx.add_command_provider(FunctionIndex);
+    ctx.add_command_provider(NodeIndex {
+        ctx: ctx.downgrade(),
+        cache: std::cell::RefCell::default(),
+    });
+    ctx.add_command_provider(FunctionIndex(window.downgrade()));
     ctx.add_command_provider(SettingsIndex {
         window: window.downgrade(),
         ctx: ctx.downgrade(),
@@ -24,27 +27,44 @@ pub fn install(window: &gtk::ApplicationWindow, ctx: &AppCtx) {
 
 /// "Go to node: Plot1": selects the node (the tree reveals it) and frames
 /// it in the active viewport.
-struct NodeIndex(WeakCtx);
+struct NodeIndex {
+    ctx: WeakCtx,
+    /// Node ids and display names, for one scene revision.
+    cache: std::cell::RefCell<Option<NodeList>>,
+}
+
+type NodeList = (u64, Rc<[(viscas_scene::NodeId, String)]>);
 
 impl CommandProvider for NodeIndex {
     fn commands(&self) -> Vec<Command> {
-        let Some(ctx) = self.0.upgrade() else {
+        let Some(ctx) = self.ctx.upgrade() else {
             return Vec::new();
         };
-        let nodes: Vec<(viscas_scene::NodeId, String)> = ctx.engine().with(|e| {
-            let scene = e.scene();
-            scene
-                .iter()
-                .map(|n| (n.id, model::display_name(scene, n.id)))
-                .collect()
+        let revision = ctx.engine().with(|e| e.scene().revision());
+        let cached = self
+            .cache
+            .borrow()
+            .as_ref()
+            .filter(|(r, _)| *r == revision)
+            .map(|(_, l)| l.clone());
+        let nodes = cached.unwrap_or_else(|| {
+            let list: Rc<[(viscas_scene::NodeId, String)]> = ctx.engine().with(|e| {
+                let scene = e.scene();
+                scene
+                    .iter()
+                    .map(|n| (n.id, model::one_line(&model::display_name(scene, n.id), 48)))
+                    .collect()
+            });
+            *self.cache.borrow_mut() = Some((revision, list.clone()));
+            list
         });
         nodes
-            .into_iter()
+            .iter()
             .map(|(id, name)| {
-                let weak = self.0.clone();
+                let (id, weak) = (*id, self.ctx.clone());
                 Command {
                     id: format!("node.goto::{}", id.0),
-                    title: format!("Go to node: {}", model::one_line(&name, 48)),
+                    title: format!("Go to node: {name}"),
                     category: "Node",
                     shortcut: None,
                     run: Rc::new(move || {
@@ -62,8 +82,27 @@ impl CommandProvider for NodeIndex {
     }
 }
 
-/// Builtin functions: inserts `name(` into the console input.
-struct FunctionIndex;
+/// Builtin functions: inserts `name(` into the console input, revealing
+/// a console (the Algebra workspace) when none is on screen.
+struct FunctionIndex(glib::WeakRef<gtk::ApplicationWindow>);
+
+fn insert_revealing(window: &glib::WeakRef<gtk::ApplicationWindow>, text: String) {
+    use crate::editors::console::insert_into_active;
+    if insert_into_active(&text) {
+        return;
+    }
+    let Some(w) = window.upgrade() else {
+        return;
+    };
+    let target = "algebra".to_variant();
+    if WidgetExt::activate_action(&w, "win.workspace", Some(&target)).is_err() {
+        return;
+    }
+    // The areas rebuild on idle; insert once the console is mapped.
+    glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+        insert_into_active(&text);
+    });
+}
 
 impl CommandProvider for FunctionIndex {
     fn commands(&self) -> Vec<Command> {
@@ -71,12 +110,13 @@ impl CommandProvider for FunctionIndex {
             .iter()
             .map(|h| {
                 let insert = format!("{}(", h.name);
+                let window = self.0.clone();
                 Command {
                     id: format!("function.insert::{}", h.name),
                     title: format!("{} — {}", h.signature, h.summary),
                     category: "Function",
                     shortcut: None,
-                    run: Rc::new(move || crate::editors::console::insert_into_active(&insert)),
+                    run: Rc::new(move || insert_revealing(&window, insert.clone())),
                 }
             })
             .collect()

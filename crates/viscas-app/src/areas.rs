@@ -85,25 +85,15 @@ impl Areas {
         areas
     }
 
-    /// Hook for "Show unfinished editors": while off, an unfinished
-    /// workspace falls back to Graph and unfinished editors in any layout
-    /// are swapped for built ones (see [`editors::replace_unfinished`]).
-    fn hide_unfinished(&self) {
-        if self
+    /// "Show unfinished editors" is off: unfinished workspaces and
+    /// editors are only *displayed* as built ones (view-only; the stored
+    /// layouts and workspace, and so saved documents, keep them).
+    fn hiding_unfinished(&self) -> bool {
+        !self
             .inner
             .ctx
             .preferences()
             .with(|p| p.interface.show_unfinished)
-        {
-            return;
-        }
-        if editors::is_unfinished_workspace(self.workspace()) {
-            self.inner.workspace.set(Workspace::Graph);
-            self.inner.active.set(None);
-        }
-        for layout in self.inner.layouts.borrow_mut().values_mut() {
-            editors::replace_unfinished(layout);
-        }
     }
 
     fn downgrade(&self) -> WeakAreas {
@@ -114,8 +104,15 @@ impl Areas {
         self.inner.root.upcast_ref()
     }
 
+    /// The workspace on screen (Graph stands in for an unfinished one
+    /// while those are hidden).
     pub fn workspace(&self) -> Workspace {
-        self.inner.workspace.get()
+        let ws = self.inner.workspace.get();
+        if editors::is_unfinished_workspace(ws) && self.hiding_unfinished() {
+            Workspace::Graph
+        } else {
+            ws
+        }
     }
 
     /// Calls `f` after every change of workspace, layout or active area.
@@ -178,7 +175,7 @@ impl Areas {
     }
 
     pub fn set_workspace(&self, workspace: Workspace) {
-        if workspace == self.workspace() {
+        if workspace == self.inner.workspace.get() {
             return;
         }
         self.inner.workspace.set(workspace);
@@ -245,7 +242,7 @@ impl Areas {
         let layouts = self.inner.layouts.borrow();
         let blob = LayoutBlob {
             version: LayoutBlob::VERSION,
-            workspace: self.workspace().id().to_owned(),
+            workspace: self.inner.workspace.get().id().to_owned(),
             layouts: layouts
                 .iter()
                 .map(|(ws, l)| (ws.id().to_owned(), l.clone()))
@@ -321,14 +318,13 @@ impl Areas {
 
     /// Replaces the widget tree with one built from the current layout.
     fn rebuild(&self) {
-        self.hide_unfinished();
         let root = &self.inner.root;
         while let Some(child) = root.first_child() {
             root.remove(&child);
         }
         self.inner.area_widgets.borrow_mut().clear();
 
-        let layout = self.layout();
+        let layout = editors::displayed_layout(&self.layout(), !self.hiding_unfinished());
         let tree = self.build_node(&layout, layout.visible_root());
         root.append(&tree);
 

@@ -970,6 +970,11 @@ impl FeatureSet {
 }
 
 impl Viewport {
+    /// The engine viewport this editor renders.
+    pub fn engine_id(&self) -> viscas_engine::ViewportId {
+        self.plots.id
+    }
+
     /// Centers the view on `node`'s drawing (zooming out when it does
     /// not fit). Returns whether the node has anything drawn.
     pub fn frame_node(&self, node: viscas_scene::NodeId) -> bool {

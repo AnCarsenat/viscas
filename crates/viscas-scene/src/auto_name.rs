@@ -1,10 +1,13 @@
-//! Godot-style automatic names for drawable nodes: `Plot1`, `Circle1`,
+//! Godot-style automatic labels for drawable nodes: `Plot1`, `Circle1`,
 //! `Curve1`, `Region1`, `Point1`.
 //!
-//! New plot-like nodes get such a name stored when they are added (see
-//! [`Scene::next_auto_name`]); older unnamed nodes are *displayed* with an
-//! automatic label ([`Scene::auto_label`]) that is only stored once the
-//! user edits the name.
+//! Display only: an unnamed drawable keeps `name = None` and is *shown*
+//! with a label derived from its kind and tree order
+//! ([`Scene::auto_label`]). Nothing is stored, so duplicates never share
+//! a name, points never become identifiers and files stay clean; a node
+//! gets a stored name only when the user renames it. Labels skip numbers
+//! used by stored names of the same form, and are cached per scene
+//! revision.
 
 use std::collections::{HashMap, HashSet};
 
@@ -109,6 +112,9 @@ fn squared_of(term: &str, v: char) -> bool {
         && !inner[1..].contains(['x', 'y', '('])
 }
 
+/// Every label family.
+const FAMILIES: [&str; 5] = ["Plot", "Circle", "Curve", "Region", "Point"];
+
 /// Splits `Plot12` into (`Plot`, 12) when the name is an automatic name
 /// of a known family.
 pub fn parse_auto_name(name: &str) -> Option<(&str, u32)> {
@@ -118,64 +124,43 @@ pub fn parse_auto_name(name: &str) -> Option<(&str, u32)> {
         return None;
     }
     let n = digits.parse().ok()?;
-    ["Plot", "Circle", "Curve", "Region", "Point"]
-        .contains(&base)
-        .then_some((base, n))
+    FAMILIES.contains(&base).then_some((base, n))
 }
 
 impl Scene {
-    /// Numbers used per family by stored names and by the labels of
-    /// unnamed nodes (in tree order, each taking the smallest free number).
-    fn auto_labels(&self) -> (HashMap<NodeId, String>, HashMap<&'static str, HashSet<u32>>) {
-        let mut used: HashMap<&'static str, HashSet<u32>> = HashMap::new();
-        for node in self.iter() {
-            if let Some((base, n)) = node.name.as_deref().and_then(parse_auto_name)
-                && let Some(fam) = ["Plot", "Circle", "Curve", "Region", "Point"]
-                    .into_iter()
-                    .find(|f| *f == base)
-            {
-                used.entry(fam).or_default().insert(n);
+    /// Labels of every unnamed drawable, computed once per revision: in
+    /// tree order, each takes the smallest number of its family not used
+    /// by a stored name or an earlier label.
+    pub fn auto_labels(&self) -> &HashMap<NodeId, String> {
+        self.auto_labels.get_or_init(|| {
+            let mut used: HashMap<&'static str, HashSet<u32>> = HashMap::new();
+            for node in self.iter() {
+                if let Some((base, n)) = node.name.as_deref().and_then(parse_auto_name)
+                    && let Some(fam) = FAMILIES.into_iter().find(|f| *f == base)
+                {
+                    used.entry(fam).or_default().insert(n);
+                }
             }
-        }
-        let mut labels = HashMap::new();
-        for node in self.iter() {
-            if node.name.is_some() {
-                continue;
+            let mut labels = HashMap::new();
+            for node in self.iter() {
+                if node.name.is_some() {
+                    continue;
+                }
+                if let Some(fam) = family(&node.kind) {
+                    let set = used.entry(fam).or_default();
+                    let n = (1..).find(|n| !set.contains(n)).unwrap_or(1);
+                    set.insert(n);
+                    labels.insert(node.id, format!("{fam}{n}"));
+                }
             }
-            if let Some(fam) = family(&node.kind) {
-                let set = used.entry(fam).or_default();
-                let n = (1..).find(|n| !set.contains(n)).unwrap_or(1);
-                set.insert(n);
-                labels.insert(node.id, format!("{fam}{n}"));
-            }
-        }
-        (labels, used)
+            labels
+        })
     }
 
     /// The automatic label shown for an unnamed drawable node (`Plot2`);
-    /// `None` for named nodes and kinds without automatic names.
+    /// `None` for named nodes and kinds without automatic labels.
     pub fn auto_label(&self, id: NodeId) -> Option<String> {
-        let node = self.get(id)?;
-        if node.name.is_some() {
-            return None;
-        }
-        family(&node.kind)?;
-        self.auto_labels().0.remove(&id)
-    }
-
-    /// The name a new node of `kind` gets: the next free number of its
-    /// family (never one shown by an unnamed node's label, nor a name
-    /// defined elsewhere). `None` for kinds without automatic names.
-    pub fn next_auto_name(&self, kind: &NodeKind) -> Option<String> {
-        let fam = family(kind)?;
-        let (_, used) = self.auto_labels();
-        let set = used.get(fam);
-        (1..)
-            .map(|n: u32| (n, format!("{fam}{n}")))
-            .find(|(n, name)| {
-                !set.is_some_and(|s| s.contains(n)) && !self.is_name_taken(name, None)
-            })
-            .map(|(_, name)| name)
+        self.auto_labels().get(&id).cloned()
     }
 }
 
@@ -206,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_and_next_names_never_collide() {
+    fn labels_skip_stored_names_and_follow_changes() {
         let mut s = Scene::new();
         let a = s.add(None, NodeContent::plot("y = x")).unwrap();
         let mut named = NodeContent::plot("y = 2x");
@@ -215,15 +200,22 @@ mod tests {
         let c = s.add(None, NodeContent::plot("y = 3x")).unwrap();
         assert_eq!(s.auto_label(a).as_deref(), Some("Plot2"));
         assert_eq!(s.auto_label(c).as_deref(), Some("Plot3"));
-        let kind = NodeKind::Plot {
-            relation: "y = 4x".into(),
-        };
-        assert_eq!(s.next_auto_name(&kind).as_deref(), Some("Plot4"));
-        let circle = NodeKind::Plot {
-            relation: "x^2+y^2=1".into(),
-        };
-        assert_eq!(s.next_auto_name(&circle).as_deref(), Some("Circle1"));
-        let var = NodeKind::Variable { expr: "1".into() };
-        assert_eq!(s.next_auto_name(&var), None);
+        let circle = s.add(None, NodeContent::plot("x^2+y^2=1")).unwrap();
+        assert_eq!(s.auto_label(circle).as_deref(), Some("Circle1"));
+        // Labels are display only: nothing is stored.
+        assert!(s.get(circle).unwrap().name.is_none());
+        // Duplicates get their own label (in tree order: right after `a`).
+        let d = s.duplicate(a).unwrap();
+        assert_eq!(s.auto_label(d).as_deref(), Some("Plot3"));
+        assert_eq!(s.auto_label(c).as_deref(), Some("Plot4"));
+        // The cache follows edits (rename stores a name; label goes).
+        let r = s.revision();
+        s.rename(a, Some("Mine")).unwrap();
+        assert!(s.revision() > r);
+        assert_eq!(s.auto_label(a), None);
+        assert_eq!(s.auto_label(d).as_deref(), Some("Plot2"));
+        assert_eq!(s.auto_label(c).as_deref(), Some("Plot3"));
+        let v = s.add(None, NodeContent::variable("k", "1")).unwrap();
+        assert_eq!(s.auto_label(v), None);
     }
 }

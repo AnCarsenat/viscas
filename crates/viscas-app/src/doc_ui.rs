@@ -444,7 +444,13 @@ impl DocUi {
         }
         let name = crate::doc::document_name(self.ctx.engine().path().as_deref());
         let this = self.clone();
-        save_prompt(self.window().as_ref(), &name, move |choice| {
+        // Always transient for a window: ours, else the app's active one.
+        let parent: Option<gtk::Window> = self.window().map(|w| w.upcast()).or_else(|| {
+            gio::Application::default()
+                .and_downcast::<gtk::Application>()
+                .and_then(|a| a.active_window())
+        });
+        save_prompt(parent.as_ref(), &name, move |choice| {
             ASKING.set(false);
             match choice {
                 SaveChoice::Discard => then(true),
@@ -483,11 +489,7 @@ enum SaveChoice {
 
 /// "Save changes?" prompt: Save is the suggested (default) action and
 /// Discard is styled destructive; Escape or closing cancels.
-fn save_prompt(
-    parent: Option<&gtk::ApplicationWindow>,
-    name: &str,
-    then: impl FnOnce(SaveChoice) + 'static,
-) {
+fn save_prompt(parent: Option<&gtk::Window>, name: &str, then: impl FnOnce(SaveChoice) + 'static) {
     let window = gtk::Window::builder()
         .modal(true)
         .resizable(false)

@@ -55,7 +55,7 @@ pub use complete::{Completion, CompletionKind, completion_start, suggest};
 pub use console::{AutoAdd, ConsoleError, ConsoleItem, ConsoleOutput, HISTORY_LIMIT, ItemKind};
 pub use engine::{
     DEFAULT_PALETTE, Engine, EngineError, FeatureHit, FeaturesResult, MAX_FEATURE_CURVES,
-    builtins_oracle,
+    NodeFeaturesTask, builtins_oracle,
 };
 pub use eval::{NodeValue, SceneEvaluator};
 pub use plot::{

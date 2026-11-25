@@ -12,8 +12,8 @@ pub mod model;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
-use gtk::pango;
 use gtk::prelude::*;
+use gtk::{gio, glib, pango};
 use viscas_engine::{Engine, PlotKind};
 use viscas_scene::{
     AnimationMode, GridKind, KindTag, LineStyle, NodeContent, NodeId, NodeKind, PropValue, Scene,
@@ -50,6 +50,8 @@ struct Inner {
     /// re-apply itself on top of the moved history.
     scrub_suspended: Cell<bool>,
     sub: RefCell<Option<Subscription>>,
+    /// Refreshes view-dependent panels (Analysis) when fresh plots arrive.
+    view_refresher: RefCell<Option<Refresher>>,
 }
 
 /// The inspector editor. Cloning shares it.
@@ -104,6 +106,7 @@ impl Inspector {
                 scrub_base: RefCell::default(),
                 scrub_suspended: Cell::new(false),
                 sub: RefCell::default(),
+                view_refresher: RefCell::default(),
             }),
         };
         let weak = insp.downgrade();
@@ -177,6 +180,12 @@ impl Inspector {
             DocEvent::HistoryNavigating => self.interrupt_scrub(),
             DocEvent::CommitEdits => self.seal_group(),
             DocEvent::Settings(_) | DocEvent::Colors => self.update(false),
+            DocEvent::PlotsReady(_) => {
+                let r = self.inner.view_refresher.borrow().clone();
+                if let Some(r) = r {
+                    self.inner.ctx.engine().with(|e| r(e));
+                }
+            }
             _ => {}
         }
     }
@@ -206,6 +215,7 @@ impl Inspector {
             body.remove(&c);
         }
         self.inner.refreshers.borrow_mut().clear();
+        self.inner.view_refresher.borrow_mut().take();
         let shape = self.current_shape();
         *self.inner.shape.borrow_mut() = shape.clone();
         if shape.is_empty() {
@@ -1363,8 +1373,7 @@ impl Inspector {
     fn analysis_panel(&self, id: NodeId) -> Panel {
         use viscas_plot::FeatureKind as K;
         let panel = Panel::new("Analysis", true);
-        type Group = (&'static str, fn(K) -> bool);
-        let groups: [Group; 3] = [
+        let groups: [AnalysisGroup; 3] = [
             ("Roots", |k| k == K::Root),
             ("Extrema", |k| matches!(k, K::Minimum | K::Maximum)),
             ("Intersections", |k| k == K::Intersection),
@@ -1387,52 +1396,57 @@ impl Inspector {
             lists.push(list);
         }
         let hint = gtk::Label::builder()
-            .label("Computed in the visible part of the viewport.")
+            .label("For the visible part of the viewport on screen; updates as it moves.")
             .xalign(0.0)
             .wrap(true)
             .css_classes(["dim", "analysis-hint"])
             .build();
         panel.append(&hint);
 
+        // Computed off the UI thread, only while the panel is expanded,
+        // for the viewport on screen; keyed by its view and the plotted
+        // nodes' revisions (refreshed when plots of a new view arrive).
         let weak = self.downgrade();
-        type Key = Vec<(K, u64, u64)>;
-        let last: Rc<RefCell<Option<Key>>> = Rc::default();
-        self.add_refresher(move |e| {
-            let hits = e.node_features(id, None);
-            let key: Vec<(K, u64, u64)> = hits
-                .iter()
-                .map(|h| {
-                    (
-                        h.feature.kind,
-                        h.feature.pos.x.to_bits(),
-                        h.feature.pos.y.to_bits(),
-                    )
-                })
-                .collect();
-            if last.borrow().as_ref() == Some(&key) {
+        let last: Rc<RefCell<Option<Vec<u64>>>> = Rc::default();
+        let lists = Rc::new(lists);
+        let p = panel.clone();
+        let refresh: Refresher = Rc::new(move |e: &Engine| {
+            if !p.is_expanded() {
                 return;
             }
-            *last.borrow_mut() = Some(key);
-            for ((_, wanted), list) in groups.iter().zip(&lists) {
-                while let Some(c) = list.first_child() {
-                    list.remove(&c);
+            let vp = crate::viewport::active().map(|v| v.engine_id());
+            let Some(task) = e.node_features_task(id, vp) else {
+                return;
+            };
+            if last.borrow().as_ref() == Some(&task.key) {
+                return;
+            }
+            *last.borrow_mut() = Some(task.key.clone());
+            let (weak, last, lists) = (weak.clone(), last.clone(), lists.clone());
+            let key = task.key;
+            let run = task.run;
+            glib::spawn_future_local(async move {
+                let Ok(hits): Result<Vec<viscas_engine::FeatureHit>, _> =
+                    gio::spawn_blocking(run).await
+                else {
+                    return;
+                };
+                // A newer request superseded this one.
+                if last.borrow().as_ref() != Some(&key) || weak.upgrade().is_none() {
+                    return;
                 }
-                let mut any = false;
-                for h in hits.iter().filter(|h| wanted(h.feature.kind)) {
-                    any = true;
-                    list.append(&analysis_row(&weak, h));
-                }
-                if !any {
-                    list.append(
-                        &gtk::Label::builder()
-                            .label("—")
-                            .xalign(0.0)
-                            .css_classes(["dim", "deps-none"])
-                            .build(),
-                    );
-                }
+                fill_analysis(&weak, &lists, &groups, &hits);
+            });
+        });
+        let r = refresh.clone();
+        let weak = self.downgrade();
+        panel.connect_expanded(move |open| {
+            if open {
+                Inspector::with_weak(&weak, |i| i.inner.ctx.engine().with(|e| r(e)));
             }
         });
+        *self.inner.view_refresher.borrow_mut() = Some(refresh.clone());
+        self.inner.refreshers.borrow_mut().push(refresh);
         panel
     }
 
@@ -1579,6 +1593,37 @@ fn chip(
     });
     button.add_controller(motion);
     button
+}
+
+/// An Analysis group: title and which feature kinds it lists.
+type AnalysisGroup = (&'static str, fn(viscas_plot::FeatureKind) -> bool);
+
+/// Fills the Analysis lists from `hits`.
+fn fill_analysis(
+    weak: &Weak<Inner>,
+    lists: &[gtk::Box],
+    groups: &[AnalysisGroup],
+    hits: &[viscas_engine::FeatureHit],
+) {
+    for ((_, wanted), list) in groups.iter().zip(lists) {
+        while let Some(c) = list.first_child() {
+            list.remove(&c);
+        }
+        let mut any = false;
+        for h in hits.iter().filter(|h| wanted(h.feature.kind)) {
+            any = true;
+            list.append(&analysis_row(weak, h));
+        }
+        if !any {
+            list.append(
+                &gtk::Label::builder()
+                    .label("—")
+                    .xalign(0.0)
+                    .css_classes(["dim", "deps-none"])
+                    .build(),
+            );
+        }
+    }
 }
 
 /// One Analysis value: `min (0, −1)` (click copies `(0, -1)`) and a `+`

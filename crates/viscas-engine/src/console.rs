@@ -733,10 +733,7 @@ impl Engine {
         let mark = scene.group_mark();
         let mut ids = Vec::new();
         let mut error = None;
-        for (i, mut c) in plan.into_iter().enumerate() {
-            if c.name.is_none() {
-                c.name = scene.next_auto_name(&c.kind);
-            }
+        for (i, c) in plan.into_iter().enumerate() {
             let provided = i < last
                 && c.kind.defines_by_name()
                 && c.name
@@ -775,14 +772,10 @@ impl Engine {
         let input = plan.last()?;
         self.scene()
             .iter()
+            // A name only identifies defining kinds; a plot is the same
+            // plot whatever its label.
             .find(|n| {
-                n.kind == input.kind
-                    && (n.name == input.name
-                        || (input.name.is_none()
-                            && n.name
-                                .as_deref()
-                                .and_then(viscas_scene::auto_name::parse_auto_name)
-                                .is_some()))
+                n.kind == input.kind && (n.name == input.name || !input.kind.defines_by_name())
             })
             .map(|n| n.id)
     }

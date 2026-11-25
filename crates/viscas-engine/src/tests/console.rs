@@ -714,6 +714,16 @@ fn re_entering_a_plot_does_not_duplicate_it() {
 }
 
 #[test]
+fn renamed_plot_is_still_recognized_on_the_board() {
+    let mut e = engine();
+    let id = added(&e.console_eval_with("y = x^3", PLOTS))[0];
+    e.scene_mut().rename(id, Some("Cubic")).unwrap();
+    // A plot's name is only a label: same relation, same node.
+    assert_eq!(on_board(&e.console_eval_with("y = x^3", PLOTS)), vec![id]);
+    assert_eq!(e.scene().len(), 1);
+}
+
+#[test]
 fn failed_add_leaves_scene_undo_and_redo_untouched() {
     let mut e = engine();
     e.add_line(None, "z := 1").unwrap();

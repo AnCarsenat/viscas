@@ -45,10 +45,15 @@ type MenuAction = (&'static str, fn(&Console));
 
 /// Inserts `text` at the cursor of the active console (palette: insert
 /// a function).
-pub fn insert_into_active(text: &str) {
-    let console = Console::active().or_else(|| Console::all().into_iter().next());
-    if let Some(c) = console {
-        c.insert_at_cursor(text);
+/// Returns `false` when no console is on screen (the caller reveals
+/// one first: text never goes into an invisible console).
+pub fn insert_into_active(text: &str) -> bool {
+    match Console::active() {
+        Some(c) => {
+            c.insert_at_cursor(text);
+            true
+        }
+        None => false,
     }
 }
 
@@ -122,6 +127,9 @@ struct Inner {
     entries: RefCell<Vec<Entry>>,
     /// Example chips shown above the input while the transcript is empty.
     examples: gtk::FlowBox,
+    /// The shared session changed while this console was off screen: it
+    /// rebuilds its transcript when mapped again.
+    stale: Cell<bool>,
     /// Programmatic buffer edit in progress (keeps history browsing).
     setting_text: Cell<bool>,
     /// Scroll to the end once the transcript grows.
@@ -262,6 +270,7 @@ impl Console {
                 nav: RefCell::default(),
                 entries: RefCell::default(),
                 examples,
+                stale: Cell::new(false),
                 setting_text: Cell::new(false),
                 stick: Cell::new(false),
                 error_color: RefCell::new(error_color(ctx)),
@@ -273,12 +282,17 @@ impl Console {
         console.connect_input(&input_bar);
         console.connect_scrolling();
         console.connect_updates();
-        // Show the shared session's transcript (B4: one console app-wide).
-        let records: Vec<(u64, ConsoleOutput, PinSnapshot)> =
-            SESSION.with_borrow(|s| s.records.clone());
-        for (id, output, pin) in records {
-            console.append_local(id, output, pin);
-        }
+        // Show the shared session's transcript (B4: one console app-wide),
+        // and catch up when shown after changes made elsewhere.
+        console.replay_session();
+        let weak = console.downgrade();
+        console.inner.root.connect_map(move |_| {
+            if let Some(c) = Console::from_weak(&weak)
+                && c.inner.stale.replace(false)
+            {
+                c.replay_session();
+            }
+        });
         console.register(ctx);
         console.focus_at_startup();
         console
@@ -293,15 +307,17 @@ impl Console {
             return;
         }
         let weak = self.downgrade();
-        self.inner.input.connect_map(move |input| {
-            if !FOCUSED.replace(true) && Console::from_weak(&weak).is_some() {
-                let input = input.downgrade();
-                glib::idle_add_local_once(move || {
-                    if let Some(i) = input.upgrade() {
-                        i.grab_focus();
-                    }
-                });
-            }
+        self.inner.input.connect_map(move |_| {
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                // Claimed only by a console that is still alive and shown.
+                if let Some(c) = Console::from_weak(&weak)
+                    && c.inner.input.is_mapped()
+                    && !FOCUSED.replace(true)
+                {
+                    c.inner.input.grab_focus();
+                }
+            });
         });
     }
 
@@ -847,8 +863,36 @@ impl Console {
             all.push(self.clone());
         }
         for c in all {
-            c.append_local(id, output.clone(), pin.clone());
+            // Off-screen consoles catch up when mapped.
+            if Rc::ptr_eq(&c.inner, &self.inner) || c.inner.root.is_mapped() {
+                c.append_local(id, output.clone(), pin.clone());
+            } else {
+                c.inner.stale.set(true);
+            }
         }
+    }
+
+    /// Rebuilds this console's transcript from the shared session in one
+    /// pass (one board-state pass, one scroll).
+    fn replay_session(&self) {
+        self.clear_local();
+        let records: Vec<(u64, ConsoleOutput, PinSnapshot)> =
+            SESSION.with_borrow(|s| s.records.clone());
+        let mut entries = Vec::with_capacity(records.len());
+        for (id, output, pin) in records {
+            let (widget, state) = self.render_entry(&output, &pin, id);
+            self.inner.transcript.append(&widget);
+            entries.push(Entry {
+                id,
+                output,
+                pin,
+                state,
+                widget,
+            });
+        }
+        *self.inner.entries.borrow_mut() = entries;
+        self.update_empty();
+        self.scroll_to_end();
     }
 
     /// Adds an entry to this editor's transcript widgets.
@@ -885,6 +929,7 @@ impl Console {
         }
         for c in all {
             c.clear_local();
+            c.inner.stale.set(false);
         }
     }
 

@@ -56,9 +56,19 @@ pub fn substitute(kind: EditorKind) -> EditorKind {
     }
 }
 
+/// The layout as displayed: a copy with unfinished editors swapped for
+/// built ones unless `show_unfinished` (the stored layout never changes).
+pub fn displayed_layout(layout: &Layout, show_unfinished: bool) -> Layout {
+    let mut shown = layout.clone();
+    if !show_unfinished {
+        replace_unfinished(&mut shown);
+    }
+    shown
+}
+
 /// Swaps unfinished editors of `layout` for built ones; returns whether
 /// anything changed.
-pub fn replace_unfinished(layout: &mut Layout) -> bool {
+fn replace_unfinished(layout: &mut Layout) -> bool {
     let mut changed = false;
     for (id, kind) in layout.leaves() {
         if is_unfinished(kind) {
@@ -434,6 +444,15 @@ mod tests {
             );
             assert!(!replace_unfinished(&mut layout), "idempotent");
         }
+        // View-only: the stored layout (what documents save) keeps its
+        // Sheet area; only the displayed copy swaps it.
+        let stored = Workspace::Data.default_layout(&mut IdGen::default());
+        let before = serde_json::to_value(&stored).unwrap();
+        let shown = displayed_layout(&stored, false);
+        assert!(shown.leaves().iter().all(|(_, k)| !is_unfinished(*k)));
+        assert_eq!(serde_json::to_value(&stored).unwrap(), before);
+        assert!(stored.leaves().iter().any(|(_, k)| *k == EditorKind::Sheet));
+        assert_eq!(displayed_layout(&stored, true), stored);
         let mut prefs = Preferences::default();
         assert!(!prefs.interface.show_unfinished, "off by default");
         assert!(!workspace_shown(Workspace::Data, &prefs));
