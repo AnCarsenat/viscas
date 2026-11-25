@@ -578,7 +578,40 @@ fn precedence_and_associativity() {
         ("a · b × c ÷ d", "(*/ a *b *c /d)"),
         ("1 +\n 2", "(+ 1 2)"),
         ("x**2", "(^ x 2)"),
+        ("a ⋅ b", "(* a b)"),
+        ("a / b ÷ c", "(*/ a /b /c)"),
     ]);
+}
+
+#[test]
+fn superscript_exponents() {
+    let cases = [
+        ("x²", "(^ x 2)"),
+        ("2x³", "(* 2 (^ x 3))"),
+        ("x⁻¹", "(^ x (neg 1))"),
+        ("x¹⁰ + 1", "(+ (^ x 10) 1)"),
+        ("(x+1)²", "(^ (+ x 1) 2)"),
+        ("x² − 2·x × 3", "(- (^ x 2) (* 2 x 3))"),
+        // A superscript run is one exponent number.
+        ("x²²", "(^ x 22)"),
+        ("x⁻¹²", "(^ x (neg 12))"),
+        ("2x²²", "(* 2 (^ x 22))"),
+        // Superscripts never glue onto identifiers.
+        ("x²y", "(* (^ x 2) y)"),
+    ];
+    for (src, want) in cases {
+        assert_eq!(sx(&expr_ok(src)), want, "parse_expr({src:?})");
+    }
+    assert_eq!(
+        kinds("x²"),
+        vec![
+            TokenKind::Ident("x".into()),
+            TokenKind::Caret,
+            num("2", false),
+            TokenKind::Eof
+        ]
+    );
+    assert_eq!(sx(&expr_ok("x⁻1")), "(^ x (neg 1))");
 }
 
 #[test]

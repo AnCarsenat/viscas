@@ -37,6 +37,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     let palette = Palette::new(&overlay, ctx);
     palette.contain_focus(&window);
     install_space_key(&window);
+    crate::compose::install(&window);
     install_actions(&window, &areas, &palette);
     crate::doc_ui::install(&window, ctx, &areas, status_widgets);
     ctx.add_command_provider(WindowCommands::new(&window));

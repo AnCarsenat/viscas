@@ -96,6 +96,8 @@ pub struct Interface {
     pub tooltips: bool,
     /// Playful one-liners in empty states.
     pub playful: bool,
+    /// How GTK rasterizes text.
+    pub font_rendering: FontRendering,
 }
 
 impl Default for Interface {
@@ -106,6 +108,39 @@ impl Default for Interface {
             mono_font: String::new(),
             tooltips: true,
             playful: true,
+            font_rendering: FontRendering::default(),
+        }
+    }
+}
+
+/// Text rasterization mode (GTK's `gtk-font-rendering`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FontRendering {
+    /// The desktop's hinting settings (GTK `manual`). The default: GTK's
+    /// unhinted automatic mode draws a small `=` as a single bar on 1×
+    /// displays, indistinguishable from `-`.
+    #[default]
+    DesktopHinting,
+    /// GTK's own choice (unhinted, subpixel-positioned glyphs).
+    Automatic,
+}
+
+impl FontRendering {
+    pub const ALL: [FontRendering; 2] = [FontRendering::DesktopHinting, FontRendering::Automatic];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            FontRendering::DesktopHinting => "Desktop Hinting",
+            FontRendering::Automatic => "Automatic",
+        }
+    }
+
+    /// Nick of the matching `GtkFontRendering` value.
+    pub fn gtk_nick(self) -> &'static str {
+        match self {
+            FontRendering::DesktopHinting => "manual",
+            FontRendering::Automatic => "automatic",
         }
     }
 }
@@ -722,6 +757,7 @@ mod tests {
         let mut p = Preferences::default();
         p.interface.ui_scale = 1.25;
         p.interface.mono_font = "Hack".into();
+        p.interface.font_rendering = FontRendering::Automatic;
         p.viewport.grid_style = GridStyle::Dots;
         p.editing.definition_op = DefinitionOp::Equals;
         p.themes.accent = Accent::Blue;
@@ -729,9 +765,21 @@ mod tests {
         p.system.dark_theme = model::HIGH_CONTRAST_NAME.into();
         let text = p.to_toml().unwrap();
         assert!(text.contains("definition_op = \"=\""));
+        assert!(text.contains("font_rendering = \"automatic\""));
         let (back, warnings) = Preferences::from_toml(&text);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn font_rendering_defaults_to_desktop_hinting() {
+        let (p, w) = Preferences::from_toml("[interface]\nfont_size = 12.0\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(p.interface.font_rendering, FontRendering::DesktopHinting);
+        assert_eq!(FontRendering::DesktopHinting.gtk_nick(), "manual");
+        assert_eq!(FontRendering::Automatic.gtk_nick(), "automatic");
+        let (p, _) = Preferences::from_toml("[interface]\nfont_rendering = \"desktop-hinting\"\n");
+        assert_eq!(p.interface.font_rendering, FontRendering::DesktopHinting);
     }
 
     #[test]

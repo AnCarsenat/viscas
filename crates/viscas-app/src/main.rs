@@ -5,6 +5,7 @@ extern crate gtk4 as gtk;
 mod app;
 mod areas;
 mod commands;
+mod compose;
 mod ctx;
 mod doc;
 mod doc_ui;

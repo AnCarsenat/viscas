@@ -344,6 +344,7 @@ fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::Window {
         .build();
     window.set_transient_for(parent.as_ref());
     install_menu_actions(&window, &binder);
+    crate::compose::install(&window);
 
     // Refresh bound widgets after every change; the refreshers live as
     // long as the window (owned by the destroy handler's closure).
@@ -465,6 +466,30 @@ fn interface_page(b: &Binder) -> gtk::Box {
     font.set_suffix(" px");
     display.append(&property_row("Font Size", font.widget()));
     display.append(&property_row("Monospace Font", &mono_font_dropdown(b)));
+    let titles: Vec<&str> = prefs::FontRendering::ALL
+        .iter()
+        .map(|f| f.title())
+        .collect();
+    let rendering = b.choice(
+        &titles,
+        |p| {
+            prefs::FontRendering::ALL
+                .iter()
+                .position(|f| *f == p.interface.font_rendering)
+                .unwrap_or(0) as u32
+        },
+        |p, i| {
+            p.interface.font_rendering = prefs::FontRendering::ALL
+                .get(i as usize)
+                .copied()
+                .unwrap_or_default()
+        },
+    );
+    rendering.set_tooltip_text(Some(
+        "Desktop Hinting uses your desktop's font hinting (crisp; keeps both bars of a \
+         small \"=\"). Automatic lets GTK render text unhinted.",
+    ));
+    display.append(&property_row("Font Rendering", &rendering));
     page.append(display.widget());
 
     let editors = Panel::new("Editors", true);

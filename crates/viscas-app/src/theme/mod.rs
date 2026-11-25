@@ -10,13 +10,15 @@ use std::cell::{Cell, RefCell};
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 
-use crate::prefs::Preferences;
+use crate::prefs::{FontRendering, Preferences};
 
 thread_local! {
     /// The installed provider and the stylesheet it currently holds.
     static PROVIDER: RefCell<Option<(gtk::CssProvider, String)>> = const { RefCell::new(None) };
     /// The color scheme last given to GTK.
     static LAST_DARK: Cell<Option<bool>> = const { Cell::new(None) };
+    /// The font rendering mode last given to GTK.
+    static LAST_RENDERING: Cell<Option<FontRendering>> = const { Cell::new(None) };
 }
 
 /// Stylesheet options taken from the preferences.
@@ -40,6 +42,10 @@ pub fn apply(prefs: &Preferences) {
     if LAST_DARK.replace(Some(theme.dark)) != Some(theme.dark) {
         set_color_scheme(&display, theme.dark);
     }
+    let rendering = prefs.interface.font_rendering;
+    if LAST_RENDERING.replace(Some(rendering)) != Some(rendering) {
+        set_font_rendering(&display, rendering);
+    }
     let sheet = css::stylesheet(&theme, &style_options(prefs));
     PROVIDER.with_borrow_mut(|slot| match slot {
         Some((_, current)) if *current == sheet => {}
@@ -61,6 +67,21 @@ pub fn apply(prefs: &Preferences) {
             *slot = Some((provider, sheet));
         }
     });
+}
+
+/// Sets GTK's `gtk-font-rendering` (GTK 4.16+; a no-op before) from
+/// Preferences ▸ Interface ▸ Font Rendering. GTK's `automatic` mode
+/// renders unhinted glyphs; at our 11–12 px sizes on a 1× display a `=`
+/// then drew as a single bar, indistinguishable from `-`.
+fn set_font_rendering(display: &gdk::Display, mode: FontRendering) {
+    let settings = gtk::Settings::for_display(display);
+    let value = settings
+        .find_property("gtk-font-rendering")
+        .and_then(|pspec| glib::EnumClass::with_type(pspec.value_type()))
+        .and_then(|class| class.to_value_by_nick(mode.gtk_nick()));
+    if let Some(value) = value {
+        settings.set_property_from_value("gtk-font-rendering", &value);
+    }
 }
 
 /// Forces GTK's built-in Adwaita (so desktop themes do not leak into

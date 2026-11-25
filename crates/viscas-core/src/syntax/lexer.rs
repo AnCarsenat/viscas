@@ -16,6 +16,13 @@
 //!   Greek letter (`dθ`) is one identifier so differentials work.
 //! - Unicode operator aliases: `· × ⋅` → `*`, `÷` → `/`, `−` → `-`,
 //!   `≤ ≥ ≠`, `→` → `->`, `′` → `'`, `**` → `^`, `...` → `..`, `≔` → `:=`.
+//! - Superscript digits are exponents (math first): `x²` → `x ^ 2`,
+//!   `x⁻¹` → `x ^ -1` (`²` is a plain key on AZERTY keyboards). A run of
+//!   superscripts is one exponent number: `x²²` → `x ^ 22`, `x⁻¹²` →
+//!   `x ^ -12`; a lone sign takes an ordinary exponent (`x⁻1` → `x ^ -1`).
+//!   Identifiers never contain superscript digits. Earlier builds lexed
+//!   `x²` as one name; the document format is pre-1.0, so saved files are
+//!   not migrated.
 //! - A string literal never spans lines: an unterminated string ends at the
 //!   newline, which is kept as a separate token so the next line still parses.
 
@@ -39,9 +46,26 @@ fn is_greek(c: char) -> bool {
     matches!(c, '\u{0370}'..='\u{03FF}' | '\u{1F00}'..='\u{1FFF}')
 }
 
+/// ASCII digit of a superscript digit (`²` → `2`).
+fn superscript_digit(c: char) -> Option<char> {
+    Some(match c {
+        '⁰' => '0',
+        '¹' => '1',
+        '²' => '2',
+        '³' => '3',
+        '⁴' => '4',
+        '⁵' => '5',
+        '⁶' => '6',
+        '⁷' => '7',
+        '⁸' => '8',
+        '⁹' => '9',
+        _ => return None,
+    })
+}
+
 /// Characters that continue a (non-Greek) identifier.
 fn is_ident_continue(c: char) -> bool {
-    c.is_alphanumeric() && !is_greek(c)
+    c.is_alphanumeric() && !is_greek(c) && superscript_digit(c).is_none()
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -101,6 +125,8 @@ impl Lexer<'_> {
                 || (c == '.' && self.peek_nth(1).is_some_and(|d| d.is_ascii_digit()))
             {
                 self.number(start);
+            } else if superscript_digit(c).is_some() || matches!(c, '⁻' | '⁺') {
+                self.superscript(start);
             } else if c == '∞' {
                 self.bump();
                 self.push(TokenKind::Ident("∞".into()), start);
@@ -159,6 +185,41 @@ impl Lexer<'_> {
             self.bump();
         }
         self.push(TokenKind::Number { text, imaginary }, start);
+    }
+
+    /// A superscript run (`²`, `⁻¹`, `¹⁰`, or a sign alone as in `x⁻1`)
+    /// lexed as `^`, an optional sign and the exponent number, all
+    /// spanning the run.
+    fn superscript(&mut self, start: usize) {
+        let sign = match self.peek() {
+            Some('⁻') => Some(TokenKind::Minus),
+            Some('⁺') => Some(TokenKind::Plus),
+            _ => None,
+        };
+        if sign.is_some() {
+            self.bump();
+        }
+        let mut digits = String::new();
+        while let Some(d) = self.peek().and_then(superscript_digit) {
+            digits.push(d);
+            self.bump();
+        }
+        self.push(TokenKind::Caret, start);
+        if let Some(sign) = sign {
+            self.push(sign, start);
+        }
+        // A lone sign (`x⁻1`, Compose `^` `-`): the exponent follows in
+        // ordinary characters.
+        if digits.is_empty() {
+            return;
+        }
+        self.push(
+            TokenKind::Number {
+                text: digits,
+                imaginary: false,
+            },
+            start,
+        );
     }
 
     fn ident(&mut self, start: usize) {
