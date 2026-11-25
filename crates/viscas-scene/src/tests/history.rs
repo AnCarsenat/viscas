@@ -494,6 +494,33 @@ fn undo_closes_open_group() {
 }
 
 #[test]
+fn undo_during_drag_then_late_end_group_keeps_history_consistent() {
+    // A scrub drag holds a group open; Ctrl+Z lands mid-drag and the
+    // editor closes "its" group afterwards.
+    let mut s = Scene::new();
+    let a = var(&mut s, "a", "0");
+    s.begin_group("Drag");
+    for i in 1..5 {
+        s.update_coalesced(a, "drag", |c| {
+            if let Some(slot) = c.kind.source_mut(SourceField::Main) {
+                *slot = i.to_string();
+            }
+        })
+        .unwrap();
+    }
+    assert!(s.undo());
+    assert_eq!(main_src(&s, a), "0", "the whole drag is one step");
+    s.end_group(); // late close: no group left, must be a no-op
+    assert!(!s.in_group());
+    assert!(s.can_redo());
+    assert!(s.redo());
+    assert_eq!(main_src(&s, a), "4");
+    assert!(s.undo());
+    assert!(s.undo());
+    assert_eq!(s.len(), 0);
+}
+
+#[test]
 fn transaction_helper() {
     let mut s = Scene::new();
     let ids = s.transaction("Two", |s| (var(s, "a", "1"), var(s, "b", "a")));

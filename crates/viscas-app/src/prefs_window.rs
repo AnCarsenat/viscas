@@ -353,17 +353,15 @@ fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::Window {
     let syncing = binder.syncing.clone();
     let listener_ctx = ctx.downgrade();
     ctx.preferences()
-        .connect_changed(move |p| match (weak.upgrade(), listener_ctx.upgrade()) {
-            (Some(refreshers), Some(ctx)) => {
+        .connect_changed_for(weak, move |refreshers, p| {
+            if let Some(ctx) = listener_ctx.upgrade() {
                 let b = Binder {
                     ctx,
                     refreshers,
                     syncing: syncing.clone(),
                 };
                 b.refresh_all(p);
-                true
             }
-            _ => false,
         });
     window.connect_destroy(move |_| drop(refreshers.take()));
     window

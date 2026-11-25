@@ -457,17 +457,10 @@ impl Console {
             .css_classes(["console-hint"])
             .visible(self.inner.ctx.preferences().with(|p| p.interface.playful))
             .build();
-        let weak_quip = quip.downgrade();
         self.inner
             .ctx
             .preferences()
-            .connect_changed(move |p| match weak_quip.upgrade() {
-                Some(q) => {
-                    q.set_visible(p.interface.playful);
-                    true
-                }
-                None => false,
-            });
+            .connect_changed_for(quip.downgrade(), |q, p| q.set_visible(p.interface.playful));
         let tries = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .max_children_per_line(6)
@@ -1509,18 +1502,17 @@ impl Console {
         });
         self.inner.subs.borrow_mut().push(sub);
 
-        let weak = self.downgrade();
-        self.inner.ctx.preferences().connect_changed(move |_| {
-            let Some(c) = Console::from_weak(&weak) else {
-                return false;
-            };
-            let color = error_color(&c.inner.ctx);
-            if *c.inner.error_color.borrow() != color {
-                *c.inner.error_color.borrow_mut() = color;
-                c.rebuild_entries();
-            }
-            true
-        });
+        self.inner
+            .ctx
+            .preferences()
+            .connect_changed_for(self.downgrade(), |inner, _| {
+                let c = Console { inner };
+                let color = error_color(&c.inner.ctx);
+                if *c.inner.error_color.borrow() != color {
+                    *c.inner.error_color.borrow_mut() = color;
+                    c.rebuild_entries();
+                }
+            });
     }
 }
 

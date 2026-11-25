@@ -45,6 +45,10 @@ struct Inner {
     /// Per-node start values of the current scrub interaction (relative
     /// multi-edits) and the field value it started from.
     scrub_base: RefCell<Option<ScrubBase>>,
+    /// Undo/redo (or a save) interrupted the current scrub: its further
+    /// values are ignored until the interaction ends, so the drag cannot
+    /// re-apply itself on top of the moved history.
+    scrub_suspended: Cell<bool>,
     sub: RefCell<Option<Subscription>>,
 }
 
@@ -98,6 +102,7 @@ impl Inspector {
                 shape: RefCell::default(),
                 group_open: Cell::new(false),
                 scrub_base: RefCell::default(),
+                scrub_suspended: Cell::new(false),
                 sub: RefCell::default(),
             }),
         };
@@ -107,29 +112,20 @@ impl Inspector {
         });
         *insp.inner.sub.borrow_mut() = Some(sub);
         let weak = insp.downgrade();
-        ctx.selection().connect_selection_changed(move |_| {
-            let Some(inner) = weak.upgrade() else {
-                return false;
-            };
-            Inspector { inner }.update(false);
-            true
-        });
+        ctx.selection()
+            .connect_selection_for(weak, |inner, _| Inspector { inner }.update(false));
         // A scrub interrupted by the editor going away (area change, window
         // closing) must not leave its undo group open.
         let weak = insp.downgrade();
         insp.inner.root.connect_unmap(move |_| {
-            Self::with_weak(&weak, |i| i.close_group());
+            Self::with_weak(&weak, |i| i.end_scrub());
         });
         let weak = insp.downgrade();
-        ctx.preferences().connect_changed(move |_| {
-            let Some(inner) = weak.upgrade() else {
-                return false;
-            };
+        ctx.preferences().connect_changed_for(weak, |inner, _| {
             let i = Inspector { inner };
             if i.inner.shape.borrow().is_empty() {
                 i.rebuild();
             }
-            true
         });
         insp.rebuild();
         insp
@@ -178,6 +174,8 @@ impl Inspector {
                 }
             }
             DocEvent::Replaced => self.update(true),
+            DocEvent::HistoryNavigating => self.interrupt_scrub(),
+            DocEvent::CommitEdits => self.seal_group(),
             DocEvent::Settings(_) | DocEvent::Colors => self.update(false),
             _ => {}
         }
@@ -200,6 +198,9 @@ impl Inspector {
 
     fn rebuild(&self) {
         self.close_group();
+        // The fields (and any interrupted drag) are replaced: a drag that
+        // never reports its end must not keep new fields suspended.
+        self.inner.scrub_suspended.set(false);
         let body = &self.inner.body;
         while let Some(c) = body.first_child() {
             body.remove(&c);
@@ -359,6 +360,9 @@ impl Inspector {
         targets: &[(NodeId, f64)],
         f: &dyn Fn(&mut NodeContent, f64),
     ) {
+        if self.inner.scrub_suspended.get() {
+            return;
+        }
         let open = self.inner.group_open.replace(true);
         self.inner.ctx.engine().edit(|e| {
             let s = e.scene_mut();
@@ -380,8 +384,20 @@ impl Inspector {
         self.inner.ctx.engine().edit(f)
     }
 
-    fn close_group(&self) {
-        self.inner.scrub_base.borrow_mut().take();
+    /// Ends a scrub interaction (release, arrow click, typed value, the
+    /// editor going away): closes its undo group and lifts a suspension.
+    fn end_scrub(&self) {
+        self.close_group();
+        if self.inner.scrub_suspended.replace(false) {
+            // Show the values the history moved to.
+            self.update(false);
+        }
+    }
+
+    /// A save during a scrub: closes the open undo group so the saved
+    /// document holds the current values; the drag goes on (its next
+    /// value opens a fresh group from the same start values).
+    fn seal_group(&self) {
         if self.inner.group_open.replace(false) {
             self.inner.ctx.engine().edit(|e| {
                 let s = e.scene_mut();
@@ -389,6 +405,20 @@ impl Inspector {
                 s.seal_history();
             });
         }
+    }
+
+    /// Undo/redo while a scrub holds an undo group open: close the group
+    /// now (one complete step) and ignore the rest of the drag.
+    fn interrupt_scrub(&self) {
+        if self.inner.group_open.get() {
+            self.close_group();
+            self.inner.scrub_suspended.set(true);
+        }
+    }
+
+    fn close_group(&self) {
+        self.inner.scrub_base.borrow_mut().take();
+        self.seal_group();
     }
 
     /// A scrub field editing a number of every selected node.
@@ -433,7 +463,7 @@ impl Inspector {
             });
         });
         let weak = self.downgrade();
-        field.connect_finished(move || Self::with_weak(&weak, |i| i.close_group()));
+        field.connect_finished(move || Self::with_weak(&weak, |i| i.end_scrub()));
         let f = field.clone();
         self.add_refresher(move |e| {
             if f.is_active() {
@@ -937,7 +967,7 @@ impl Inspector {
             });
         });
         let weak = self.downgrade();
-        value.connect_finished(move || Self::with_weak(&weak, |i| i.close_group()));
+        value.connect_finished(move || Self::with_weak(&weak, |i| i.end_scrub()));
         let f = value.clone();
         self.add_refresher(move |e| {
             if f.is_active() {

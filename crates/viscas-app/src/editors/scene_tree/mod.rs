@@ -687,34 +687,20 @@ impl SceneTree {
         // Selection changes re-apply (and reveal) the selection; hover only
         // restyles rows. Both disconnect once the editor is gone.
         let weak = self.downgrade();
-        self.inner
-            .ctx
-            .selection()
-            .connect_selection_changed(move |_| {
-                let Some(inner) = weak.upgrade() else {
-                    return false;
-                };
-                let t = SceneTree { inner };
-                t.apply_selection_from_ctx(true);
-                t.update_tint();
-                true
+        let ctx = &self.inner.ctx;
+        ctx.selection().connect_selection_for(weak, |inner, _| {
+            let t = SceneTree { inner };
+            t.apply_selection_from_ctx(true);
+            t.update_tint();
+        });
+        ctx.selection()
+            .connect_hover_for(self.downgrade(), |inner, _| {
+                SceneTree { inner }.update_tint()
             });
-        let weak = self.downgrade();
-        self.inner.ctx.selection().connect_hover_changed(move |_| {
-            let Some(inner) = weak.upgrade() else {
-                return false;
-            };
-            SceneTree { inner }.update_tint();
-            true
-        });
-        let weak = self.downgrade();
-        self.inner.ctx.preferences().connect_changed(move |_| {
-            let Some(inner) = weak.upgrade() else {
-                return false;
-            };
-            SceneTree { inner }.update_empty();
-            true
-        });
+        ctx.preferences()
+            .connect_changed_for(self.downgrade(), |inner, _| {
+                SceneTree { inner }.update_empty()
+            });
     }
 
     fn install_actions(&self) {

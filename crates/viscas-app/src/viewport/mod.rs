@@ -130,26 +130,17 @@ impl Viewport {
         viewport.add_layer(PlotsLayer {
             state: viewport.plots.clone(),
         });
-        let this = viewport.downgrade();
         ctx.preferences()
-            .connect_changed(move |p| match this.upgrade() {
-                Some(vp) => {
-                    vp.plots.invalidate_style();
-                    if p.viewport.lock_aspect && vp.view.borrow().aspect != 1.0 {
-                        vp.update_view(View::lock_aspect);
-                    }
-                    vp.sync_actions();
-                    vp.queue_draw();
-                    true
+            .connect_changed_for(viewport.downgrade(), |vp, p| {
+                vp.plots.invalidate_style();
+                if p.viewport.lock_aspect && vp.view.borrow().aspect != 1.0 {
+                    vp.update_view(View::lock_aspect);
                 }
-                None => false,
-            });
-        let this = viewport.downgrade();
-        ctx.selection().connect_changed(move |_| {
-            if let Some(vp) = this.upgrade() {
+                vp.sync_actions();
                 vp.queue_draw();
-            }
-        });
+            });
+        ctx.selection()
+            .connect_changed_for(viewport.downgrade(), |vp, _| vp.queue_draw());
         viewport.subscribe();
         viewport.install_actions();
         viewport.install_draw();
@@ -820,6 +811,16 @@ struct WeakViewport {
     actions: glib::WeakRef<gio::SimpleActionGroup>,
     header: Weak<RefCell<HeaderRefs>>,
     quick_input: Weak<Cell<bool>>,
+}
+
+impl crate::ctx::WeakGuard for WeakViewport {
+    type Strong = Viewport;
+    fn upgrade_guard(&self) -> Option<Viewport> {
+        self.upgrade()
+    }
+    fn is_alive(&self) -> bool {
+        self.root.upgrade().is_some()
+    }
 }
 
 impl WeakViewport {
