@@ -180,14 +180,28 @@ impl Number {
                 super::theory::factorial(&(n - 1u32)).map(Number::Integer)
             }
             Number::F64(x) => {
+                // `F64` is finite by invariant, but never panic on a stray
+                // NaN/∞ (the plot path feeds raw `f64`s through here).
+                let Some(b) = BigFloat::from_f64(*x, 53) else {
+                    return Err(if *x == f64::INFINITY {
+                        NumberError::Overflow
+                    } else {
+                        NumberError::Domain("gamma of a non-finite float")
+                    });
+                };
                 if x.fract() == 0.0 && *x <= 0.0 {
                     return pole();
+                }
+                if x.fract() == 0.0 && *x <= 171.0 {
+                    // Exact (n-1)! for small positive integers; Lanczos is
+                    // off by a few ulps there (Γ(4) = 6.000000000000007).
+                    let n = BigInt::from(*x as u64 - 1);
+                    return Ok(Number::Integer(super::theory::factorial(&n)?).into_f64_kind());
                 }
                 let v = gamma_f64(*x);
                 if v.is_finite() && v != 0.0 {
                     return Ok(Number::F64(v));
                 }
-                let b = BigFloat::from_f64(*x, 53).expect("finite");
                 Ok(Number::Float(b.gamma()?).into_f64_kind())
             }
             Number::Float(f) => f.gamma().map(Number::Float),

@@ -6,7 +6,9 @@
 //! become function pointers, degree mode is folded in) and constant
 //! subtrees are folded. Evaluating the tree allocates nothing.
 //!
-//! Booleans are `1.0`/`0.0`; `NaN` means undefined (failed restriction,
+//! Booleans are `1.0`/`0.0` (results of comparisons, conditions); used as
+//! arithmetic operands they are an error like in the general evaluator
+//! (`(x > 0) + 1` is NaN, not `2`). `NaN` means undefined (failed restriction,
 //! missing piecewise branch, domain error). Anything the compiler does not
 //! handle (lists, sums, integrals, derivatives, recursive or block-bodied
 //! functions, complex numbers, ...) falls back to the general evaluator in
@@ -44,7 +46,6 @@ enum Node {
     PowI(Box<Node>, i32),
     /// Real `x^(p/q)` for odd `q` (negative bases allowed).
     OddRoot(Box<Node>, f64, f64),
-    Mod(Box<Node>, Box<Node>),
     F1(F1, Box<Node>),
     F2(F2, Box<Node>, Box<Node>),
     Cmp(CmpOp, Box<Node>, Box<Node>),
@@ -119,23 +120,32 @@ impl Node {
                 }
                 fin(acc)
             }
-            Node::Pow(a, b) => fin(a.eval(v).powf(b.eval(v))),
-            Node::PowI(a, n) => fin(a.eval(v).powi(*n)),
+            Node::Pow(a, b) => {
+                let (x, y) = (a.eval(v), b.eval(v));
+                // `powf` maps `NaN^0` and `1^NaN` to 1; the evaluator does not.
+                if x.is_nan() {
+                    x
+                } else if y.is_nan() {
+                    y
+                } else {
+                    fin(x.powf(y))
+                }
+            }
+            Node::PowI(a, n) => {
+                let x = a.eval(v);
+                if x.is_nan() { x } else { fin(x.powi(*n)) }
+            }
             Node::OddRoot(a, p, q) => {
                 let x = a.eval(v);
+                if x.is_nan() {
+                    return x;
+                }
                 let r = x.abs().powf(1.0 / q).powf(*p);
                 fin(if x < 0.0 && (*p as i64) % 2 != 0 {
                     -r
                 } else {
                     r
                 })
-            }
-            Node::Mod(a, b) => {
-                let (x, y) = (a.eval(v), b.eval(v));
-                if y == 0.0 {
-                    return f64::NAN;
-                }
-                fin(x - y * (x / y).floor())
             }
             Node::F1(f, a) => {
                 let x = a.eval(v);
@@ -221,9 +231,7 @@ impl Node {
             }
             Node::Not(a) => a.has_var(),
             Node::Add(t) | Node::Mul(t) => t.iter().any(|(_, n)| n.has_var()),
-            Node::Pow(a, b) | Node::Mod(a, b) | Node::F2(_, a, b) | Node::Cmp(_, a, b) => {
-                a.has_var() || b.has_var()
-            }
+            Node::Pow(a, b) | Node::F2(_, a, b) | Node::Cmp(_, a, b) => a.has_var() || b.has_var(),
             Node::And(items) | Node::Or(items) => items.iter().any(Node::has_var),
             Node::Select(b, o) => o.has_var() || b.iter().any(|(c, v)| c.has_var() || v.has_var()),
             Node::Restrict(a, c) => a.has_var() || c.iter().any(Node::has_var),
@@ -259,7 +267,8 @@ struct Compiler<'a> {
     env: &'a Env,
     vars: Vec<String>,
     /// Inlined parameters (innermost last).
-    locals: Vec<(String, Node)>,
+    /// `(name, value, is_boolean)`.
+    locals: Vec<(String, Node, bool)>,
     degrees: bool,
     inline_depth: usize,
     /// Exact-mode options for evaluating constant exponents.
@@ -273,6 +282,9 @@ fn f64_number(n: &Number) -> Option<f64> {
 }
 
 fn gamma_f(x: f64) -> f64 {
+    if !x.is_finite() {
+        return f64::NAN;
+    }
     Number::F64(x)
         .gamma(Precision::DEFAULT)
         .map_or(f64::NAN, |n| n.to_f64())
@@ -299,14 +311,24 @@ fn round_f(x: f64) -> f64 {
 }
 
 fn log_b(x: f64, b: f64) -> f64 {
+    // Domain errors in the evaluator: base <= 0 or 1 (and NaN).
+    if b.is_nan() || b <= 0.0 || b == 1.0 {
+        return f64::NAN;
+    }
     x.ln() / b.ln()
 }
 
 fn mod_f(x: f64, y: f64) -> f64 {
-    x - y * (x / y).floor()
+    if y == 0.0 || !x.is_finite() || !y.is_finite() {
+        return f64::NAN;
+    }
+    crate::number::mod_f64(x, y)
 }
 
 fn root_f(x: f64, n: f64) -> f64 {
+    if n == 0.0 || n.is_nan() {
+        return f64::NAN;
+    }
     if x < 0.0 && n.fract() == 0.0 && (n as i64) % 2 != 0 {
         -(-x).powf(1.0 / n)
     } else {
@@ -323,8 +345,8 @@ impl Compiler<'_> {
         self.locals
             .iter()
             .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.clone())
+            .find(|(n, _, _)| n == name)
+            .map(|(_, v, _)| v.clone())
     }
 
     /// Plot variable index; inside inlined function bodies the plot
@@ -338,11 +360,39 @@ impl Compiler<'_> {
     }
 
     fn is_known(&self, name: &str) -> bool {
-        self.locals.iter().any(|(n, _)| n == name)
+        self.locals.iter().any(|(n, _, _)| n == name)
             || self.var_index(name).is_some()
             || CONSTANTS.contains(&name)
             || builtins::lookup(name).is_some()
             || self.env.has(name)
+    }
+
+    /// Whether `e` is (syntactically) a boolean: comparisons, `and`/`or`/
+    /// `not`, `true`/`false` and inlined parameters bound to those.
+    fn is_bool(&self, e: &Expr) -> bool {
+        match &*e.kind {
+            ExprKind::Compare { .. } | ExprKind::And(_) | ExprKind::Or(_) => true,
+            ExprKind::Unary { op, .. } => *op == UnaryOp::Not,
+            ExprKind::Ident(name) => {
+                let name = canonical_name(name);
+                if let Some((_, _, b)) = self.locals.iter().rev().find(|(n, _, _)| n == name) {
+                    *b
+                } else {
+                    self.var_index(name).is_none() && matches!(name, "true" | "false")
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Compiles an arithmetic operand. Booleans are not numbers: the
+    /// general evaluator raises a type error (`(x > 0) + 1`), so the fast
+    /// path yields an error NaN instead of treating them as `1`/`0`.
+    fn num(&mut self, e: &Expr) -> CResult {
+        if self.is_bool(e) {
+            return Ok(Node::Const(f64::NAN));
+        }
+        self.compile(e)
     }
 
     fn ident(&mut self, name: &str, e: &Expr) -> CResult {
@@ -394,7 +444,11 @@ impl Compiler<'_> {
             }
             ExprKind::Ident(name) => self.ident(name, e)?,
             ExprKind::Unary { op, expr } => {
-                let a = self.compile(expr)?;
+                let a = if *op == UnaryOp::Not {
+                    self.compile(expr)?
+                } else {
+                    self.num(expr)?
+                };
                 match op {
                     UnaryOp::Neg => Node::Neg(Box::new(a)),
                     UnaryOp::Pos => a,
@@ -403,8 +457,8 @@ impl Compiler<'_> {
             }
             ExprKind::Binary { op, lhs, rhs } => match op {
                 BinOp::Pow => {
-                    let base = self.compile(lhs)?;
-                    let exp = self.compile(rhs)?;
+                    let base = self.num(lhs)?;
+                    let exp = self.num(rhs)?;
                     // Decide integer / odd-root exponents from the exact value.
                     let exact = match exp {
                         Node::Const(_) => eval_expr(rhs, self.env, &self.exact_opts)
@@ -414,20 +468,20 @@ impl Compiler<'_> {
                     };
                     power(base, exp, exact.as_ref())
                 }
-                BinOp::Mod => Node::Mod(Box::new(self.compile(lhs)?), Box::new(self.compile(rhs)?)),
+                BinOp::Mod => Node::F2(mod_f, Box::new(self.num(lhs)?), Box::new(self.num(rhs)?)),
                 BinOp::To => return Err(Fail::Unsupported),
             },
             ExprKind::Add(terms) => {
                 let mut out = Vec::with_capacity(terms.len());
                 for t in terms {
-                    out.push((t.op == AddOp::Sub, self.compile(&t.expr)?));
+                    out.push((t.op == AddOp::Sub, self.num(&t.expr)?));
                 }
                 Node::Add(out.into())
             }
             ExprKind::Mul(factors) => {
                 let mut out = Vec::with_capacity(factors.len());
                 for f in factors {
-                    out.push((f.op == MulOp::Div, self.compile(&f.expr)?));
+                    out.push((f.op == MulOp::Div, self.num(&f.expr)?));
                 }
                 Node::Mul(out.into())
             }
@@ -443,7 +497,7 @@ impl Compiler<'_> {
                 }
             }
             ExprKind::Postfix { op, expr } => {
-                let a = self.compile(expr)?;
+                let a = self.num(expr)?;
                 match op {
                     PostfixOp::Factorial => Node::F1(fact_f, Box::new(a)),
                     PostfixOp::Percent => {
@@ -521,7 +575,7 @@ impl Compiler<'_> {
                     }
                     let mut bound = Vec::with_capacity(args.len());
                     for (p, a) in u.params.iter().zip(args) {
-                        bound.push((p.clone(), self.compile(a)?));
+                        bound.push((p.clone(), self.compile(a)?, self.is_bool(a)));
                     }
                     // Parameters see only themselves, not the caller's locals.
                     let saved = std::mem::replace(&mut self.locals, bound);
@@ -542,8 +596,8 @@ impl Compiler<'_> {
         if args.len() != 1 {
             return Err(Fail::Unsupported);
         }
-        let a = self.compile(callee)?;
-        let b = self.compile(&args[0])?;
+        let a = self.num(callee)?;
+        let b = self.num(&args[0])?;
         Ok(Node::Mul(vec![(false, a), (false, b)].into()))
     }
 
@@ -592,7 +646,7 @@ impl Compiler<'_> {
             if args.len() != 1 {
                 return Err(Fail::Unsupported);
             }
-            let mut a = self.compile(&args[0])?;
+            let mut a = self.num(&args[0])?;
             let angle_in = matches!(name, "sin" | "cos" | "tan" | "sec" | "csc" | "cot");
             let angle_out = matches!(name, "asin" | "acos" | "atan" | "asec" | "acsc" | "acot");
             if deg && angle_in {
@@ -614,8 +668,8 @@ impl Compiler<'_> {
         };
         match f2 {
             Some(f) if args.len() == 2 => {
-                let a = self.compile(&args[0])?;
-                let b = self.compile(&args[1])?;
+                let a = self.num(&args[0])?;
+                let b = self.num(&args[1])?;
                 let r = Node::F2(f, Box::new(a), Box::new(b));
                 Ok(if deg && name == "atan2" {
                     Node::Mul(vec![(false, r), (true, Node::Const(DEG))].into())
@@ -699,8 +753,11 @@ impl PlotFn {
                     .vars
                     .iter()
                     .zip(args)
-                    .map(|(n, x)| (n.clone(), Value::num(Number::F64(*x))))
-                    .collect();
+                    .map(|(n, x)| Number::f64(*x).map(|x| (n.clone(), Value::num(x))))
+                    .collect::<Result<_, _>>();
+                let Ok(scope) = scope else {
+                    return f64::NAN;
+                };
                 ev.push_scope(scope);
                 match ev.eval(&fb.expr) {
                     Ok(Value::Number(n)) if n.is_real() => fin(n.to_f64()),

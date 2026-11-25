@@ -539,7 +539,17 @@ fn gcd_lcm_integers() {
 fn gcd_lcm_rationals() {
     assert_eq!(rat(1, 2).gcd(&rat(1, 3)).unwrap(), rat(1, 6));
     assert_eq!(rat(1, 2).lcm(&rat(1, 3)).unwrap(), int(1));
-    assert_eq!(Number::F64(1.0).gcd(&int(2)), Err(NumberError::NotInteger));
+    assert_eq!(Number::F64(1.5).gcd(&int(2)), Err(NumberError::NotInteger));
+    assert_eq!(
+        Number::F64(1.0).gcd(&rat(1, 2)),
+        Err(NumberError::NotInteger)
+    );
+    // Integral floats are accepted (float64 mode: `gcd(4, 6)`).
+    assert_eq!(
+        Number::F64(4.0).gcd(&Number::F64(6.0)).unwrap().to_f64(),
+        2.0
+    );
+    assert!(matches!(Number::F64(4.0).lcm(&int(6)).unwrap(), Number::F64(x) if x == 12.0));
 }
 
 #[test]

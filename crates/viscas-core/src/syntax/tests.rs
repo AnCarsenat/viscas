@@ -1147,6 +1147,13 @@ fn nesting_limit_errors() {
             nest("-", "x", "", 200_000),
             "1 mod ".repeat(300) + "1",
             "1 to ".repeat(300) + "1",
+            // Long postfix chains nest one level per operator.
+            "1".to_string() + &"!".repeat(5000),
+            "x".to_string() + &"%".repeat(5000),
+            "f".to_string() + &"'".repeat(5000),
+            "x".to_string() + &".m".repeat(5000),
+            "x".to_string() + &"[1]".repeat(5000),
+            "1".to_string() + &"!".repeat(parser::MAX_DEPTH + 1),
         ] {
             let errs = parse_expr(&src).expect_err(&head(&src));
             assert!(errs.iter().any(|e| e.message.contains("too")), "{errs:?}");
@@ -1168,6 +1175,10 @@ fn deepest_accepted_nesting_fits_small_stack() {
             let e = parse_expr(&src).unwrap_or_else(|e| panic!("{}…: {e:?}", head(&src)));
             roundtrip_expr(&head(&src), &e);
         }
+        // The longest accepted postfix chain.
+        let src = "x".to_string() + &"!".repeat(parser::MAX_DEPTH);
+        let e = parse_expr(&src).unwrap_or_else(|e| panic!("postfix chain: {e:?}"));
+        roundtrip_expr("postfix chain", &e);
         // Each `if` uses one unit; the innermost statement and its
         // expression use two more.
         let program = nest("if x {\n", "y", "\n}", parser::MAX_DEPTH - 2);

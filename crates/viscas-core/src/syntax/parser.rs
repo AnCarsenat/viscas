@@ -904,6 +904,8 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut e = self.parse_primary()?;
+        // Each postfix operator nests the tree one level deeper.
+        let mut count = 0;
         loop {
             let start = e.span.start;
             match self.peek() {
@@ -957,6 +959,10 @@ impl Parser {
                     };
                 }
                 _ => break,
+            }
+            count += 1;
+            if count > MAX_DEPTH {
+                return Err(self.chain_too_long("postfix"));
             }
         }
         Ok(e)

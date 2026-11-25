@@ -417,15 +417,7 @@ impl Number {
             (Number::F64(_), _) | (_, Number::F64(_)) => {
                 let (x, y) = (self.to_f64(), b.to_f64());
                 if x.is_finite() && y.is_finite() {
-                    // `%` is exact in IEEE arithmetic; fix the sign afterwards.
-                    let mut r = x % y;
-                    if r != 0.0 && (r < 0.0) != (y < 0.0) {
-                        r += y;
-                    }
-                    if r.abs() >= y.abs() {
-                        r = 0.0;
-                    }
-                    return Ok(Number::F64(r));
+                    return Ok(Number::F64(mod_f64(x, y)));
                 }
                 let r = f64_parts_to_big(self).modulo(&f64_parts_to_big(b))?;
                 Ok(r.into_f64_kind())
@@ -441,18 +433,26 @@ impl Number {
         }
     }
 
-    /// Greatest common divisor of exact rationals (non-negative).
+    /// Greatest common divisor of exact rationals (non-negative). Integral
+    /// floats are accepted too (`gcd(4.0, 6) = 2.0`, inexact result).
     /// `gcd(a/b, c/d) = gcd(a, c) / lcm(b, d)`.
     pub fn gcd(&self, other: &Number) -> NumResult<Number> {
+        if let Some(r) = integral_float_op(self, other, |a, b| a.gcd(b)) {
+            return r;
+        }
         let (a, b) = exact_pair(self, other)?;
         let num = a.numer().gcd(b.numer());
         let den = a.denom().lcm(b.denom());
         Ok(Number::from_ratio(BigRational::new(num, den)))
     }
 
-    /// Least common multiple of exact rationals (non-negative).
+    /// Least common multiple of exact rationals (non-negative). Integral
+    /// floats are accepted too (`lcm(4.0, 6) = 12.0`, inexact result).
     /// `lcm(a/b, c/d) = lcm(a, c) / gcd(b, d)`.
     pub fn lcm(&self, other: &Number) -> NumResult<Number> {
+        if let Some(r) = integral_float_op(self, other, |a, b| a.lcm(b)) {
+            return r;
+        }
         let (a, b) = exact_pair(self, other)?;
         let num = a.numer().lcm(b.numer());
         let den = a.denom().gcd(b.denom());
@@ -646,6 +646,46 @@ fn float_modulo(a: &Number, b: &Number) -> NumResult<Number> {
         r = &r - b;
     }
     Ok(r)
+}
+
+/// Floored modulo of finite `f64`s (`y != 0`), shared by the `float64`
+/// evaluator and the plot fast path so both agree bit for bit.
+pub(crate) fn mod_f64(x: f64, y: f64) -> f64 {
+    // `%` is exact in IEEE arithmetic; fix the sign afterwards.
+    let mut r = x % y;
+    if r != 0.0 && (r < 0.0) != (y < 0.0) {
+        r += y;
+    }
+    if r.abs() >= y.abs() {
+        r = 0.0;
+    }
+    r
+}
+
+/// `f` on the integer values of a real pair with at least one inexact
+/// operand (`None` when both are exact or one is complex). Non-integral
+/// floats are [`NumberError::NotInteger`]; the result is inexact (`F64` if
+/// either operand is).
+fn integral_float_op(
+    a: &Number,
+    b: &Number,
+    f: fn(&BigInt, &BigInt) -> BigInt,
+) -> Option<NumResult<Number>> {
+    if (a.is_exact() && b.is_exact()) || a.is_complex() || b.is_complex() {
+        return None;
+    }
+    let (x, y) = match (a.integer_value(), b.integer_value()) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
+    };
+    let r = Number::Integer(f(&x, &y));
+    Some(Ok(
+        if matches!(a, Number::F64(_)) || matches!(b, Number::F64(_)) {
+            r.into_f64_kind()
+        } else {
+            r.to_float(a.working_prec(b.working_prec(Precision::from_bits(53))))
+        },
+    ))
 }
 
 fn exact_pair(a: &Number, b: &Number) -> NumResult<(BigRational, BigRational)> {
