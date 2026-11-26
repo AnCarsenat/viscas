@@ -13,6 +13,7 @@ mod docking;
 mod editors;
 mod export;
 mod fuzzy;
+mod intellisense;
 mod keymap;
 mod layout;
 mod palette;

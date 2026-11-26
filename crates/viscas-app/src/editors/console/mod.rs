@@ -12,9 +12,11 @@
 //! can opt into auto-adding drawings or definitions.
 //!
 //! Input: Enter evaluates, Shift+Enter adds a line, Up/Down recall the
-//! (persisted) history, Tab completes through a popover, Ctrl+L clears
-//! the transcript, Escape clears the input. Space always types: the
+//! (persisted) history, Ctrl+L clears the transcript, Escape clears the input. Space always types: the
 //! window's Space-for-palette key ignores focused text views.
+//!
+//! Completion, signature help, diagnostics, auto-pairing and the inline
+//! value preview come from [`crate::intellisense::Assist`].
 //!
 //! Pure helpers live in [`render`] (markup), [`history`] (persistence,
 //! recall) and [`complete`] (insertion math); [`style`] holds the CSS
@@ -31,7 +33,7 @@ use std::rc::{Rc, Weak};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use viscas_engine::{
-    AutoAdd, Completion, CompletionKind, ConsoleError, ConsoleItem, ConsoleOutput, ItemKind,
+    AutoAdd, ConsoleError, ConsoleItem, ConsoleOutput, ItemKind,
 };
 use viscas_scene::{NodeContent, NodeId};
 
@@ -59,8 +61,6 @@ pub fn insert_into_active(text: &str) -> bool {
 
 /// Entries kept in the transcript; older ones are dropped.
 const MAX_ENTRIES: usize = 400;
-/// Completion candidates shown at once.
-const MAX_COMPLETIONS: usize = 60;
 
 thread_local! {
     /// The history file was read into the engine (once per process).
@@ -120,9 +120,7 @@ struct Inner {
     transcript: gtk::Box,
     empty: gtk::Box,
     input: gtk::TextView,
-    popover: gtk::Popover,
-    list: gtk::ListBox,
-    completions: RefCell<Vec<Completion>>,
+    assist: crate::intellisense::Assist,
     nav: RefCell<HistoryNav>,
     entries: RefCell<Vec<Entry>>,
     /// Example chips shown above the input while the transcript is empty.
@@ -223,38 +221,13 @@ impl Console {
             .css_classes(["console-examples"])
             .build();
 
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::Browse)
-            .can_focus(false)
-            .activate_on_single_click(true)
-            .build();
-        let list_scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .propagate_natural_height(true)
-            .max_content_height(220)
-            .child(&list)
-            .build();
-        let popover = gtk::Popover::builder()
-            .autohide(false)
-            .has_arrow(false)
-            .can_focus(false)
-            .position(gtk::PositionType::Top)
-            .css_classes(["completion"])
-            .child(&list_scroll)
-            .build();
-        // Parented to the input bar, not the text view: a GtkBox removes
-        // (unparents) every child when disposed, while GtkTextView only
-        // knows its own children and would loop on a foreign one when the
-        // editor is destroyed (closing the area, File > New/Open).
-        popover.set_parent(&input_bar);
-        // Moving the console to another area or window unmaps it: never
-        // leave the completion popover open on the old surface.
-        input_bar.connect_unmap(glib::clone!(
-            #[weak]
-            popover,
-            move |_| popover.popdown()
-        ));
-
+        let assist = crate::intellisense::Assist::for_text_view(
+            ctx,
+            &input,
+            &input_bar,
+            viscas_engine::Scope::Console,
+        );
+        assist.enable_preview(&field_overlay);
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .css_classes(["console", "keymap-console"])
@@ -271,9 +244,7 @@ impl Console {
                 transcript,
                 empty,
                 input,
-                popover,
-                list,
-                completions: RefCell::default(),
+                assist,
                 nav: RefCell::default(),
                 entries: RefCell::default(),
                 examples,
@@ -605,9 +576,6 @@ impl Console {
                 if !c.inner.setting_text.get() {
                     c.inner.nav.borrow_mut().reset();
                 }
-                if c.inner.popover.is_visible() {
-                    c.refresh_completions();
-                }
             }
         });
 
@@ -617,16 +585,10 @@ impl Console {
             input_bar,
             move |_| input_bar.add_css_class("focused")
         ));
-        let weak = self.downgrade();
         focus.connect_leave(glib::clone!(
             #[weak]
             input_bar,
-            move |_| {
-                input_bar.remove_css_class("focused");
-                if let Some(c) = Console::from_weak(&weak) {
-                    c.inner.popover.popdown();
-                }
-            }
+            move |_| input_bar.remove_css_class("focused")
         ));
         input.add_controller(focus);
 
@@ -640,13 +602,6 @@ impl Console {
         });
         input_bar.add_controller(click);
 
-        let weak = self.downgrade();
-        self.inner.list.connect_row_activated(move |_, row| {
-            if let Some(c) = Console::from_weak(&weak) {
-                c.accept_completion(row.index().max(0) as usize);
-                c.inner.input.grab_focus();
-            }
-        });
     }
 
     fn on_key(&self, key: gdk::Key, keycode: u32, mods: gdk::ModifierType) -> glib::Propagation {
@@ -654,27 +609,8 @@ impl Console {
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let stop = glib::Propagation::Stop;
-        if self.inner.popover.is_visible() {
-            match key {
-                Key::Up | Key::Down => {
-                    self.move_completion(if key == Key::Up { -1 } else { 1 });
-                    return stop;
-                }
-                Key::Tab | Key::Return | Key::KP_Enter | Key::ISO_Left_Tab => {
-                    let i = self
-                        .inner
-                        .list
-                        .selected_row()
-                        .map_or(0, |r| r.index().max(0) as usize);
-                    self.accept_completion(i);
-                    return stop;
-                }
-                Key::Escape => {
-                    self.inner.popover.popdown();
-                    return stop;
-                }
-                _ => {}
-            }
+        if self.inner.assist.on_key(key, mods) == stop {
+            return stop;
         }
         // Rebindable console keys (Preferences ▸ Keymap ▸ Console).
         let bound =
@@ -693,10 +629,6 @@ impl Console {
         match key {
             Key::Return | Key::KP_Enter if !shift => {
                 self.evaluate();
-                stop
-            }
-            Key::Tab if !ctrl && !shift => {
-                self.complete();
                 stop
             }
             Key::Up if !ctrl && self.cursor_on_first_line() => {
@@ -719,12 +651,6 @@ impl Console {
     fn input_text(&self) -> String {
         let b = self.inner.input.buffer();
         b.text(&b.start_iter(), &b.end_iter(), false).to_string()
-    }
-
-    /// Cursor position in bytes.
-    fn cursor_byte(&self) -> usize {
-        let b = self.inner.input.buffer();
-        complete::char_to_byte(&self.input_text(), b.cursor_position().max(0) as usize)
     }
 
     /// Replaces the input; the cursor goes to byte `cursor` (end if `None`).
@@ -793,7 +719,7 @@ impl Console {
         if text.trim().is_empty() {
             return;
         }
-        self.inner.popover.popdown();
+        self.inner.assist.dismiss();
         let auto = self.inner.ctx.preferences().with(|p| AutoAdd {
             plots: p.editing.console_add_plots,
             definitions: p.editing.console_add_definitions,
@@ -1069,6 +995,7 @@ impl Console {
             .build();
         // Selectable labels would take focus on click; keep it in the input.
         echo.set_focusable(false);
+        crate::intellisense::install_label_hover(&self.inner.ctx, &echo);
         head.append(&prompt);
         head.append(&echo);
         let actions = self.build_actions(out, pin, id);
@@ -1491,126 +1418,6 @@ impl Console {
         })
     }
 
-    // ------------------------------------------------------- completion
-
-    fn complete(&self) {
-        let text = self.input_text();
-        let cursor = self.cursor_byte();
-        let items = self
-            .inner
-            .ctx
-            .engine()
-            .with(|e| e.complete(&text[..cursor]));
-        match items.len() {
-            0 => self.inner.input.error_bell(),
-            1 => {
-                let (t, c) = complete::apply(&text, cursor, &items[0]);
-                self.set_input(&t, Some(c));
-            }
-            _ => {
-                if let Some((t, c)) = complete::extend_to_common(&text, cursor, &items) {
-                    self.set_input(&t, Some(c));
-                }
-                self.show_completions(items);
-            }
-        }
-    }
-
-    fn refresh_completions(&self) {
-        let text = self.input_text();
-        let cursor = self.cursor_byte();
-        let items = self
-            .inner
-            .ctx
-            .engine()
-            .with(|e| e.complete(&text[..cursor]));
-        if items.is_empty() {
-            self.inner.popover.popdown();
-        } else {
-            self.show_completions(items);
-        }
-    }
-
-    fn show_completions(&self, mut items: Vec<Completion>) {
-        // A detached editor (other workspace) has no surface to pop up on.
-        if !self.inner.input.is_mapped() {
-            return;
-        }
-        items.truncate(MAX_COMPLETIONS);
-        let list = &self.inner.list;
-        list.remove_all();
-        for c in &items {
-            list.append(&completion_row(c));
-        }
-        *self.inner.completions.borrow_mut() = items;
-        if let Some(row) = list.row_at_index(0) {
-            list.select_row(Some(&row));
-        }
-        // Point at the cursor.
-        let input = &self.inner.input;
-        let rect = input.iter_location(&self.cursor_iter());
-        let (x, y) = input.buffer_to_window_coords(gtk::TextWindowType::Widget, rect.x(), rect.y());
-        // The popover's parent is the input bar.
-        let at = self
-            .inner
-            .popover
-            .parent()
-            .and_then(|bar| {
-                input.compute_point(&bar, &gtk::graphene::Point::new(x as f32, y as f32))
-            })
-            .map_or((x, y), |p| (p.x() as i32, p.y() as i32));
-        self.inner
-            .popover
-            .set_pointing_to(Some(&gdk::Rectangle::new(
-                at.0,
-                at.1,
-                1,
-                rect.height().max(1),
-            )));
-        if !self.inner.popover.is_visible() {
-            self.inner.popover.popup();
-        }
-    }
-
-    fn move_completion(&self, delta: i32) {
-        let list = &self.inner.list;
-        let n = self.inner.completions.borrow().len() as i32;
-        if n == 0 {
-            return;
-        }
-        let cur = list.selected_row().map_or(0, |r| r.index());
-        let next = (cur + delta).rem_euclid(n);
-        if let Some(row) = list.row_at_index(next) {
-            list.select_row(Some(&row));
-            // Keep the selection visible.
-            if let Some(adj) = list
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|s| s.downcast::<gtk::ScrolledWindow>().ok())
-                .map(|s| s.vadjustment())
-                && let Some(b) = row.compute_bounds(list)
-            {
-                let (top, bottom) = (f64::from(b.y()), f64::from(b.y() + b.height()));
-                if top < adj.value() {
-                    adj.set_value(top);
-                } else if bottom > adj.value() + adj.page_size() {
-                    adj.set_value(bottom - adj.page_size());
-                }
-            }
-        }
-        self.inner.input.grab_focus();
-    }
-
-    fn accept_completion(&self, index: usize) {
-        let Some(c) = self.inner.completions.borrow().get(index).cloned() else {
-            return;
-        };
-        let text = self.input_text();
-        let (t, cursor) = complete::apply(&text, self.cursor_byte(), &c);
-        self.inner.popover.popdown();
-        self.set_input(&t, Some(cursor));
-    }
-
     // ---------------------------------------------------------- updates
 
     fn connect_updates(&self) {
@@ -1643,45 +1450,6 @@ impl Console {
                 }
             });
     }
-}
-
-fn completion_row(c: &Completion) -> gtk::ListBoxRow {
-    let (badge, class) = match c.kind {
-        CompletionKind::Node => ("n", "node"),
-        CompletionKind::Console => ("c", "console"),
-        CompletionKind::Builtin => ("ƒ", "builtin"),
-        CompletionKind::Constant => ("π", "constant"),
-        CompletionKind::Command => (":", "command"),
-    };
-    let row_box = gtk::Box::builder().spacing(6).build();
-    row_box.append(
-        &gtk::Label::builder()
-            .label(badge)
-            .css_classes(["kind-badge", class])
-            .build(),
-    );
-    row_box.append(
-        &gtk::Label::builder()
-            .label(&c.text)
-            .xalign(0.0)
-            .css_classes(["completion-text"])
-            .build(),
-    );
-    row_box.append(
-        &gtk::Label::builder()
-            .label(&c.detail)
-            .xalign(1.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .max_width_chars(36)
-            .css_classes(["completion-detail"])
-            .build(),
-    );
-    gtk::ListBoxRow::builder()
-        .child(&row_box)
-        .focusable(false)
-        .tooltip_text(&c.detail)
-        .build()
 }
 
 /// Could "Add to board" turn this output into a node? Its last result

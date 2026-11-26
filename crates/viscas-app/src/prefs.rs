@@ -247,6 +247,15 @@ pub struct Editing {
     pub console_add_plots: bool,
     /// The console adds new definitions (`a := 3`) to the board too.
     pub console_add_definitions: bool,
+    /// Math inputs open the completion popup as you type (Ctrl+Space
+    /// always does).
+    pub auto_complete_popup: bool,
+    /// Typing `(`, `[`, `{` or `|` inserts the closing one too.
+    pub auto_pair_brackets: bool,
+    /// The console shows the value of a cheap input as ghost text.
+    pub inline_preview: bool,
+    /// Parse errors and unknown names are underlined while typing.
+    pub live_diagnostics: bool,
 }
 
 impl Default for Editing {
@@ -256,6 +265,10 @@ impl Default for Editing {
             definition_op: DefinitionOp::default(),
             console_add_plots: false,
             console_add_definitions: false,
+            auto_complete_popup: true,
+            auto_pair_brackets: true,
+            inline_preview: true,
+            live_diagnostics: true,
         }
     }
 }
