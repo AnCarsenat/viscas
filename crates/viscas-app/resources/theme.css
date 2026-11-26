@@ -894,6 +894,51 @@ window.prefs-window {
   color: @vc_danger_text;
 }
 
+/* ------------------------------------------------------- keymap editor */
+.keymap-toolbar { margin: 0 2px 4px; }
+.keymap-toolbar dropdown > button { min-height: 22px; }
+.keymap-search { min-height: 24px; }
+.keymap-row {
+  padding: 1px 6px;
+  min-height: 24px;
+  border-radius: 3px;
+}
+.keymap-row:hover { background: alpha(@vc_tint, 0.06); }
+.keymap-row .keymap-name { color: @vc_fg; }
+.keymap-row.overridden .keymap-name { color: @vc_fg_strong; font-weight: 600; }
+.keymap-row .keymap-context { color: @vc_fg_faint; font-size: 10px; }
+button.binding {
+  font-family: __MONO__;
+  font-size: 11px;
+  min-height: 20px;
+  min-width: 40px;
+  padding: 0 8px;
+  border-radius: 3px;
+  border: 1px solid @vc_line;
+  background: @vc_bg3;
+  color: @vc_fg;
+}
+button.binding:hover { background: @vc_bg4; }
+button.binding.capturing {
+  border-color: @vc_accent;
+  background: alpha(@vc_accent, 0.16);
+  color: @vc_accent_text;
+}
+button.binding.conflict { border-color: alpha(@vc_danger, 0.8); }
+button.binding.unbound { color: @vc_fg_faint; font-style: italic; }
+button.keymap-icon {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 0;
+  color: @vc_fg_dim;
+}
+button.keymap-icon:hover { color: @vc_fg_strong; }
+.keymap-row .chip.error { margin: 0 2px; }
+.keymap-key-filter {
+  font-family: __MONO__;
+  font-size: 11px;
+}
+
 /* ------------------------------------------------- stock GTK file chooser */
 /* The dense app rules above are global selectors; inside the stock file
    chooser (used when no portal is available) restore stock proportions so

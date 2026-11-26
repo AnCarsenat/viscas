@@ -257,7 +257,7 @@ impl Console {
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .css_classes(["console"])
+            .css_classes(["console", "keymap-console"])
             .build();
         root.append(&scroller);
         root.append(&examples);
@@ -591,10 +591,12 @@ impl Console {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = self.downgrade();
-        keys.connect_key_pressed(move |_, key, _, mods| match Console::from_weak(&weak) {
-            Some(c) => c.on_key(key, mods),
-            None => glib::Propagation::Proceed,
-        });
+        keys.connect_key_pressed(
+            move |_, key, keycode, mods| match Console::from_weak(&weak) {
+                Some(c) => c.on_key(key, keycode, mods),
+                None => glib::Propagation::Proceed,
+            },
+        );
         input.add_controller(keys);
 
         let weak = self.downgrade();
@@ -647,7 +649,7 @@ impl Console {
         });
     }
 
-    fn on_key(&self, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
+    fn on_key(&self, key: gdk::Key, keycode: u32, mods: gdk::ModifierType) -> glib::Propagation {
         use gdk::Key;
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
@@ -674,11 +676,21 @@ impl Console {
                 _ => {}
             }
         }
-        match key {
-            Key::Return | Key::KP_Enter if ctrl && shift => {
+        // Rebindable console keys (Preferences ▸ Keymap ▸ Console).
+        let bound =
+            crate::keymap::live::action_for(crate::keymap::Context::Console, key, keycode, mods);
+        match bound.as_deref() {
+            Some("console.add-to-board") => {
                 self.pin_last();
-                stop
+                return stop;
             }
+            Some("console.clear") => {
+                self.clear_transcript();
+                return stop;
+            }
+            _ => {}
+        }
+        match key {
             Key::Return | Key::KP_Enter if !shift => {
                 self.evaluate();
                 stop
@@ -698,10 +710,6 @@ impl Console {
             Key::Escape if !self.input_text().is_empty() => {
                 self.set_input("", None);
                 self.inner.nav.borrow_mut().reset();
-                stop
-            }
-            Key::l | Key::L if ctrl => {
-                self.clear_transcript();
                 stop
             }
             _ => glib::Propagation::Proceed,

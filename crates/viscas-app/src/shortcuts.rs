@@ -1,16 +1,16 @@
-//! The single table of keyboard accelerators, and the code applying it.
-
-use gtk::prelude::*;
+//! Default keyboard accelerators of the window commands (the Viscas
+//! preset). The keymap (`crate::keymap`) reads them as defaults; the
+//! user's bindings and all key handling live there.
 
 use crate::workspace::Workspace;
 
-/// One accelerator binding.
+/// One default accelerator.
 pub struct Shortcut {
     /// Detailed action name, e.g. `win.workspace::graph`.
     pub action: String,
     /// Accelerator in `gtk::accelerator_parse` syntax.
     pub accel: &'static str,
-    /// Description shown in the shortcuts overview.
+    /// Description, for actions without a palette command.
     pub title: String,
 }
 
@@ -65,84 +65,6 @@ pub fn all() -> Vec<Shortcut> {
             }),
     );
     list
-}
-
-/// Actions whose keys the window handles itself (see
-/// `window::install_layout_keys`) instead of application accelerators:
-/// Ctrl+Alt+Z is AltGr+Z on some layouts and must still type in text
-/// fields; Ctrl+Tab must win over focus navigation.
-pub const WINDOW_KEYS: [&str; 3] = ["win.layout-undo", "win.next-tab", "win.prev-tab"];
-
-/// Registers every accelerator of [`all`] on the application.
-pub fn install(app: &gtk::Application) {
-    for shortcut in all() {
-        if WINDOW_KEYS.contains(&shortcut.action.as_str()) {
-            continue;
-        }
-        app.set_accels_for_action(&shortcut.action, &[shortcut.accel]);
-    }
-}
-
-/// Human-readable label of an accelerator, e.g. `Ctrl+P`.
-fn label(accel: &str) -> String {
-    gtk::accelerator_parse(accel)
-        .map(|(key, mods)| gtk::accelerator_get_label(key, mods).to_string())
-        .unwrap_or_else(|| accel.to_owned())
-}
-
-/// Accelerator label of the detailed action `action`, if it has one.
-pub fn label_for(action: &str) -> Option<String> {
-    all()
-        .into_iter()
-        .find(|s| s.action == action)
-        .map(|s| label(s.accel))
-}
-
-/// Key that also opens the palette when focus is not in a text field
-/// (Blender's search key). Handled by the window, not an accelerator.
-pub const PALETTE_KEY_LABEL: &str = "Space";
-
-/// Hint for the palette button: accelerator and the Space key.
-pub fn palette_hint() -> String {
-    match label_for("win.palette") {
-        Some(accel) => format!("{accel} / {PALETTE_KEY_LABEL}"),
-        None => PALETTE_KEY_LABEL.to_owned(),
-    }
-}
-
-/// Keyboard map for display: key label and description.
-pub fn keymap() -> Vec<(String, String)> {
-    all()
-        .iter()
-        .map(|s| {
-            let keys = if s.action == "win.palette" {
-                palette_hint()
-            } else {
-                label(s.accel)
-            };
-            (keys, s.title.clone())
-        })
-        .collect()
-}
-
-/// Plain-text overview of the shortcuts, one per line.
-pub fn overview() -> String {
-    let mut lines: Vec<String> = keymap()
-        .iter()
-        .map(|(keys, title)| format!("{keys:<18}{title}"))
-        .collect();
-    lines.push(format!("{:<18}Zoom graph at cursor", "Scroll"));
-    lines.push(format!("{:<18}Pan graph", "Drag"));
-    lines.push(format!("{:<18}Box zoom", "Shift+Drag"));
-    lines.push(format!("{:<18}Zoom graph", "Pinch"));
-    lines.push(format!("{:<18}Reset graph view", "Home"));
-    lines.push(format!(
-        "{:<18}Select curve, show roots/extrema",
-        "Click curve"
-    ));
-    lines.push(format!("{:<18}Pin / unpin its label", "Click dot"));
-    lines.push(format!("{:<18}Clear dots and selection", "Esc"));
-    lines.join("\n")
 }
 
 #[cfg(test)]
