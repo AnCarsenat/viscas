@@ -58,7 +58,12 @@ pub fn doc_markup(c: &Completion) -> String {
     } else {
         let lines: Vec<String> = sigs
             .iter()
-            .map(|s| format!("<tt><b>{}</b></tt>", esc(&s.replacen(sig_name(s), &c.text, 1))))
+            .map(|s| {
+                format!(
+                    "<tt><b>{}</b></tt>",
+                    esc(&s.replacen(sig_name(s), &c.text, 1))
+                )
+            })
             .collect();
         out.push_str(&lines.join("\n"));
     }
@@ -93,10 +98,7 @@ pub fn signature_markup(h: &SignatureHelp) -> String {
     match h.active_param.and_then(|p| sig.param_range(p)) {
         Some((s, e)) => {
             label.push_str(&esc(&sig.label[..s]));
-            label.push_str(&format!(
-                "<b><u>{}</u></b>",
-                esc(&sig.label[s..e])
-            ));
+            label.push_str(&format!("<b><u>{}</u></b>", esc(&sig.label[s..e])));
             label.push_str(&esc(&sig.label[e..]));
         }
         None => label.push_str(&esc(&sig.label)),
@@ -165,9 +167,9 @@ pub fn diagnostic_markup(d: &Diagnostic) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use viscas_engine::help::Signature;
     use viscas_core::syntax::Span;
     use viscas_engine::Snippet;
+    use viscas_engine::help::Signature;
 
     fn log() -> Completion {
         let mut c = Completion::new("log", CompletionKind::Builtin, "log(x, b) — logarithm");

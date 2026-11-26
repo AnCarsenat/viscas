@@ -325,9 +325,7 @@ impl Assist {
             .chars()
             .nth(caret.wrapping_sub(1))
             .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':');
-        if self.popup_open() {
-            self.refresh_completions(false);
-        } else if grew && !own && ident_before && self.features().popup {
+        if self.popup_open() || (grew && !own && ident_before && self.features().popup) {
             self.refresh_completions(false);
         }
         self.refresh_hint();
@@ -510,7 +508,7 @@ impl Assist {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .propagate_natural_height(true)
             .max_content_height(240)
-            .min_content_width(320)
+            .width_request(300)
             .child(&list)
             .build();
         let doc = gtk::Label::builder()
@@ -536,6 +534,7 @@ impl Assist {
                 Scope::Console => gtk::PositionType::Top,
                 Scope::Expression => gtk::PositionType::Bottom,
             })
+            .halign(gtk::Align::Start)
             .css_classes(["completion", "assist-popup"])
             .child(&row)
             .build();
@@ -748,6 +747,7 @@ impl Assist {
                     Scope::Console => gtk::PositionType::Top,
                     Scope::Expression => gtk::PositionType::Bottom,
                 })
+                .halign(gtk::Align::Start)
                 .css_classes(["assist-hint"])
                 .child(&label)
                 .build();
@@ -832,10 +832,7 @@ impl Assist {
                     // Zero-width / end-of-input spans mark the last char.
                     let e = e.min(text.len());
                     let s = if s >= e {
-                        text[..e]
-                            .char_indices()
-                            .last()
-                            .map_or(0, |(i, _)| i)
+                        text[..e].char_indices().last().map_or(0, |(i, _)| i)
                     } else {
                         s
                     };
@@ -867,7 +864,8 @@ impl Assist {
             .engine()
             .with(|e| e.diagnostics(&text, scope));
         let caret = char_to_byte(&text, f.cursor());
-        let fixable: Vec<&Diagnostic> = diags.iter().filter(|d| !d.suggestions.is_empty()).collect();
+        let fixable: Vec<&Diagnostic> =
+            diags.iter().filter(|d| !d.suggestions.is_empty()).collect();
         let Some(d) = fixable
             .iter()
             .find(|d| d.span.start <= caret && caret <= d.span.end)
@@ -875,7 +873,10 @@ impl Assist {
         else {
             return false;
         };
-        let (s, e) = (byte_to_char(&text, d.span.start), byte_to_char(&text, d.span.end));
+        let (s, e) = (
+            byte_to_char(&text, d.span.start),
+            byte_to_char(&text, d.span.end),
+        );
         let fix = &d.suggestions[0];
         self.apply_edit(&Edit {
             start: s,
@@ -1024,8 +1025,8 @@ pub enum TextAction {
 pub fn text_action(key: gdk::Key, mods: gdk::ModifierType) -> Option<TextAction> {
     use gdk::Key;
     let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
-    let alt = mods.contains(gdk::ModifierType::ALT_MASK)
-        || mods.contains(gdk::ModifierType::SUPER_MASK);
+    let alt =
+        mods.contains(gdk::ModifierType::ALT_MASK) || mods.contains(gdk::ModifierType::SUPER_MASK);
     let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
     if alt {
         return None;
@@ -1132,10 +1133,8 @@ pub fn install_label_hover(ctx: &AppCtx, label: &gtk::Label) {
         }
         let layout = label.layout();
         let (ox, oy) = label.layout_offsets();
-        let (inside, index, _) = layout.xy_to_index(
-            (x - ox) * pango::SCALE,
-            (y - oy) * pango::SCALE,
-        );
+        let (inside, index, _) =
+            layout.xy_to_index((x - ox) * pango::SCALE, (y - oy) * pango::SCALE);
         if !inside {
             return false;
         }
@@ -1164,7 +1163,10 @@ mod tests {
             text_action(Key::Tab, M::SHIFT_MASK),
             Some(TextAction::PrevField)
         );
-        assert_eq!(text_action(Key::Tab, M::empty()), Some(TextAction::NextField));
+        assert_eq!(
+            text_action(Key::Tab, M::empty()),
+            Some(TextAction::NextField)
+        );
         assert_eq!(text_action(Key::dead_circumflex, M::empty()), None);
         assert_eq!(text_action(Key::Up, M::ALT_MASK), None);
     }

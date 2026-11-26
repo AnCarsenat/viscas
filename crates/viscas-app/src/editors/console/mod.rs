@@ -32,9 +32,7 @@ use std::rc::{Rc, Weak};
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
-use viscas_engine::{
-    AutoAdd, ConsoleError, ConsoleItem, ConsoleOutput, ItemKind,
-};
+use viscas_engine::{AutoAdd, ConsoleError, ConsoleItem, ConsoleOutput, ItemKind};
 use viscas_scene::{NodeContent, NodeId};
 
 use crate::ctx::AppCtx;
@@ -572,10 +570,10 @@ impl Console {
 
         let weak = self.downgrade();
         input.buffer().connect_changed(move |_| {
-            if let Some(c) = Console::from_weak(&weak) {
-                if !c.inner.setting_text.get() {
-                    c.inner.nav.borrow_mut().reset();
-                }
+            if let Some(c) = Console::from_weak(&weak)
+                && !c.inner.setting_text.get()
+            {
+                c.inner.nav.borrow_mut().reset();
             }
         });
 
@@ -601,7 +599,6 @@ impl Console {
             }
         });
         input_bar.add_controller(click);
-
     }
 
     fn on_key(&self, key: gdk::Key, keycode: u32, mods: gdk::ModifierType) -> glib::Propagation {

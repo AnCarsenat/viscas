@@ -197,13 +197,13 @@ popover.completion > contents { padding: 2px; min-width: 260px; }
 .kind-badge.command { color: @vx_ui_fg; }
 .kind-badge.constant { color: @vx_console_hint; background: alpha(@vx_console_hint, 0.12); }
 
-popover.assist-popup > contents { padding: 0; }
+popover.assist-popup > contents { padding: 0; background-color: @vx_ui_bg1; }
+popover.assist-popup list { background: transparent; }
 popover.assist-popup scrolledwindow { padding: 2px; }
 .assist-doc {
   padding: 8px 10px;
   color: @vx_ui_fg;
   font-size: 11px;
-  background-color: alpha(@vx_ui_tint, 0.03);
 }
 popover.assist-hint > contents {
   padding: 3px 8px;

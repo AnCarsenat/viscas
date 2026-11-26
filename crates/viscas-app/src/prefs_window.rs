@@ -992,6 +992,14 @@ fn viewport_page(b: &Binder) -> gtk::Box {
     page
 }
 
+/// A labelled preference checkbox: label, tooltip, getter, setter.
+type Toggle = (
+    &'static str,
+    &'static str,
+    fn(&Preferences) -> bool,
+    fn(&mut Preferences, bool),
+);
+
 fn editing_page(b: &Binder) -> gtk::Box {
     let page = page();
     let undo = Panel::new("Undo", true);
@@ -1049,7 +1057,7 @@ fn editing_page(b: &Binder) -> gtk::Box {
     page.append(console.widget());
 
     let assist = Panel::new("Assistance", true);
-    let toggles: [(&str, &str, fn(&Preferences) -> bool, fn(&mut Preferences, bool)); 4] = [
+    let toggles: [Toggle; 4] = [
         (
             "Completion popup while typing",
             "Suggest functions, constants and names as you type (Ctrl+Space always opens it)",

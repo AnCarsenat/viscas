@@ -72,7 +72,10 @@ impl Field {
         match self {
             Field::View(v) => {
                 let b = v.buffer();
-                b.select_range(&b.iter_at_offset(end as i32), &b.iter_at_offset(start as i32));
+                b.select_range(
+                    &b.iter_at_offset(end as i32),
+                    &b.iter_at_offset(start as i32),
+                );
             }
             Field::Entry(e) => e.select_region(start as i32, end as i32),
         }
@@ -221,7 +224,11 @@ impl Field {
                     u.set_start_index(s as u32);
                     u.set_end_index(e as u32);
                     attrs.insert(u);
-                    let c = if sev == Severity::Error { error } else { warning };
+                    let c = if sev == Severity::Error {
+                        error
+                    } else {
+                        warning
+                    };
                     let scale = |v: u8| u16::from(v) * 257;
                     let mut uc =
                         pango::AttrColor::new_underline_color(scale(c.r), scale(c.g), scale(c.b));
@@ -250,8 +257,7 @@ impl Field {
     pub fn connect_cursor_moved(&self, f: impl Fn() + 'static) {
         match self {
             Field::View(v) => {
-                v.buffer()
-                    .connect_cursor_position_notify(move |_| f());
+                v.buffer().connect_cursor_position_notify(move |_| f());
             }
             Field::Entry(e) => {
                 e.connect_cursor_position_notify(move |_| f());

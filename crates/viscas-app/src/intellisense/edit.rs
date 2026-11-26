@@ -368,7 +368,12 @@ mod tests {
         assert_eq!(apply("si(1)", &e), "sin(1)");
         assert_eq!(e.caret, 3);
         // The rest of the word is replaced too.
-        let (e, _) = accept("θ + al1", 4, 6, &Completion::new("alpha", CompletionKind::Node, ""));
+        let (e, _) = accept(
+            "θ + al1",
+            4,
+            6,
+            &Completion::new("alpha", CompletionKind::Node, ""),
+        );
         assert_eq!(apply("θ + al1", &e), "θ + alpha");
     }
 

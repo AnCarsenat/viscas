@@ -17,12 +17,15 @@ pub const PREVIEW_MAX_STEPS: u64 = 20_000;
 /// Longest input previewed (bytes).
 pub const PREVIEW_MAX_LEN: usize = 200;
 
+/// The evaluation a [`PreviewTask`] runs: exact and decimal texts.
+type PreviewFn = Box<dyn FnOnce(Arc<AtomicBool>) -> Option<(String, String)> + Send>;
+
 /// A pending preview ([`Engine::preview_task`]): `Send`, run it on any
 /// thread.
 pub struct PreviewTask {
     /// The input it evaluates.
     pub input: String,
-    run: Box<dyn FnOnce(Arc<AtomicBool>) -> Option<(String, String)> + Send>,
+    run: PreviewFn,
 }
 
 impl std::fmt::Debug for PreviewTask {
