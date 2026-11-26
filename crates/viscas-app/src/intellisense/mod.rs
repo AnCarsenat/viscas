@@ -353,58 +353,59 @@ impl Assist {
     /// Handles a key press first (call it from the editor's capture
     /// controller before its own bindings). Returns `Stop` when consumed.
     pub fn on_key(&self, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
+        let stop = glib::Propagation::Stop;
+        let action = text_action(key, mods);
+        if self.popup_open() {
+            match action {
+                Some(TextAction::Up) => self.move_selection(-1),
+                Some(TextAction::Down) => self.move_selection(1),
+                Some(TextAction::PageUp) => self.move_selection(-8),
+                Some(TextAction::PageDown) => self.move_selection(8),
+                Some(TextAction::Accept | TextAction::NextField | TextAction::PrevField) => {
+                    self.accept_selected();
+                }
+                Some(TextAction::Dismiss) => self.hide_popup(),
+                _ => return self.on_key_closed(key, mods, action),
+            }
+            return stop;
+        }
+        self.on_key_closed(key, mods, action)
+    }
+
+    /// [`Assist::on_key`] when the completion popup is closed.
+    fn on_key_closed(
+        &self,
+        key: gdk::Key,
+        mods: gdk::ModifierType,
+        action: Option<TextAction>,
+    ) -> glib::Propagation {
         use gdk::Key;
         let stop = glib::Propagation::Stop;
         let go = glib::Propagation::Proceed;
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let alt = mods.contains(gdk::ModifierType::ALT_MASK)
             || mods.contains(gdk::ModifierType::SUPER_MASK);
-        let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
-        if self.popup_open() {
-            match key {
-                Key::Up | Key::KP_Up => {
-                    self.move_selection(-1);
-                    return stop;
-                }
-                Key::Down | Key::KP_Down => {
-                    self.move_selection(1);
-                    return stop;
-                }
-                Key::Page_Up => {
-                    self.move_selection(-8);
-                    return stop;
-                }
-                Key::Page_Down => {
-                    self.move_selection(8);
-                    return stop;
-                }
-                Key::Tab | Key::ISO_Left_Tab | Key::Return | Key::KP_Enter if !ctrl => {
-                    self.accept_selected();
-                    return stop;
-                }
-                Key::Escape => {
-                    self.hide_popup();
-                    return stop;
-                }
-                _ => {}
+        match action {
+            Some(TextAction::Complete) => {
+                self.refresh_completions(true);
+                return stop;
             }
-        }
-        if ctrl && !alt && matches!(key, Key::space | Key::nobreakspace) {
-            self.refresh_completions(true);
-            return stop;
-        }
-        if ctrl && !alt && matches!(key, Key::period | Key::KP_Decimal | Key::semicolon) {
-            if !self.quick_fix() {
-                self.inner.field.widget().error_bell();
+            Some(TextAction::QuickFix) => {
+                if !self.quick_fix() {
+                    self.inner.field.widget().error_bell();
+                }
+                return stop;
             }
-            return stop;
+            _ => {}
         }
         if ctrl || alt {
             return go;
         }
         match key {
-            Key::Tab | Key::ISO_Left_Tab if self.inner.snippet.borrow().is_some() => {
-                self.snippet_jump(key == Key::ISO_Left_Tab || shift);
+            _ if matches!(action, Some(TextAction::NextField | TextAction::PrevField))
+                && self.inner.snippet.borrow().is_some() =>
+            {
+                self.snippet_jump(action == Some(TextAction::PrevField));
                 return stop;
             }
             Key::Tab if self.has_fragment() => {
@@ -415,7 +416,9 @@ impl Assist {
                 }
                 return stop;
             }
-            Key::Escape if self.inner.snippet.borrow().is_some() || self.hint_open() => {
+            _ if action == Some(TextAction::Dismiss)
+                && (self.inner.snippet.borrow().is_some() || self.hint_open()) =>
+            {
                 self.inner.snippet.borrow_mut().take();
                 self.hide_hint();
                 return stop;
@@ -995,6 +998,59 @@ impl Assist {
     }
 }
 
+/// Keyboard actions of math inputs. Every binding goes through
+/// [`text_action`], the one place to hand over to a keymap registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAction {
+    /// Open the completion popup (Ctrl+Space).
+    Complete,
+    /// Apply the first suggestion of the problem at the caret (Ctrl+.).
+    QuickFix,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    /// Accept the selected completion (Enter; Tab also accepts).
+    Accept,
+    /// Next snippet placeholder / accept (Tab).
+    NextField,
+    /// Previous snippet placeholder (Shift+Tab).
+    PrevField,
+    /// Close the popup, hint or snippet (Escape).
+    Dismiss,
+}
+
+/// The action `key` with `mods` triggers in a math input.
+pub fn text_action(key: gdk::Key, mods: gdk::ModifierType) -> Option<TextAction> {
+    use gdk::Key;
+    let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+    let alt = mods.contains(gdk::ModifierType::ALT_MASK)
+        || mods.contains(gdk::ModifierType::SUPER_MASK);
+    let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+    if alt {
+        return None;
+    }
+    if ctrl {
+        return match key {
+            Key::space | Key::nobreakspace => Some(TextAction::Complete),
+            Key::period | Key::KP_Decimal | Key::semicolon => Some(TextAction::QuickFix),
+            _ => None,
+        };
+    }
+    match key {
+        Key::Up | Key::KP_Up => Some(TextAction::Up),
+        Key::Down | Key::KP_Down => Some(TextAction::Down),
+        Key::Page_Up => Some(TextAction::PageUp),
+        Key::Page_Down => Some(TextAction::PageDown),
+        Key::Return | Key::KP_Enter => Some(TextAction::Accept),
+        Key::ISO_Left_Tab => Some(TextAction::PrevField),
+        Key::Tab if shift => Some(TextAction::PrevField),
+        Key::Tab => Some(TextAction::NextField),
+        Key::Escape => Some(TextAction::Dismiss),
+        _ => None,
+    }
+}
+
 /// Ghost text for a preview: `= exact`, plus `≈ decimal` when it differs;
 /// empty when it only repeats the input.
 pub fn preview_text(input: &str, exact: &str, approx: &str) -> String {
@@ -1091,6 +1147,27 @@ pub fn install_label_hover(ctx: &AppCtx, label: &gtk::Label) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_bindings() {
+        use gdk::{Key, ModifierType as M};
+        assert_eq!(
+            text_action(Key::space, M::CONTROL_MASK),
+            Some(TextAction::Complete)
+        );
+        assert_eq!(text_action(Key::space, M::empty()), None, "Space types");
+        assert_eq!(
+            text_action(Key::period, M::CONTROL_MASK),
+            Some(TextAction::QuickFix)
+        );
+        assert_eq!(
+            text_action(Key::Tab, M::SHIFT_MASK),
+            Some(TextAction::PrevField)
+        );
+        assert_eq!(text_action(Key::Tab, M::empty()), Some(TextAction::NextField));
+        assert_eq!(text_action(Key::dead_circumflex, M::empty()), None);
+        assert_eq!(text_action(Key::Up, M::ALT_MASK), None);
+    }
 
     #[test]
     fn preview_ghost_text() {
