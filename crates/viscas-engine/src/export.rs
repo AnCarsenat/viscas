@@ -339,9 +339,10 @@ pub fn param_name(shape: &PlotShape) -> Option<&'static str> {
     }
 }
 
-/// Parameter of the point of the curve nearest to `p` in `[a, b]`
-/// (`samples` uniform probes, distances measured with `scale` = world
-/// units per pixel on each axis).
+/// Parameter of the point of the curve nearest to `p` in `[a, b]`:
+/// `samples` coarse uniform probes, then two local refinements around the
+/// best probe (distances measured with `scale` = world units per pixel on
+/// each axis).
 pub fn nearest_param(
     shape: &PlotShape,
     (a, b): (f64, f64),
@@ -349,19 +350,41 @@ pub fn nearest_param(
     scale: (f64, f64),
     samples: usize,
 ) -> Option<f64> {
-    let n = samples.max(2);
-    let mut best: Option<(f64, f64)> = None;
-    for i in 0..=n {
-        let t = a + (b - a) * i as f64 / n as f64;
-        let Some(q) = point_at(shape, t).filter(|q| q.is_finite()) else {
-            continue;
-        };
-        let d = ((q.x - p.x) / scale.0).hypot((q.y - p.y) / scale.1);
-        if best.is_none_or(|(bd, _)| d < bd) {
-            best = Some((d, t));
+    const REFINE: usize = 32;
+    let dist = |t: f64| {
+        point_at(shape, t)
+            .filter(|q| q.is_finite())
+            .map(|q| ((q.x - p.x) / scale.0).hypot((q.y - p.y) / scale.1))
+    };
+    let probe = |lo: f64, hi: f64, n: usize| {
+        let mut best: Option<(f64, f64)> = None;
+        for i in 0..=n {
+            let t = lo + (hi - lo) * i as f64 / n as f64;
+            if let Some(d) = dist(t)
+                && best.is_none_or(|(bd, _)| d < bd)
+            {
+                best = Some((d, t));
+            }
         }
+        best
+    };
+    if !(a.is_finite() && b.is_finite()) {
+        return None;
     }
-    best.map(|(_, t)| t)
+    let n = samples.max(2);
+    let (mut best_d, mut t) = probe(a, b, n)?;
+    let mut half = (b - a) / n as f64;
+    for _ in 0..2 {
+        let (lo, hi) = ((t - half).max(a.min(b)), (t + half).min(a.max(b)));
+        if let Some((d, tt)) = probe(lo, hi, REFINE)
+            && d <= best_d
+        {
+            best_d = d;
+            t = tt;
+        }
+        half = (hi - lo) / REFINE as f64;
+    }
+    Some(t)
 }
 
 /// Uniform samples `(t, x, y)` of a curve for `t ∈ [a, b]`, split into

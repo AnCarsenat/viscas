@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 use viscas_plot::{Primitive, Vec2};
 
-use super::drawing::{Drawing, alpha, decimals_for, hex, num};
+use super::drawing::{Drawing, alpha, decimals_for, hex, num, num_sig};
 use super::settings::Unit;
 
 /// SVG output options.
@@ -42,6 +42,15 @@ pub fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Text safe inside an XML comment (no `--`).
+fn comment(s: &str) -> String {
+    let mut t = s.replace("--", "- -");
+    if t.ends_with('-') {
+        t.push(' ');
+    }
+    t
 }
 
 /// Page-coordinate decimals (1/1000 px).
@@ -152,14 +161,32 @@ fn write_grid(s: &mut String, d: &Drawing) {
     }
 }
 
-/// Path data of a point list (`M x y L x y …`, `Z` when closed).
+/// Path data of a point list (`M x y L x y …`, `Z` when closed). A
+/// non-finite point starts a new subpath, so the data never holds NaN or
+/// infinities; subpaths of a single point are dropped.
 fn path_data(pts: &[(f64, f64)], dec: usize, closed: bool) -> String {
     let mut out = String::with_capacity(pts.len() * 16);
-    for (i, (x, y)) in pts.iter().enumerate() {
-        out.push(if i == 0 { 'M' } else { 'L' });
-        let _ = write!(out, "{} {}", num(*x, dec), num(*y, dec));
+    let mut run: Vec<(f64, f64)> = Vec::new();
+    let mut runs = 0;
+    let mut flush = |run: &mut Vec<(f64, f64)>, out: &mut String| {
+        if run.len() >= 2 {
+            for (i, (x, y)) in run.iter().enumerate() {
+                out.push(if i == 0 { 'M' } else { 'L' });
+                let _ = write!(out, "{} {}", num(*x, dec), num(*y, dec));
+            }
+            runs += 1;
+        }
+        run.clear();
+    };
+    for &(x, y) in pts {
+        if x.is_finite() && y.is_finite() {
+            run.push((x, y));
+        } else {
+            flush(&mut run, &mut out);
+        }
     }
-    if closed {
+    flush(&mut run, &mut out);
+    if closed && runs == 1 {
         out.push('Z');
     }
     out
@@ -175,19 +202,25 @@ fn write_plots(s: &mut String, d: &Drawing, opts: &SvgOptions) {
     } else {
         (PAGE_DEC, Box::new(|p: Vec2| d.to_page(p)))
     };
-    let _ = write!(s, r#"<g id="plots" clip-path="url(#page)""#);
+    // The clip lives on an untransformed group so it stays in page units;
+    // the world transform goes on the inner group.
+    s.push_str("<g id=\"plots\" clip-path=\"url(#page)\">\n");
     if opts.world_coords {
+        // Strokes and dashes use `vector-effect="non-scaling-stroke"`: per
+        // SVG 2 both are then measured in page units. Renderers without
+        // vector-effect support draw them scaled by the world transform.
         let (sx, sy) = (d.sx(), d.sy());
-        let _ = write!(
+        let _ = writeln!(
             s,
-            r#" transform="matrix({} 0 0 {} {} {})""#,
-            num(sx, 9),
-            num(-sy, 9),
-            num(-d.world.x_min * sx, 6),
-            num(d.world.y_max * sy, 6)
+            r#"<g id="world" transform="matrix({} 0 0 {} {} {})">"#,
+            num_sig(sx, 12),
+            num_sig(-sy, 12),
+            num_sig(-d.world.x_min * sx, 12),
+            num_sig(d.world.y_max * sy, 12)
         );
+    } else {
+        s.push_str("<g id=\"page-coords\">\n");
     }
-    s.push_str(">\n");
     let nse = if opts.world_coords {
         r#" vector-effect="non-scaling-stroke""#
     } else {
@@ -195,6 +228,9 @@ fn write_plots(s: &mut String, d: &Drawing, opts: &SvgOptions) {
     };
     for (i, layer) in d.layers.iter().enumerate() {
         let st = &layer.style;
+        if let Some(note) = layer.note() {
+            let _ = writeln!(s, "<!-- {} -->", comment(&note));
+        }
         let _ = writeln!(
             s,
             r#"<g id="layer-{i}" data-name="{}" data-kind="{}">"#,
@@ -211,7 +247,7 @@ fn write_plots(s: &mut String, d: &Drawing, opts: &SvgOptions) {
                     .filter(|q| q.is_finite())
                     .map(|q| map(*q))
                     .collect();
-                if pts.len() >= 3 {
+                if pts.len() >= 3 && pts.iter().all(|(x, y)| x.is_finite() && y.is_finite()) {
                     fill.push_str(&path_data(&pts, dec, true));
                 }
             }
@@ -226,13 +262,10 @@ fn write_plots(s: &mut String, d: &Drawing, opts: &SvgOptions) {
         }
         for p in layer.primitives.iter() {
             if let Primitive::Polyline { line, style } = p {
-                let pts: Vec<(f64, f64)> = line
-                    .points
-                    .iter()
-                    .filter(|q| q.is_finite())
-                    .map(|q| map(*q))
-                    .collect();
-                if pts.len() < 2 {
+                // Undefined samples split the path (path_data).
+                let pts: Vec<(f64, f64)> = line.points.iter().map(|q| map(*q)).collect();
+                let data = path_data(&pts, dec, line.closed);
+                if data.is_empty() {
                     continue;
                 }
                 let dash = d.dash(st, *style);
@@ -245,7 +278,7 @@ fn write_plots(s: &mut String, d: &Drawing, opts: &SvgOptions) {
                 let _ = writeln!(
                     s,
                     r#"<path class="curve" d="{}" fill="none" stroke="{}" stroke-width="{}" stroke-linecap="round" stroke-linejoin="round"{}{}{nse}/>"#,
-                    path_data(&pts, dec, line.closed),
+                    data,
                     hex(st.color),
                     num(d.stroke_width(st), 3),
                     opacity_attr("stroke-opacity", alpha(st.color, st.opacity)),
@@ -255,7 +288,7 @@ fn write_plots(s: &mut String, d: &Drawing, opts: &SvgOptions) {
         }
         s.push_str("</g>\n");
     }
-    s.push_str("</g>\n");
+    s.push_str("</g>\n</g>\n");
     // Points in page coordinates (circles stay round in world mode).
     for layer in &d.layers {
         let st = &layer.style;
@@ -265,6 +298,9 @@ fn write_plots(s: &mut String, d: &Drawing, opts: &SvgOptions) {
             if let Primitive::Points(pts) = p {
                 for q in pts.iter().filter(|q| q.is_finite()) {
                     let (x, y) = d.to_page(*q);
+                    if !(x.is_finite() && y.is_finite()) {
+                        continue;
+                    }
                     let _ = write!(
                         dots,
                         r#"<circle cx="{}" cy="{}" r="{}"/>"#,
@@ -385,6 +421,14 @@ pub mod tests {
         let mut i = 0;
         let mut roots = 0;
         while i < b.len() {
+            if doc[i..].starts_with("<!--") {
+                let end = doc[i..].find("-->").ok_or("unterminated comment")? + i;
+                if doc[i + 4..end].contains("--") {
+                    return Err("-- inside a comment".into());
+                }
+                i = end + 3;
+                continue;
+            }
             if b[i] == b'<' {
                 let end = doc[i..].find('>').ok_or("unterminated tag")? + i;
                 let tag = &doc[i + 1..end];
@@ -499,6 +543,9 @@ pub mod tests {
 
     pub fn layer(prims: Vec<Primitive>) -> DrawLayer {
         DrawLayer {
+            node: viscas_scene::NodeId(1),
+            truncated: false,
+            error: None,
             name: "f <1> & \"g\"".to_owned(),
             kind: PlotKind::ExplicitY,
             style: PlotStyle::from_style(&Default::default(), Color::rgb(0x20, 0x80, 0xff)),
@@ -572,6 +619,59 @@ pub mod tests {
         }
         assert!(svg.contains("non-scaling-stroke"));
         assert!(svg.contains(r#"transform="matrix(100 0 0 -100 50 150)""#));
+    }
+
+    #[test]
+    fn undefined_samples_split_paths_without_nan() {
+        let mut d = identity();
+        d.layers[0].truncated = true;
+        d.layers[0].name = "a--b".into();
+        d.layers.push(layer(vec![Primitive::Polyline {
+            line: Polyline::open(vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(0.1, 0.1),
+                Vec2::new(0.2, f64::NAN),
+                Vec2::new(0.3, 0.3),
+                Vec2::new(f64::INFINITY, 0.4),
+                Vec2::new(0.5, 0.5),
+                Vec2::new(0.6, 0.6),
+            ]),
+            style: Default::default(),
+        }]));
+        for world in [false, true] {
+            let svg = write(
+                &d,
+                &SvgOptions {
+                    world_coords: world,
+                    ..Default::default()
+                },
+            );
+            check_xml(&svg).unwrap();
+            assert!(!svg.contains("NaN") && !svg.contains("inf"));
+            assert!(svg.contains("<!-- a- -b: sampling budget reached"));
+            let line = svg
+                .lines()
+                .filter(|l| l.contains(r#"class="curve""#))
+                .nth(1)
+                .unwrap();
+            // Two runs of ≥ 2 points; the lone (0.3, 0.3) is dropped.
+            assert_eq!(line.matches('M').count(), 2, "{line}");
+        }
+    }
+
+    #[test]
+    fn world_mode_clips_in_page_units() {
+        let svg = write(
+            &identity(),
+            &SvgOptions {
+                world_coords: true,
+                ..Default::default()
+            },
+        );
+        let plots = svg.lines().find(|l| l.contains(r#"id="plots""#)).unwrap();
+        assert!(plots.contains("clip-path") && !plots.contains("transform"));
+        let world = svg.lines().find(|l| l.contains(r#"id="world""#)).unwrap();
+        assert!(world.contains("transform") && !world.contains("clip-path"));
     }
 
     #[test]

@@ -42,10 +42,29 @@ impl Default for GridColors {
 /// One node's geometry and style.
 #[derive(Clone, Debug)]
 pub struct DrawLayer {
+    pub node: viscas_scene::NodeId,
     pub name: String,
     pub kind: PlotKind,
     pub style: PlotStyle,
     pub primitives: Arc<Vec<Primitive>>,
+    /// The sampling budget cut the export short (coarser result).
+    pub truncated: bool,
+    /// Rendering failed; `primitives` is empty.
+    pub error: Option<String>,
+}
+
+impl DrawLayer {
+    /// A note about a failed or coarse layer, for comments and the status.
+    pub fn note(&self) -> Option<String> {
+        match (&self.error, self.truncated) {
+            (Some(e), _) => Some(format!("{}: not exported ({e})", self.name)),
+            (None, true) => Some(format!(
+                "{}: sampling budget reached, coarser result",
+                self.name
+            )),
+            (None, false) => None,
+        }
+    }
 }
 
 /// Text anchor of a label.
@@ -281,12 +300,25 @@ pub fn num(v: f64, decimals: usize) -> String {
     if s == "-0" { "0".to_owned() } else { s }
 }
 
-/// Decimals needed to resolve `1/100` of a page pixel at `units_per_px`.
+/// Decimals needed to resolve `1/100` of a page pixel at `units_per_px`
+/// (fixed point, so tiny views get many decimals rather than `e`
+/// notation).
 pub fn decimals_for(units_per_px: f64) -> usize {
     if !(units_per_px.is_finite() && units_per_px > 0.0) {
         return 6;
     }
-    (-(units_per_px / 100.0).log10()).ceil().clamp(0.0, 15.0) as usize
+    (-(units_per_px / 100.0).log10()).ceil().clamp(0.0, 320.0) as usize
+}
+
+/// Fixed-point text of `v` with at least `sig` significant digits
+/// (never `e` notation; zeros trimmed).
+pub fn num_sig(v: f64, sig: usize) -> String {
+    if v == 0.0 || !v.is_finite() {
+        return "0".to_owned();
+    }
+    let mag = v.abs().log10().floor() as i64;
+    let decimals = (sig as i64 - 1 - mag).clamp(0, 330) as usize;
+    num(v, decimals)
 }
 
 /// `#rrggbb` of a color.
@@ -320,6 +352,11 @@ mod tests {
         assert_eq!(decimals_for(0.01), 4);
         assert_eq!(decimals_for(10.0), 1);
         assert_eq!(hex(Color::rgb(255, 0, 16)), "#ff0010");
+        assert_eq!(decimals_for(1e-20), 22);
+        assert_eq!(num_sig(0.000_001_234_567_89, 6), "0.00000123457");
+        assert_eq!(num_sig(123_456_789.0, 6), "123456789");
+        assert_eq!(num_sig(2.5e-7, 6), "0.00000025");
+        assert!(!num_sig(1e-300, 6).contains('e'));
     }
 
     #[test]

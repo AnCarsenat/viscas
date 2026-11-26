@@ -5,7 +5,8 @@ use std::cell::{Cell, RefCell};
 use std::f64::consts::TAU;
 use std::rc::Rc;
 
-use gtk::cairo;
+use gtk::prelude::*;
+use gtk::{cairo, glib};
 use viscas_engine::PlotShape;
 use viscas_engine::export::{nearest_param, point_at};
 use viscas_plot::Vec2;
@@ -19,7 +20,7 @@ const GRAB_PX: f64 = 12.0;
 /// Samples of the highlighted part.
 const HIGHLIGHT_SAMPLES: usize = 400;
 /// Probes of the nearest-parameter search.
-const SEARCH_SAMPLES: usize = 2000;
+const SEARCH_SAMPLES: usize = 256;
 
 /// Callback receiving the picked parameter range.
 pub type OnChange = Rc<dyn Fn(f64, f64)>;
@@ -39,6 +40,8 @@ thread_local! {
     static PICK: RefCell<Option<Pick>> = const { RefCell::new(None) };
     static DRAGGING: Cell<Option<usize>> = const { Cell::new(None) };
     static BOX_ARMED: Cell<bool> = const { Cell::new(false) };
+    /// Latest pointer of a handle drag, applied on the next frame.
+    static PENDING: Cell<Option<(View, f64, f64)>> = const { Cell::new(None) };
 }
 
 fn redraw() {
@@ -127,6 +130,8 @@ pub fn press(view: &View, sx: f64, sy: f64) -> bool {
     match grabbed {
         Some(i) => {
             DRAGGING.set(Some(i));
+            // A handle press is not the start of an export box.
+            BOX_ARMED.set(false);
             true
         }
         None => false,
@@ -134,8 +139,23 @@ pub fn press(view: &View, sx: f64, sy: f64) -> bool {
 }
 
 /// Viewport drag update: moves the grabbed handle to the curve point
-/// nearest the pointer.
-pub fn drag_to(view: &View, sx: f64, sy: f64) {
+/// nearest the pointer, at most once per frame of `widget`.
+pub fn drag_to(widget: &impl IsA<gtk::Widget>, view: &View, sx: f64, sy: f64) {
+    if DRAGGING.get().is_none() {
+        return;
+    }
+    if PENDING.replace(Some((*view, sx, sy))).is_some() {
+        return; // a frame callback is already queued
+    }
+    widget.add_tick_callback(|_, _| {
+        if let Some((view, sx, sy)) = PENDING.take() {
+            apply_drag(&view, sx, sy);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn apply_drag(view: &View, sx: f64, sy: f64) {
     let Some(i) = DRAGGING.get() else {
         return;
     };
@@ -161,6 +181,9 @@ pub fn drag_to(view: &View, sx: f64, sy: f64) {
 
 /// Viewport drag end.
 pub fn release() -> bool {
+    if let Some((view, sx, sy)) = PENDING.take() {
+        apply_drag(&view, sx, sy);
+    }
     DRAGGING.take().is_some()
 }
 

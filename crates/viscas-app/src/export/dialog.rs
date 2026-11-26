@@ -32,25 +32,54 @@ const QUALITIES: [(f64, &str); 4] = [
     (8.0, "Extreme (8×)"),
 ];
 
-/// Parses a number or a constant expression (`pi/2`, `2τ`, `1e-3`).
+/// Parses a number or a constant expression (`pi/2`, `2τ`, `1e-3`). It
+/// runs on the UI thread, so evaluation is in `f64` with small step and
+/// element budgets (`2^(2^30)` cannot freeze the dialog). A comma is
+/// accepted as the decimal separator.
 pub fn parse_number(text: &str) -> Option<f64> {
-    use viscas_core::eval::{Env, eval_expr};
+    use viscas_core::eval::{Env, EvalOptions, eval_expr};
     let t = text.trim();
     if t.is_empty() {
         return None;
     }
-    if let Ok(v) = t.replace('−', "-").parse::<f64>() {
+    let plain = t.replace('−', "-");
+    if let Ok(v) = plain
+        .parse::<f64>()
+        .or_else(|_| plain.replace(',', ".").parse())
+    {
         return v.is_finite().then_some(v);
     }
     let expr = viscas_core::syntax::parse_expr(t).ok()?;
-    let v = eval_expr(&expr, &Env::new(), &Default::default()).ok()?;
+    let opts = EvalOptions {
+        approx: true,
+        float64: true,
+        max_steps: 10_000,
+        max_elements: 1_000,
+        ..EvalOptions::default()
+    };
+    let v = eval_expr(&expr, &Env::new(), &opts).ok()?;
     let n = v.as_number()?;
     n.is_real().then(|| v.to_f64()).filter(|v| v.is_finite())
 }
 
-fn fmt(v: f64) -> String {
-    let s = format!("{v:.6}");
-    let s = s.trim_end_matches('0').trim_end_matches('.').to_owned();
+/// Shortest text that reads back as `v` (dot decimal separator, never
+/// truncated).
+pub fn fmt(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_owned();
+    }
+    format!("{v}")
+}
+
+/// Text of a page size or setting: at most `digits` decimals, dot
+/// separator (the same everywhere in the dialog, whatever the locale).
+pub fn fmt_digits(v: f64, digits: u32) -> String {
+    let s = format!("{v:.*}", digits as usize);
+    let s = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        s
+    };
     if s == "-0" { "0".to_owned() } else { s }
 }
 
@@ -110,11 +139,15 @@ struct Inner {
     syncing: Cell<bool>,
     preview_queued: Cell<bool>,
     preview_token: RefCell<Option<CancelToken>>,
+    /// Number of the latest preview render; older results are dropped.
+    preview_gen: Cell<u64>,
     previous_unit: Cell<Unit>,
 }
 
 thread_local! {
     static OPEN: RefCell<Weak<Inner>> = const { RefCell::new(Weak::new()) };
+    /// Owns the open dialog's state until its window is destroyed.
+    static KEEP: RefCell<Option<Rc<Inner>>> = const { RefCell::new(None) };
 }
 
 /// The export dialog (one at a time; opening again re-presents it).
@@ -134,10 +167,18 @@ fn entry(width: i32) -> gtk::Entry {
         .build()
 }
 
+/// A spin button showing and reading numbers with a dot separator (not
+/// the locale's), like the rest of the dialog and math input.
 fn spin(lo: f64, hi: f64, step: f64, digits: u32) -> gtk::SpinButton {
     let s = gtk::SpinButton::with_range(lo, hi, step);
     s.set_digits(digits);
     s.set_hexpand(true);
+    s.add_css_class("mono");
+    s.connect_output(move |s| {
+        s.set_text(&fmt_digits(s.value(), digits));
+        glib::Propagation::Stop
+    });
+    s.connect_input(|s| Some(parse_number(&s.text()).ok_or(())));
     s
 }
 
@@ -167,16 +208,23 @@ impl ExportDialog {
         }
         let inner = Rc::new(Inner::build(ctx));
         OPEN.with_borrow_mut(|o| *o = Rc::downgrade(&inner));
+        KEEP.with_borrow_mut(|k| *k = Some(inner.clone()));
         inner.connect(&inner);
         inner.apply_preset(&preset);
         inner.w.window.present();
-        // The window keeps the state alive.
-        let keep = inner.clone();
+        // The state lives in KEEP while the window exists (no Rc cycle
+        // through the window's own closures); destroying the window drops
+        // it so the next open builds a fresh dialog.
+        let weak = Rc::downgrade(&inner);
         inner.w.window.connect_destroy(move |_| {
             pick::stop();
-            if let Some(t) = keep.preview_token.borrow_mut().take() {
+            if let Some(i) = weak.upgrade()
+                && let Some(t) = i.preview_token.borrow_mut().take()
+            {
                 t.cancel();
             }
+            OPEN.with_borrow_mut(|o| *o = Weak::new());
+            KEEP.with_borrow_mut(|k| *k = None);
         });
     }
 }
@@ -441,6 +489,7 @@ impl Inner {
             syncing: Cell::new(false),
             preview_queued: Cell::new(false),
             preview_token: RefCell::default(),
+            preview_gen: Cell::new(0),
             previous_unit: Cell::new(Unit::Px),
         };
         inner.load_settings(&ctx.preferences().with(|p| p.export.clone()));
@@ -853,8 +902,8 @@ impl Inner {
                 let (pw, ph) = req.settings.page_px();
                 let mut info = format!(
                     "{} × {} {} · {}",
-                    fmt((req.settings.width * 100.0).round() / 100.0),
-                    fmt((req.settings.height * 100.0).round() / 100.0),
+                    fmt_digits(req.settings.width, 2),
+                    fmt_digits(req.settings.height, 2),
                     req.settings.unit.suffix(),
                     req.settings.format.short()
                 );
@@ -960,6 +1009,8 @@ impl Inner {
         {
             t.cancel();
         }
+        let generation = self.preview_gen.get() + 1;
+        self.preview_gen.set(generation);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("viscas-export-preview".into())
@@ -968,10 +1019,15 @@ impl Inner {
             })
             .ok();
         let picture = self.w.preview.downgrade();
+        let state = OPEN.with_borrow(Weak::clone);
         glib::timeout_add_local(Duration::from_millis(30), move || match rx.try_recv() {
-            Ok(Ok(bytes)) => {
-                if let Some(p) = picture.upgrade()
-                    && let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+            Ok(Ok(out)) => {
+                let current = state
+                    .upgrade()
+                    .is_some_and(|i| i.preview_gen.get() == generation);
+                if current
+                    && let Some(p) = picture.upgrade()
+                    && let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(out.bytes))
                 {
                     p.set_paintable(Some(&tex));
                 }
@@ -1052,9 +1108,7 @@ impl Inner {
             let Some(mut path) = file.path() else {
                 return;
             };
-            if path.extension().is_none() {
-                path.set_extension(format.extension());
-            }
+            path = super::with_format_extension(path, format);
             super::run(&ctx, req, Dest::File(path), move |r| {
                 if r.is_ok()
                     && let Some(w) = window.upgrade()
@@ -1069,6 +1123,25 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::parse_number;
+
+    #[test]
+    fn huge_expressions_do_not_hang() {
+        let t = std::time::Instant::now();
+        assert_eq!(parse_number("2^(2^30)"), None);
+        assert!(parse_number("2^(2^30) - 2^(2^30)").is_none_or(|v| v.is_finite()));
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn formatting_round_trips_with_a_dot() {
+        use super::{fmt, fmt_digits};
+        for v in [-7.224999999999, 0.1 + 0.2, 1e-9, 123456.789, -0.0] {
+            assert_eq!(parse_number(&fmt(v)), Some(v + 0.0));
+        }
+        assert_eq!(fmt_digits(800.0, 2), "800");
+        assert_eq!(fmt_digits(733.5612, 2), "733.56");
+        assert_eq!(parse_number("733,56"), Some(733.56));
+    }
 
     #[test]
     fn numbers_and_constant_expressions() {

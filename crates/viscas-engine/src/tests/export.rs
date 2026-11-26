@@ -159,3 +159,17 @@ fn cancelled_jobs_stop() {
     job.cancel_token().cancel();
     assert!(job.run(|_, _| {}).is_err());
 }
+
+#[test]
+fn nearest_parameter_refines_coarse_probes() {
+    let shape = PlotShape::Parametric {
+        x: Arc::new(f64::cos),
+        y: Arc::new(f64::sin),
+        range: (0.0, 2.0 * PI),
+    };
+    // 8 coarse probes are 0.785 apart; refinement still lands within 1e-3.
+    let target = 1.0_f64;
+    let p = Vec2::new(target.cos(), target.sin());
+    let t = nearest_param(&shape, (0.0, 2.0 * PI), p, (1.0, 1.0), 8).unwrap();
+    assert!((t - target).abs() < 1e-3, "t = {t}");
+}

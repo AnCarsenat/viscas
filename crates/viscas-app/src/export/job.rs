@@ -37,6 +37,37 @@ pub struct Prepared {
     base: Drawing,
     settings: ExportSettings,
     range: ExportRange,
+    clip: Option<Rect>,
+}
+
+/// Finished export bytes plus notes about failed or coarse layers.
+#[derive(Debug)]
+pub struct Output {
+    pub bytes: Vec<u8>,
+    pub notes: Vec<String>,
+}
+
+/// Keeps the rows `keep` accepts, splitting a piece where rows are dropped
+/// (so the table matches the trimmed geometry).
+pub fn filter_table(
+    pieces: Vec<Vec<[f64; 3]>>,
+    keep: impl Fn(&[f64; 3]) -> bool,
+) -> Vec<Vec<[f64; 3]>> {
+    let mut out = Vec::new();
+    for piece in pieces {
+        let mut cur = Vec::new();
+        for row in piece {
+            if keep(&row) {
+                cur.push(row);
+            } else if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
 }
 
 impl Prepared {
@@ -110,7 +141,14 @@ pub fn base_drawing(prefs: &Preferences, settings: &ExportSettings, world: Rect)
 pub fn prepare(engine: &Engine, prefs: &Preferences, req: &Request) -> Result<Prepared, String> {
     let mut settings = req.settings.clone();
     settings.validate();
-    if !(req.world.width() > 0.0 && req.world.height() > 0.0) {
+    let w = &req.world;
+    if ![w.x_min, w.x_max, w.y_min, w.y_max]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return Err("the export box needs finite bounds".to_owned());
+    }
+    if !(w.width() > 0.0 && w.height() > 0.0 && w.width().is_finite() && w.height().is_finite()) {
         return Err("the export box is empty".to_owned());
     }
     let mut names = HashMap::new();
@@ -142,6 +180,7 @@ pub fn prepare(engine: &Engine, prefs: &Preferences, req: &Request) -> Result<Pr
         base: base_drawing(prefs, &settings, req.world),
         settings,
         range: req.range,
+        clip: req.clip,
     })
 }
 
@@ -161,7 +200,18 @@ fn tables(p: &Prepared) -> Vec<Table> {
                 _ => param_range(shape, &p.job.world)?,
             };
             let pieces = sample_table(shape, range, p.settings.csv_samples as usize)?;
+            // Same trimming as the geometry: x range and clip box.
+            let x_range = match p.range {
+                ExportRange::X(a, b) => Some((a.min(b), a.max(b))),
+                _ => None,
+            };
+            let clip = p.clip;
+            let pieces = filter_table(pieces, |[_, x, y]| {
+                x_range.is_none_or(|(a, b)| (a..=b).contains(x))
+                    && clip.is_none_or(|c| c.contains(viscas_plot::Vec2::new(*x, *y)))
+            });
             Some(Table {
+                node: it.item.node,
                 name: p.names.get(&it.item.node).cloned().unwrap_or_default(),
                 param: param.to_owned(),
                 pieces,
@@ -171,7 +221,7 @@ fn tables(p: &Prepared) -> Vec<Table> {
 }
 
 /// Renders `p` (worker thread); `progress(done, total)` follows sampling.
-pub fn produce(p: Prepared, progress: impl FnMut(usize, usize)) -> Result<Vec<u8>, String> {
+pub fn produce(p: Prepared, progress: impl FnMut(usize, usize)) -> Result<Output, String> {
     let layers = p
         .job
         .run(progress)
@@ -179,14 +229,17 @@ pub fn produce(p: Prepared, progress: impl FnMut(usize, usize)) -> Result<Vec<u8
     let mut d = p.base.clone();
     d.layers = layers
         .into_iter()
-        .filter(|l| l.error.is_none())
         .map(|l| DrawLayer {
+            node: l.node_id,
             name: p.names.get(&l.node_id).cloned().unwrap_or_default(),
             kind: l.kind,
             style: l.style,
             primitives: l.primitives,
+            truncated: l.truncated,
+            error: l.error,
         })
         .collect();
+    let notes: Vec<String> = d.layers.iter().filter_map(|l| l.note()).collect();
     let s = &p.settings;
     let bytes = match s.format {
         Format::Svg => svg::write(
@@ -209,7 +262,7 @@ pub fn produce(p: Prepared, progress: impl FnMut(usize, usize)) -> Result<Vec<u8
             text::json(&d, &t).into_bytes()
         }
     };
-    Ok(bytes)
+    Ok(Output { bytes, notes })
 }
 
 #[cfg(test)]
@@ -250,7 +303,7 @@ mod tests {
         req.range = ExportRange::Param(0.0, 1.0);
         req.settings.svg_world = true;
         let p = prepare(&e, &Preferences::default(), &req).unwrap();
-        let svg = String::from_utf8(produce(p, |_, _| {}).unwrap()).unwrap();
+        let svg = String::from_utf8(produce(p, |_, _| {}).unwrap().bytes).unwrap();
         check_xml(&svg).unwrap();
         let paths = curve_paths(&svg);
         assert_eq!(paths.len(), 1, "only the selected node");
@@ -267,7 +320,7 @@ mod tests {
             let mut req = request(f, Rect::new(-4.0, -4.0, 4.0, 4.0));
             req.settings.csv_param = f == Format::Json;
             let p = prepare(&e, &Preferences::default(), &req).unwrap();
-            let out = produce(p, |_, _| {}).unwrap();
+            let out = produce(p, |_, _| {}).unwrap().bytes;
             assert!(out.len() > 50, "{f:?} output too small");
         }
     }
@@ -281,12 +334,36 @@ mod tests {
         req.settings.csv_param = true;
         req.settings.csv_samples = 3;
         let p = prepare(&e, &Preferences::default(), &req).unwrap();
-        let csv = String::from_utf8(produce(p, |_, _| {}).unwrap()).unwrap();
+        let csv = String::from_utf8(produce(p, |_, _| {}).unwrap().bytes).unwrap();
         let rows: Vec<&str> = csv.lines().skip(1).collect();
         assert_eq!(rows.len(), 3);
         assert!(rows[0].ends_with(",0,x,0,0,0"), "{}", rows[0]);
         assert!(rows[1].ends_with(",0,x,0.5,0.5,1"), "{}", rows[1]);
         assert!(rows[2].ends_with(",0,x,1,1,2"), "{}", rows[2]);
+    }
+
+    #[test]
+    fn csv_table_follows_an_x_range_and_rejects_bad_boxes() {
+        let (e, ids) = engine_with(&["(t, t^2)"]);
+        let mut req = request(Format::Csv, Rect::new(-4.0, -4.0, 4.0, 4.0));
+        req.nodes = Some(ids);
+        req.range = ExportRange::X(-0.5, 0.5);
+        req.settings.csv_param = true;
+        req.settings.csv_samples = 1000;
+        let p = prepare(&e, &Preferences::default(), &req).unwrap();
+        let csv = String::from_utf8(produce(p, |_, _| {}).unwrap().bytes).unwrap();
+        let xs: Vec<f64> = csv
+            .lines()
+            .skip(1)
+            .map(|l| l.split(',').nth(4).unwrap().parse().unwrap())
+            .collect();
+        assert!(!xs.is_empty());
+        assert!(xs.iter().all(|x| (-0.5..=0.5).contains(x)));
+        let mut bad = request(Format::Svg, Rect::new(0.0, 0.0, f64::INFINITY, 1.0));
+        bad.world.x_max = f64::NAN;
+        assert!(prepare(&e, &Preferences::default(), &bad).is_err());
+        let split = filter_table(vec![vec![[0.0; 3], [1.0; 3], [2.0; 3]]], |r| r[0] != 1.0);
+        assert_eq!(split.len(), 2);
     }
 
     #[test]

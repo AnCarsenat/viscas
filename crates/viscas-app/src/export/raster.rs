@@ -81,18 +81,26 @@ fn paint_grid(cr: &cairo::Context, d: &Drawing) {
     }
 }
 
-fn trace(cr: &cairo::Context, d: &Drawing, pts: &[Vec2]) -> usize {
-    let mut n = 0;
-    for q in pts.iter().filter(|q| q.is_finite()) {
+/// Adds `pts` to the path; returns the number of points and whether an
+/// undefined point split it (each split starts a new subpath).
+fn trace(cr: &cairo::Context, d: &Drawing, pts: &[Vec2]) -> (usize, bool) {
+    let (mut n, mut split, mut pen) = (0, false, false);
+    for q in pts {
         let (x, y) = d.to_page(*q);
-        if n == 0 {
-            cr.move_to(x, y);
-        } else {
+        if !(q.is_finite() && x.is_finite() && y.is_finite()) {
+            split |= n > 0;
+            pen = false;
+            continue;
+        }
+        if pen {
             cr.line_to(x, y);
+        } else {
+            cr.move_to(x, y);
+            pen = true;
         }
         n += 1;
     }
-    n
+    (n, split)
 }
 
 fn paint_plots(cr: &cairo::Context, d: &Drawing) {
@@ -105,7 +113,7 @@ fn paint_plots(cr: &cairo::Context, d: &Drawing) {
         let mut any = false;
         for p in layer.primitives.iter() {
             if let Primitive::Polygon(poly) = p
-                && trace(cr, d, &poly.points) >= 3
+                && trace(cr, d, &poly.points).0 >= 3
             {
                 cr.close_path();
                 any = true;
@@ -119,11 +127,12 @@ fn paint_plots(cr: &cairo::Context, d: &Drawing) {
         cr.set_line_width(d.stroke_width(st));
         for p in layer.primitives.iter() {
             if let Primitive::Polyline { line, style } = p {
-                if trace(cr, d, &line.points) < 2 {
+                let (n, split) = trace(cr, d, &line.points);
+                if n < 2 {
                     cr.new_path();
                     continue;
                 }
-                if line.closed {
+                if line.closed && !split {
                     cr.close_path();
                 }
                 cr.set_dash(&d.dash(st, *style), 0.0);
@@ -217,7 +226,31 @@ fn paint_legend(cr: &cairo::Context, d: &Drawing) {
 }
 
 /// PNG bytes of `d` at `px` device pixels.
+/// Largest PNG accepted, in pixels.
+pub const MAX_PNG_PIXELS: u64 = 100_000_000;
+/// Largest PNG side cairo supports.
+pub const MAX_PNG_SIDE: u32 = 32_767;
+
+/// Why a PNG of `px` pixels is refused, if it is.
+pub fn png_size_error(px: (u32, u32)) -> Option<String> {
+    let total = u64::from(px.0) * u64::from(px.1);
+    if px.0 > MAX_PNG_SIDE || px.1 > MAX_PNG_SIDE || total > MAX_PNG_PIXELS {
+        Some(format!(
+            "PNG too large: {} × {} px (limit {} MP, {} px per side) — lower the size or DPI",
+            px.0,
+            px.1,
+            MAX_PNG_PIXELS / 1_000_000,
+            MAX_PNG_SIDE
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn png(d: &Drawing, px: (u32, u32)) -> Result<Vec<u8>, String> {
+    if let Some(e) = png_size_error(px) {
+        return Err(e);
+    }
     let (pw, ph) = (px.0.max(1) as i32, px.1.max(1) as i32);
     let surface =
         cairo::ImageSurface::create(cairo::Format::ARgb32, pw, ph).map_err(|e| e.to_string())?;
@@ -225,6 +258,8 @@ pub fn png(d: &Drawing, px: (u32, u32)) -> Result<Vec<u8>, String> {
         let cr = cairo::Context::new(&surface).map_err(|e| e.to_string())?;
         cr.scale(f64::from(pw) / d.size.0, f64::from(ph) / d.size.1);
         paint(&cr, d);
+        cr.status()
+            .map_err(|e| format!("drawing the PNG failed: {e}"))?;
     }
     let mut out = Vec::new();
     surface.write_to_png(&mut out).map_err(|e| e.to_string())?;
@@ -247,6 +282,7 @@ pub fn vector(d: &Drawing, kind: Vector) -> Result<Vec<u8>, String> {
         let cr = cairo::Context::new(surface).map_err(|e| e.to_string())?;
         cr.scale(to_pt, to_pt);
         paint(&cr, d);
+        cr.status().map_err(|e| format!("drawing failed: {e}"))?;
         cr.show_page().map_err(|e| e.to_string())?;
         Ok(())
     };
@@ -297,6 +333,15 @@ mod tests {
         // IHDR width/height (big endian) at bytes 16..24.
         assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 240);
         assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 160);
+    }
+
+    #[test]
+    fn huge_pngs_are_refused() {
+        assert!(png_size_error((10_000, 10_000)).is_none());
+        assert!(png_size_error((10_001, 10_000)).is_some());
+        assert!(png_size_error((40_000, 10)).is_some());
+        let e = png(&drawing(), (20_000, 20_000)).unwrap_err();
+        assert!(e.contains("too large"), "{e}");
     }
 
     #[test]

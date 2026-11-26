@@ -332,7 +332,9 @@ impl ExportSettings {
     pub fn raster_px(&self) -> (u32, u32) {
         let (w, h) = self.page_px();
         let k = self.dpi / 96.0;
-        let px = |v: f64| (v * k).round().clamp(1.0, 16_384.0) as u32;
+        // Not capped here: the PNG writer refuses oversized images with a
+        // clear message instead of silently changing the size.
+        let px = |v: f64| (v * k).round().clamp(1.0, f64::from(u32::MAX)) as u32;
         (px(w), px(h))
     }
 

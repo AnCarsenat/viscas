@@ -635,7 +635,7 @@ impl Viewport {
                 };
                 if picking.get() {
                     if let Some((sx, sy)) = g.start_point() {
-                        crate::export::pick::drag_to(&vp.view(), sx + ox, sy + oy);
+                        crate::export::pick::drag_to(&vp.area, &vp.view(), sx + ox, sy + oy);
                     }
                     return;
                 }
