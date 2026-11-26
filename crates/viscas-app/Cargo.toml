@@ -11,6 +11,7 @@ name = "viscas"
 path = "src/main.rs"
 
 [dependencies]
+cairo-rs = { version = "0.22", features = ["pdf", "ps", "png"] }
 gtk4 = { workspace = true, features = ["v4_14"] }
 pangocairo.workspace = true
 serde.workspace = true

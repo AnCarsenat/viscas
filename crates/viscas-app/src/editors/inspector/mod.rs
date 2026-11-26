@@ -235,6 +235,7 @@ impl Inspector {
                 KindTag::Plot => {
                     content.push(self.ranges_panel(id));
                     content.push(self.analysis_panel(id));
+                    content.push(self.export_panel(id));
                 }
                 KindTag::Viewport => content.push(self.viewport_panel(id)),
                 _ => {}
@@ -1447,6 +1448,62 @@ impl Inspector {
         });
         *self.inner.view_refresher.borrow_mut() = Some(refresh.clone());
         self.inner.refreshers.borrow_mut().push(refresh);
+        panel
+    }
+
+    /// Export buttons for a plot node (opens the export dialog).
+    fn export_panel(&self, id: NodeId) -> Panel {
+        use crate::export::settings::{Format, Target};
+        let panel = Panel::new("Export", false);
+        let row = gtk::Box::builder().spacing(4).build();
+        let button = |label: &str, tip: &str, format: Option<Format>, target: Target| {
+            let b = gtk::Button::builder()
+                .label(label)
+                .tooltip_text(tip)
+                .hexpand(true)
+                .build();
+            let weak = self.downgrade();
+            b.connect_clicked(move |_| {
+                Self::with_weak(&weak, |i| {
+                    crate::export::open(
+                        &i.inner.ctx,
+                        crate::export::Preset {
+                            format,
+                            target: Some(target),
+                            node: Some(id),
+                            ..Default::default()
+                        },
+                    );
+                });
+            });
+            b
+        };
+        row.append(&button(
+            "Export…",
+            "Export this curve (Ctrl+Shift+E)",
+            None,
+            Target::Curve,
+        ));
+        row.append(&button(
+            "Part…",
+            "Export part of this curve (a range, or drag handles along it)",
+            None,
+            Target::Part,
+        ));
+        let copy = gtk::Button::builder()
+            .label("Copy SVG")
+            .tooltip_text("Copy this curve as SVG")
+            .hexpand(true)
+            .build();
+        let weak = self.downgrade();
+        copy.connect_clicked(move |_| {
+            Self::with_weak(&weak, |i| {
+                i.inner.ctx.selection().set_selected([id]);
+                crate::export::copy(&i.inner.ctx, Format::Svg, Target::Selected);
+            });
+        });
+        row.append(&copy);
+        panel.append(&row);
         panel
     }
 

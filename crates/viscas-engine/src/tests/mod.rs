@@ -5,6 +5,7 @@ mod complete;
 mod console;
 mod document;
 mod eval;
+mod export;
 mod plot;
 
 use viscas_plot::{Primitive, Rect, View};

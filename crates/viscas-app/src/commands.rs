@@ -81,6 +81,7 @@ pub fn specs() -> Vec<(String, String, &'static str)> {
         ("win.open", "Open Document…", "File"),
         ("win.save", "Save Document", "File"),
         ("win.save-as", "Save Document As…", "File"),
+        ("win.export", "Export…", "File"),
         ("win.undo", "Undo", "Edit"),
         ("win.redo", "Redo", "Edit"),
         ("win.toggle-approx", "Toggle Exact / Approx", "Mode"),

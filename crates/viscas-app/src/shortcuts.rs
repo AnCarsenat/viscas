@@ -36,6 +36,7 @@ pub fn all() -> Vec<Shortcut> {
         ("win.open", "<Control>o", "Open document"),
         ("win.save", "<Control>s", "Save document"),
         ("win.save-as", "<Control><Shift>s", "Save document as"),
+        ("win.export", "<Control><Shift>e", "Export"),
         ("win.undo", "<Control>z", "Undo"),
         ("win.redo", "<Control><Shift>z", "Redo"),
         ("win.layout-undo", "<Control><Alt>z", "Undo layout change"),

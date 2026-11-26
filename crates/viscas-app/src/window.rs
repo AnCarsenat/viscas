@@ -43,6 +43,15 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
     ctx.add_command_provider(WindowCommands::new(&window, ctx));
     ctx.add_command_provider(AreaCommands::new(&areas));
     ctx.add_command_provider(crate::editors::scene_tree::ops::NodeCommands::new(ctx));
+    ctx.add_command_provider(crate::export::ExportCommands::new(ctx));
+    let export = gio::SimpleAction::new("export", None);
+    let weak = ctx.downgrade();
+    export.connect_activate(move |_, _| {
+        if let Some(ctx) = weak.upgrade() {
+            crate::export::open(&ctx, crate::export::Preset::default());
+        }
+    });
+    window.add_action(&export);
     crate::palette_sources::install(&window, ctx);
 
     if let Some(notice) = ctx.preferences().load_notice() {
@@ -333,7 +342,7 @@ fn menubar(show_unfinished: bool) -> (gio::Menu, gio::Menu) {
     doc.append(Some("_Save"), Some("win.save"));
     doc.append(Some("Save _As…"), Some("win.save-as"));
     let export = gio::Menu::new();
-    export.append(Some("_Export Viewport…"), Some("win.export"));
+    export.append(Some("_Export…"), Some("win.export"));
     let quit = gio::Menu::new();
     quit.append(Some("_Quit"), Some("app.quit"));
     file.append_section(None, &doc);
@@ -453,6 +462,7 @@ fn build_statusbar() -> (gtk::Box, gtk::Label, crate::doc_ui::StatusWidgets) {
         .css_classes(["mono"])
         .build();
     status.append(&status_label);
+    bar.append(&crate::export::status_widget());
     bar.append(&status);
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bar.append(

@@ -1,0 +1,382 @@
+//! Data and source exports: CSV point tables, plain JSON points and
+//! TikZ/PGF (`\draw plot coordinates {…}`).
+
+use std::fmt::Write as _;
+
+use viscas_plot::{LineStyle, Primitive, Vec2};
+
+use super::drawing::{Drawing, decimals_for, hex, num};
+use super::settings::Unit;
+
+/// Uniform `(t, x, y)` samples of one node, split where undefined.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Table {
+    pub name: String,
+    /// Parameter name (`x`, `y`, `t`, `θ`).
+    pub param: String,
+    pub pieces: Vec<Vec<[f64; 3]>>,
+}
+
+/// Quotes a CSV field when needed.
+pub fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Finite points of each polyline and polygon of a layer, in order.
+fn pieces(prims: &[Primitive]) -> Vec<(&'static str, Vec<Vec2>)> {
+    prims
+        .iter()
+        .filter_map(|p| {
+            let (kind, pts) = match p {
+                Primitive::Polyline { line, .. } => {
+                    let mut pts = line.points.clone();
+                    if line.closed
+                        && let Some(&first) = pts.first()
+                    {
+                        pts.push(first);
+                    }
+                    ("curve", pts)
+                }
+                Primitive::Polygon(poly) => ("fill", poly.points.clone()),
+                Primitive::Points(pts) => ("points", pts.clone()),
+            };
+            let pts: Vec<Vec2> = pts.into_iter().filter(|q| q.is_finite()).collect();
+            (!pts.is_empty()).then_some((kind, pts))
+        })
+        .collect()
+}
+
+/// CSV of the drawing's sampled points: `node,piece,kind,x,y`. Each
+/// polyline (a piece between discontinuities) gets its own piece number.
+pub fn csv_points(d: &Drawing) -> String {
+    let mut s = String::from("node,piece,kind,x,y\n");
+    for layer in &d.layers {
+        let name = csv_field(&layer.name);
+        for (i, (kind, pts)) in pieces(&layer.primitives).into_iter().enumerate() {
+            for q in pts {
+                let _ = writeln!(s, "{name},{i},{kind},{},{}", q.x, q.y);
+            }
+        }
+    }
+    s
+}
+
+/// CSV of parameter tables: `node,piece,param,t,x,y`.
+pub fn csv_table(tables: &[Table]) -> String {
+    let mut s = String::from("node,piece,param,t,x,y\n");
+    for t in tables {
+        let name = csv_field(&t.name);
+        let param = csv_field(&t.param);
+        for (i, piece) in t.pieces.iter().enumerate() {
+            for [tt, x, y] in piece {
+                let _ = writeln!(s, "{name},{i},{param},{tt},{x},{y}");
+            }
+        }
+    }
+    s
+}
+
+/// Plain JSON: world box and, per node, its pieces as `[x, y]` arrays
+/// (plus `t` tables when given).
+pub fn json(d: &Drawing, tables: &[Table]) -> String {
+    use serde_json::{Value, json};
+    let pt = |q: &Vec2| json!([q.x, q.y]);
+    let nodes: Vec<Value> = d
+        .layers
+        .iter()
+        .map(|l| {
+            let mut curves = Vec::new();
+            let mut fills = Vec::new();
+            let mut points = Vec::new();
+            for (kind, pts) in pieces(&l.primitives) {
+                let arr: Vec<Value> = pts.iter().map(pt).collect();
+                match kind {
+                    "curve" => curves.push(Value::Array(arr)),
+                    "fill" => fills.push(Value::Array(arr)),
+                    _ => points.extend(arr),
+                }
+            }
+            let mut v = json!({
+                "name": l.name,
+                "kind": l.kind.as_str(),
+                "color": hex(l.style.color),
+                "curves": curves,
+            });
+            if !fills.is_empty() {
+                v["fills"] = Value::Array(fills);
+            }
+            if !points.is_empty() {
+                v["points"] = Value::Array(points);
+            }
+            if let Some(t) = tables.iter().find(|t| t.name == l.name) {
+                v["param"] = json!(t.param);
+                v["samples"] = json!(t.pieces);
+            }
+            v
+        })
+        .collect();
+    let w = &d.world;
+    let doc = json!({
+        "generator": "Viscas",
+        "world": {"x_min": w.x_min, "x_max": w.x_max, "y_min": w.y_min, "y_max": w.y_max},
+        "nodes": nodes,
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n"
+}
+
+/// Escapes text for a TeX comment line.
+fn tex_comment(s: &str) -> String {
+    s.replace(['\n', '\r'], " ")
+}
+
+/// TikZ picture of the drawing, in world coordinates scaled to the page
+/// size (`x`/`y` lengths in cm).
+pub fn tikz(d: &Drawing) -> String {
+    let w = &d.world;
+    let x_cm = Unit::Px.convert(d.size.0, Unit::Cm) / w.width();
+    let y_cm = Unit::Px.convert(d.size.1, Unit::Cm) / w.height();
+    let dec = decimals_for((1.0 / d.sx()).min(1.0 / d.sy()));
+    let c = |v: f64| num(v, dec);
+    let coord = |q: &Vec2| format!("({},{})", c(q.x), c(q.y));
+    let mut s = String::new();
+    let _ = writeln!(s, "% Generated by Viscas — needs \\usepackage{{tikz}}");
+    let _ = writeln!(
+        s,
+        "\\begin{{tikzpicture}}[x={}cm,y={}cm]",
+        num(x_cm, 6),
+        num(y_cm, 6)
+    );
+    for (i, l) in d.layers.iter().enumerate() {
+        let col = l.style.color;
+        let _ = writeln!(
+            s,
+            "\\definecolor{{viscas{}}}{{HTML}}{{{:02X}{:02X}{:02X}}} % {}",
+            i,
+            col.r,
+            col.g,
+            col.b,
+            tex_comment(&l.name)
+        );
+    }
+    let corners = format!(
+        "({},{}) rectangle ({},{})",
+        c(w.x_min),
+        c(w.y_min),
+        c(w.x_max),
+        c(w.y_max)
+    );
+    if let Some(bg) = d.background
+        && bg != viscas_scene::Color::rgb(255, 255, 255)
+    {
+        let _ = writeln!(
+            s,
+            "\\fill[fill={{rgb,255:red,{};green,{};blue,{}}}] {corners};",
+            bg.r, bg.g, bg.b
+        );
+    }
+    let _ = writeln!(s, "\\begin{{scope}}");
+    let _ = writeln!(s, "\\clip {corners};");
+    if d.grid {
+        let (tx, ty) = d.ticks();
+        if d.minor_grid {
+            let _ = writeln!(
+                s,
+                "\\draw[black!8, very thin, xstep={}, ystep={}] {};",
+                c(tx.minor_step),
+                c(ty.minor_step),
+                corners.replace("rectangle", "grid")
+            );
+        }
+        let _ = writeln!(
+            s,
+            "\\draw[black!20, thin, xstep={}, ystep={}] {};",
+            c(tx.major_step),
+            c(ty.major_step),
+            corners.replace("rectangle", "grid")
+        );
+    }
+    if d.axes {
+        let _ = writeln!(
+            s,
+            "\\draw[black!70] ({},0) -- ({},0);\n\\draw[black!70] (0,{}) -- (0,{});",
+            c(w.x_min),
+            c(w.x_max),
+            c(w.y_min),
+            c(w.y_max)
+        );
+    }
+    for (i, l) in d.layers.iter().enumerate() {
+        let st = &l.style;
+        let width_pt = Unit::Px.convert(d.stroke_width(st), Unit::Pt);
+        for p in l.primitives.iter() {
+            match p {
+                Primitive::Polygon(poly) => {
+                    let pts: Vec<String> = poly
+                        .points
+                        .iter()
+                        .filter(|q| q.is_finite())
+                        .map(coord)
+                        .collect();
+                    if pts.len() >= 3 {
+                        let _ = writeln!(
+                            s,
+                            "\\fill[viscas{i}, fill opacity={}] plot coordinates {{{}}} -- cycle;",
+                            num(st.fill_opacity * st.opacity, 3),
+                            pts.join(" ")
+                        );
+                    }
+                }
+                Primitive::Polyline { line, style } => {
+                    let pts: Vec<String> = line
+                        .points
+                        .iter()
+                        .filter(|q| q.is_finite())
+                        .map(coord)
+                        .collect();
+                    if pts.len() < 2 {
+                        continue;
+                    }
+                    let dashed = match st.line_style {
+                        viscas_scene::LineStyle::Dashed => ", dashed",
+                        viscas_scene::LineStyle::Dotted => ", dotted",
+                        viscas_scene::LineStyle::Solid if *style == LineStyle::Dashed => ", dashed",
+                        viscas_scene::LineStyle::Solid => "",
+                    };
+                    let opacity = if st.opacity < 0.999 {
+                        format!(", opacity={}", num(st.opacity, 3))
+                    } else {
+                        String::new()
+                    };
+                    let cycle = if line.closed { " -- cycle" } else { "" };
+                    let _ = writeln!(
+                        s,
+                        "\\draw[viscas{i}, line width={}pt, line cap=round, line join=round{dashed}{opacity}] plot coordinates {{{}}}{cycle};",
+                        num(width_pt, 3),
+                        pts.join(" ")
+                    );
+                }
+                Primitive::Points(pts) => {
+                    let r = Unit::Px.convert(d.point_radius(st), Unit::Pt);
+                    for q in pts.iter().filter(|q| q.is_finite()) {
+                        let _ = writeln!(
+                            s,
+                            "\\fill[viscas{i}] {} circle[radius={}pt];",
+                            coord(q),
+                            num(r, 3)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let _ = writeln!(s, "\\end{{scope}}");
+    if d.labels {
+        let (tx, ty) = d.ticks();
+        for &x in tx.major.iter().filter(|x| **x != 0.0) {
+            if (w.y_min..=w.y_max).contains(&0.0) {
+                let _ = writeln!(
+                    s,
+                    "\\node[below, font=\\tiny] at ({},0) {{${}$}};",
+                    c(x),
+                    crate::viewport::view::format_tick(x, tx.major_step).replace('−', "-")
+                );
+            }
+        }
+        for &y in ty.major.iter().filter(|y| **y != 0.0) {
+            if (w.x_min..=w.x_max).contains(&0.0) {
+                let _ = writeln!(
+                    s,
+                    "\\node[left, font=\\tiny] at (0,{}) {{${}$}};",
+                    c(y),
+                    crate::viewport::view::format_tick(y, ty.major_step).replace('−', "-")
+                );
+            }
+        }
+    }
+    let _ = writeln!(s, "\\end{{tikzpicture}}");
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use viscas_plot::{Polyline, Rect};
+
+    use super::*;
+    use crate::export::svg::tests::layer;
+
+    fn drawing() -> Drawing {
+        let mut d = Drawing::new(
+            Rect::new(0.0, 0.0, 2.0, 1.0),
+            (Unit::Cm.css_px() * 4.0, Unit::Cm.css_px() * 2.0),
+        );
+        d.layers.push(layer(vec![
+            Primitive::Polyline {
+                line: Polyline::open(vec![Vec2::new(0.0, 0.0), Vec2::new(0.5, 0.25)]),
+                style: Default::default(),
+            },
+            Primitive::Polyline {
+                line: Polyline::open(vec![
+                    Vec2::new(1.0, 0.5),
+                    Vec2::new(1.5, f64::NAN),
+                    Vec2::new(2.0, 1.0),
+                ]),
+                style: LineStyle::Dashed,
+            },
+        ]));
+        d.layers[0].name = "f, g".to_owned();
+        d
+    }
+
+    #[test]
+    fn csv_lists_pieces_and_quotes_names() {
+        let csv = csv_points(&drawing());
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "node,piece,kind,x,y");
+        assert_eq!(lines[1], "\"f, g\",0,curve,0,0");
+        assert_eq!(lines[2], "\"f, g\",0,curve,0.5,0.25");
+        // NaN samples are dropped; the second polyline is piece 1.
+        assert_eq!(lines[3], "\"f, g\",1,curve,1,0.5");
+        assert_eq!(lines[4], "\"f, g\",1,curve,2,1");
+        assert_eq!(lines.len(), 5);
+        let t = csv_table(&[Table {
+            name: "y".into(),
+            param: "x".into(),
+            pieces: vec![vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]],
+        }]);
+        assert_eq!(t, "node,piece,param,t,x,y\ny,0,x,0,0,0\ny,0,x,1,1,1\n");
+    }
+
+    #[test]
+    fn tikz_draws_plot_coordinates() {
+        let mut d = drawing();
+        d.grid = false;
+        d.labels = false;
+        let tex = tikz(&d);
+        assert!(tex.contains("\\begin{tikzpicture}[x=2cm,y=2cm]"), "{tex}");
+        assert!(tex.contains("\\definecolor{viscas0}{HTML}{2080FF}"));
+        assert!(
+            tex.contains("plot coordinates {(0,0) (0.5,0.25)};"),
+            "{tex}"
+        );
+        assert!(tex.contains(", dashed] plot coordinates {(1,0.5) (2,1)};"));
+        assert!(tex.contains("\\clip (0,0) rectangle (2,1);"));
+        assert!(tex.trim_end().ends_with("\\end{tikzpicture}"));
+        assert_eq!(tex.matches('{').count(), tex.matches('}').count());
+    }
+
+    #[test]
+    fn json_is_parseable_points() {
+        let d = drawing();
+        let text = json(&d, &[]);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["generator"], "Viscas");
+        let curves = v["nodes"][0]["curves"].as_array().unwrap();
+        assert_eq!(curves.len(), 2);
+        assert_eq!(curves[0][1], serde_json::json!([0.5, 0.25]));
+        assert_eq!(v["world"]["x_max"], 2.0);
+    }
+}

@@ -134,6 +134,7 @@ impl Viewport {
         viewport.add_layer(PlotsLayer {
             state: viewport.plots.clone(),
         });
+        viewport.add_layer(crate::export::pick::PickLayer);
         ctx.preferences()
             .connect_changed_for(viewport.downgrade(), |vp, p| {
                 vp.plots.invalidate_style();
@@ -264,6 +265,11 @@ impl Viewport {
         self.area.queue_draw();
     }
 
+    /// Gives the drawing area keyboard focus.
+    pub fn grab_focus(&self) {
+        self.area.grab_focus();
+    }
+
     /// Follows the document: layers, replots, features, errors.
     fn subscribe(&self) {
         let this = self.downgrade();
@@ -374,6 +380,12 @@ impl Viewport {
             Some("vp.none"),
         );
         view_menu.append_section(None, &hint);
+        let export = gio::Menu::new();
+        export.append(Some("Export View…"), Some("vp.export"));
+        export.append(Some("Export Box Region… (Shift+E)"), Some("vp.export-box"));
+        export.append(Some("Copy View as SVG"), Some("vp.copy::svg"));
+        export.append(Some("Copy View as PNG"), Some("vp.copy::png"));
+        view_menu.append_section(Some("Export"), &export);
         let examples = gio::Menu::new();
         for (target, title, _) in EXAMPLES {
             examples.append(Some(title), Some(&format!("vp.add-example::{target}")));
@@ -483,6 +495,39 @@ impl Viewport {
             }
         });
         self.actions.add_action(&add);
+
+        let export = gio::SimpleAction::new("export", None);
+        let ctx = self.ctx().downgrade();
+        export.connect_activate(move |_, _| {
+            if let Some(ctx) = ctx.upgrade() {
+                crate::export::open(
+                    &ctx,
+                    crate::export::Preset {
+                        target: Some(crate::export::settings::Target::View),
+                        ..Default::default()
+                    },
+                );
+            }
+        });
+        self.actions.add_action(&export);
+        let export_box = gio::SimpleAction::new("export-box", None);
+        export_box.connect_activate(|_, _| crate::export::pick::arm_box());
+        self.actions.add_action(&export_box);
+        let copy = gio::SimpleAction::new("copy", Some(glib::VariantTy::STRING));
+        let ctx = self.ctx().downgrade();
+        copy.connect_activate(move |_, param| {
+            use crate::export::settings::{Format, Target};
+            let (Some(ctx), Some(kind)) = (ctx.upgrade(), param.and_then(|p| p.str())) else {
+                return;
+            };
+            let format = if kind == "png" {
+                Format::Png
+            } else {
+                Format::Svg
+            };
+            crate::export::copy(&ctx, format, Target::View);
+        });
+        self.actions.add_action(&copy);
         self.sync_actions();
     }
 
@@ -522,6 +567,10 @@ impl Viewport {
         let drag = gtk::GestureDrag::new();
         let last = Rc::new(Cell::new((0.0, 0.0)));
         let mode = Rc::new(Cell::new(DragMode::Pan));
+        // The box is an export box (Shift+E), not a zoom box.
+        let export_box = Rc::new(Cell::new(false));
+        // A curve-part handle of the export dialog is being dragged.
+        let picking = Rc::new(Cell::new(false));
         let this = self.downgrade();
 
         drag.connect_drag_begin(glib::clone!(
@@ -529,6 +578,10 @@ impl Viewport {
             last,
             #[strong]
             mode,
+            #[strong]
+            export_box,
+            #[strong]
+            picking,
             #[strong]
             this,
             move |g, x, y| {
@@ -538,14 +591,24 @@ impl Viewport {
                 last.set((0.0, 0.0));
                 vp.plots.dragged.set(false);
                 vp.area.grab_focus();
+                if crate::export::pick::press(&vp.view(), x, y) {
+                    picking.set(true);
+                    vp.plots.dragged.set(true);
+                    return;
+                }
+                export_box.set(crate::export::pick::take_box());
                 let state = g.current_event_state();
-                let m = vp.ctx().preferences().with(|p| {
-                    p.input.left_drag(
-                        state.contains(gdk::ModifierType::SHIFT_MASK),
-                        state.contains(gdk::ModifierType::CONTROL_MASK),
-                        state.contains(gdk::ModifierType::ALT_MASK),
-                    )
-                });
+                let m = if export_box.get() {
+                    DragMode::BoxZoom
+                } else {
+                    vp.ctx().preferences().with(|p| {
+                        p.input.left_drag(
+                            state.contains(gdk::ModifierType::SHIFT_MASK),
+                            state.contains(gdk::ModifierType::CONTROL_MASK),
+                            state.contains(gdk::ModifierType::ALT_MASK),
+                        )
+                    })
+                };
                 mode.set(m);
                 match m {
                     DragMode::BoxZoom => {
@@ -563,11 +626,19 @@ impl Viewport {
             #[strong]
             mode,
             #[strong]
+            picking,
+            #[strong]
             this,
             move |g, ox, oy| {
                 let Some(vp) = this.upgrade() else {
                     return;
                 };
+                if picking.get() {
+                    if let Some((sx, sy)) = g.start_point() {
+                        crate::export::pick::drag_to(&vp.view(), sx + ox, sy + oy);
+                    }
+                    return;
+                }
                 if ox.hypot(oy) > CLICK_SLOP {
                     vp.plots.dragged.set(true);
                 }
@@ -611,6 +682,25 @@ impl Viewport {
                     return;
                 };
                 vp.area.set_cursor(None::<&gdk::Cursor>);
+                if picking.replace(false) {
+                    crate::export::pick::release();
+                    return;
+                }
+                if export_box.replace(false) {
+                    mode.set(DragMode::Pan);
+                    if let Some((a, b)) = vp.plots.zoom_box.take() {
+                        let v = vp.view();
+                        let (x0, y0) = v.screen_to_world(a.0, a.1);
+                        let (x1, y1) = v.screen_to_world(b.0, b.1);
+                        let rect =
+                            viscas_plot::Rect::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
+                        if rect.width() > 0.0 && rect.height() > 0.0 {
+                            crate::export::open_box(vp.ctx(), rect);
+                        }
+                    }
+                    vp.queue_draw();
+                    return;
+                }
                 if mode.replace(DragMode::Pan) == DragMode::BoxZoom
                     && let Some((a, b)) = vp.plots.zoom_box.take()
                 {
@@ -888,7 +978,12 @@ impl Viewport {
                     vp.reset_view();
                     glib::Propagation::Stop
                 }
+                Some("viewport.export-box") => {
+                    crate::export::pick::arm_box();
+                    glib::Propagation::Stop
+                }
                 Some("viewport.clear-marks") => {
+                    crate::export::pick::disarm_box();
                     vp.plots.clear_marks();
                     vp.plots.zoom_box.set(None);
                     vp.ctx().selection().set_selected([]);

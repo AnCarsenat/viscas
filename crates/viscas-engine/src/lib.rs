@@ -42,6 +42,7 @@ mod complete;
 mod console;
 mod engine;
 mod eval;
+pub mod export;
 pub mod help;
 pub mod lines;
 mod plot;
