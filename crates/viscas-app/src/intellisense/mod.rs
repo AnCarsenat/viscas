@@ -700,15 +700,34 @@ impl Assist {
         }
         let text = f.text();
         let caret = char_to_byte(&text, f.cursor());
-        let Some(help) = self
+        let help = self
             .inner
             .ctx
             .engine()
-            .with(|e| e.signature_at(&text, caret))
-        else {
+            .with(|e| e.signature_at(&text, caret));
+        // The problem under the caret, for keyboard users (no hover).
+        let problem = {
+            let diags = self.inner.diags.borrow();
+            (diags.0 == text)
+                .then(|| {
+                    diags
+                        .1
+                        .iter()
+                        .find(|d| d.span.start <= caret && caret <= d.span.end)
+                        .map(markup::diagnostic_markup)
+                })
+                .flatten()
+        };
+        let parts: Vec<String> = help
+            .as_ref()
+            .map(markup::signature_markup)
+            .into_iter()
+            .chain(problem)
+            .collect();
+        if parts.is_empty() {
             self.hide_hint();
             return;
-        };
+        }
         if self.inner.hint.borrow().is_none() {
             let label = gtk::Label::builder()
                 .use_markup(true)
@@ -736,8 +755,8 @@ impl Assist {
         let Some(h) = hint.as_ref() else {
             return;
         };
-        h.label.set_markup(&markup::signature_markup(&help));
-        let open = byte_to_char(&text, help.open);
+        h.label.set_markup(&parts.join("\n"));
+        let open = byte_to_char(&text, help.as_ref().map_or(caret, |h| h.open));
         if let Some(rect) = f.caret_rect(open, &self.inner.host) {
             h.popover.set_pointing_to(Some(&rect));
         }
@@ -793,6 +812,9 @@ impl Assist {
         };
         *self.inner.diags.borrow_mut() = (text, diags);
         self.render_marks();
+        if f.has_focus() {
+            self.refresh_hint();
+        }
     }
 
     fn render_marks(&self) {
