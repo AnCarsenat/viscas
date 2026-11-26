@@ -112,6 +112,23 @@ Editors (UI, not nodes):
 *Data*, *Script*; user-defined workspaces allowed. Layout is stored per document
 with a user default.
 
+**Keymap and input (Preferences ▸ Keymap / Input):** one registry lists
+every bindable action (window commands, palette commands of any
+provider, editor-local keys of the Viewport, Scene Tree and Console, and
+"Text Editing" actions other features register) with its context,
+default and current bindings. All key handling goes through it, so
+rebinding applies live to shortcuts, menu accelerators and palette
+labels. Keys match by the keyval the layout types (AZERTY `é` is
+`eacute`), never by keycode; dead keys and lone modifiers cannot be
+bound. The editor offers search by name or by pressed key, collapsible
+categories, click-to-capture (Esc cancels, Backspace removes), several
+bindings per action, conflict warnings within a context (Replace /
+Swap), per-row and global reset, presets (Viscas default, Blender-like)
+and TOML import/export. Preferences store only the overrides
+(versioned; unknown action ids kept but ignored). Input: invert zoom,
+zoom sensitivity, pan with left or middle drag, emulate 3-button mouse
+(Alt+left = middle).
+
 ### 2.1 Signature features
 
 1. **Dependency view.** Dependency Graph editor shows nodes as boxes with edges
