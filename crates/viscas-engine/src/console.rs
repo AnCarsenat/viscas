@@ -147,6 +147,11 @@ pub(crate) struct ConsoleState {
 }
 
 impl ConsoleState {
+    /// Console definitions, including `ans`/`ans2` (completion, preview).
+    pub(crate) fn defs(&self) -> &BTreeMap<String, Value> {
+        &self.defs
+    }
+
     pub(crate) fn forget_pin(&mut self) {
         self.last = None;
     }

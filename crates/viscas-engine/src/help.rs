@@ -176,3 +176,7 @@ pub fn command_help(name: &str) -> Option<&'static HelpEntry> {
     let name = name.strip_prefix(':').unwrap_or(name);
     COMMAND_HELP.iter().find(|e| &e.name[1..] == name)
 }
+
+mod catalog;
+
+pub use catalog::{BuiltinCatalog, Catalog, FunctionDoc, Signature, catalog};

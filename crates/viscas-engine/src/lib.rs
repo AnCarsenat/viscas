@@ -52,7 +52,10 @@ mod worker;
 #[cfg(test)]
 mod tests;
 
-pub use complete::{Completion, CompletionKind, completion_start, suggest};
+pub use complete::{
+    Completion, CompletionKind, CompletionSet, Diagnostic, PreviewTask, Scope, Severity,
+    SignatureHelp, Snippet, call_at, completion_start, suggest,
+};
 pub use console::{AutoAdd, ConsoleError, ConsoleItem, ConsoleOutput, HISTORY_LIMIT, ItemKind};
 pub use engine::{
     DEFAULT_PALETTE, Engine, EngineError, FeatureHit, FeaturesResult, MAX_FEATURE_CURVES,
