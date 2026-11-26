@@ -36,7 +36,7 @@ pub fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::ApplicationWindow {
 
     let palette = Palette::new(&overlay, ctx);
     palette.contain_focus(&window);
-    install_space_key(&window);
+    crate::keymap::live::install(&window, ctx);
     crate::compose::install(&window);
     install_actions(&window, &areas, &palette);
     crate::doc_ui::install(&window, ctx, &areas, status_widgets);
@@ -101,13 +101,19 @@ fn build_topbar(ctx: &AppCtx, areas: &Areas) -> gtk::HeaderBar {
             .css_classes(["app-name"])
             .build(),
     );
+    let app_model = app_menu();
     let app_menu = gtk::MenuButton::builder()
         .child(&logo)
-        .menu_model(&app_menu())
+        .menu_model(&app_model)
         .tooltip_text("Viscas")
         .css_classes(["app-menu", "flat"])
         .build();
     header.pack_start(&app_menu);
+    // Menu items show the current key bindings, updated on rebinding.
+    crate::keymap::live::refresh_menu_accels(&app_model);
+    crate::keymap::live::connect_changed_for(&app_menu, move |_| {
+        crate::keymap::live::refresh_menu_accels(&app_model);
+    });
     let show = ctx.preferences().with(|p| p.interface.show_unfinished);
     let (model, section) = menubar(show);
     let bar = gtk::PopoverMenuBar::from_model(Some(&model));
@@ -126,9 +132,16 @@ fn build_topbar(ctx: &AppCtx, areas: &Areas) -> gtk::HeaderBar {
                 let name = lbl.borrow().clone().unwrap_or_else(|| "Area".to_owned());
                 fill_area_section(&section, &name);
                 sec.replace(section);
+                crate::keymap::live::refresh_menu_accels(&model);
                 bar.set_menu_model(Some(&model));
             }
         });
+    crate::keymap::live::refresh_menu_accels(&model);
+    crate::keymap::live::connect_changed_for(&bar, |bar| {
+        if let Some(model) = bar.menu_model().and_downcast::<gio::Menu>() {
+            crate::keymap::live::refresh_menu_accels(&model);
+        }
+    });
     header.pack_start(&bar);
     let update_area_section = move |areas: &Areas| {
         let name = areas.target_editor().map(|k| k.title()).unwrap_or("Area");
@@ -159,12 +172,15 @@ fn build_topbar(ctx: &AppCtx, areas: &Areas) -> gtk::HeaderBar {
             .hexpand(true)
             .build(),
     );
-    content.append(
-        &gtk::Label::builder()
-            .label(crate::shortcuts::palette_hint())
-            .css_classes(["keycap"])
-            .build(),
-    );
+    let hint = gtk::Label::builder().css_classes(["keycap"]).build();
+    let sync_hint = |hint: &gtk::Label| {
+        let keys = crate::keymap::live::label("win.palette");
+        hint.set_visible(keys.is_some());
+        hint.set_label(&keys.unwrap_or_default());
+    };
+    sync_hint(&hint);
+    crate::keymap::live::connect_changed_for(&hint, sync_hint);
+    content.append(&hint);
     let palette_button = gtk::Button::builder()
         .child(&content)
         .action_name("win.palette")
@@ -188,15 +204,18 @@ fn workspace_tabs(ctx: &AppCtx, areas: &Areas) -> gtk::Box {
         .build();
     let mut buttons = Vec::new();
     for ws in Workspace::ALL {
-        let tab = gtk::ToggleButton::builder()
-            .label(ws.title())
-            .tooltip_text(format!(
-                "{} workspace ({}) · right-click to reset its layout",
-                ws.title(),
-                crate::shortcuts::label_for(&format!("win.workspace::{}", ws.id()))
-                    .unwrap_or_default()
-            ))
-            .build();
+        let tab = gtk::ToggleButton::builder().label(ws.title()).build();
+        let sync_tip = move |tab: &gtk::ToggleButton| {
+            let keys = crate::keymap::live::label(&format!("win.workspace::{}", ws.id()))
+                .map(|k| format!(" ({k})"))
+                .unwrap_or_default();
+            tab.set_tooltip_text(Some(&format!(
+                "{} workspace{keys} · right-click to reset its layout",
+                ws.title()
+            )));
+        };
+        sync_tip(&tab);
+        crate::keymap::live::connect_changed_for(&tab, sync_tip);
         tab.connect_clicked(move |tab| {
             // Undo GTK's own toggle; the listener below sets the state.
             tab.set_active(!tab.is_active());
@@ -284,6 +303,7 @@ fn fill_area_section(section: &gio::Menu, name: &str) {
         Some(&format!("_Close Area ({name})")),
         Some("win.close-area"),
     );
+    crate::keymap::live::refresh_menu_accels(section);
 }
 
 fn app_menu() -> gio::Menu {
@@ -336,10 +356,7 @@ fn menubar(show_unfinished: bool) -> (gio::Menu, gio::Menu) {
     let area = gio::Menu::new();
     fill_area_section(&area, "Area");
     let layout_history = gio::Menu::new();
-    let undo_item = gio::MenuItem::new(Some("_Undo Layout Change"), Some("win.layout-undo"));
-    // Handled by the window, not an app accelerator: show it here.
-    undo_item.set_attribute_value("accel", Some(&"<Control><Alt>z".to_variant()));
-    layout_history.append_item(&undo_item);
+    layout_history.append(Some("_Undo Layout Change"), Some("win.layout-undo"));
     layout_history.append(Some("Redo Layout Change"), Some("win.layout-redo"));
     let editors = gio::Menu::new();
     for kind in EditorKind::ALL
@@ -452,49 +469,6 @@ fn build_statusbar() -> (gtk::Box, gtk::Label, crate::doc_ui::StatusWidgets) {
     (bar, selection_info, widgets)
 }
 
-/// Space opens the palette like Blender's search, unless focus is in a
-/// text field (where Space types a space). The controller runs in the
-/// bubble phase, so a focused button, check box or row that uses Space
-/// itself gets it first. Holding Space (key repeat) opens it only once.
-fn install_space_key(window: &gtk::ApplicationWindow) {
-    let keys = gtk::EventControllerKey::new();
-    let held = std::rc::Rc::new(std::cell::Cell::new(false));
-    keys.connect_key_released(glib::clone!(
-        #[strong]
-        held,
-        move |_, key, _, _| {
-            if key == gtk::gdk::Key::space {
-                held.set(false);
-            }
-        }
-    ));
-    keys.connect_key_pressed(glib::clone!(
-        #[weak]
-        window,
-        #[upgrade_or]
-        glib::Propagation::Proceed,
-        move |_, key, _, mods| {
-            if key == gtk::gdk::Key::space && held.replace(true) {
-                return glib::Propagation::Stop; // auto-repeat
-            }
-            let plain = !mods.intersects(
-                gtk::gdk::ModifierType::CONTROL_MASK
-                    | gtk::gdk::ModifierType::ALT_MASK
-                    | gtk::gdk::ModifierType::SUPER_MASK
-                    | gtk::gdk::ModifierType::SHIFT_MASK,
-            );
-            if key != gtk::gdk::Key::space || !plain || focus_is_text(&window) {
-                return glib::Propagation::Proceed;
-            }
-            match WidgetExt::activate_action(&window, "win.palette", None) {
-                Ok(()) => glib::Propagation::Stop,
-                Err(_) => glib::Propagation::Proceed,
-            }
-        }
-    ));
-    window.add_controller(keys);
-}
-
 /// The focused text widget whose own text undo should take Ctrl+Z
 /// (`redo`: Ctrl+Shift+Z) instead of the document: a text view with
 /// something to undo/redo, or a text field with uncommitted changes (its
@@ -519,66 +493,6 @@ pub fn text_undo_target(window: &gtk::Window, redo: bool) -> Option<gtk::Widget>
         w = cur.parent();
     }
     None
-}
-
-/// Keys handled here rather than as application accelerators (see
-/// `shortcuts::WINDOW_KEYS`): Ctrl+Tab / Ctrl+Shift+Tab cycle the tabs
-/// of the area under the pointer (capture phase, before focus
-/// navigation); Ctrl+Alt+Z undoes a layout change unless a text field
-/// has focus (AltGr+Z types there on some layouts).
-pub fn install_layout_keys(window: &gtk::Window) {
-    use gtk::gdk::{Key, ModifierType};
-    let tabs = gtk::EventControllerKey::new();
-    tabs.set_propagation_phase(gtk::PropagationPhase::Capture);
-    tabs.connect_key_pressed(glib::clone!(
-        #[weak]
-        window,
-        #[upgrade_or]
-        glib::Propagation::Proceed,
-        move |_, key, _, mods| {
-            let ctrl = mods.contains(ModifierType::CONTROL_MASK)
-                && !mods.intersects(ModifierType::ALT_MASK | ModifierType::SUPER_MASK);
-            let action = match key {
-                Key::Tab if ctrl && !mods.contains(ModifierType::SHIFT_MASK) => "win.next-tab",
-                Key::ISO_Left_Tab | Key::Tab if ctrl => "win.prev-tab",
-                _ => return glib::Propagation::Proceed,
-            };
-            let _ = WidgetExt::activate_action(&window, action, None);
-            glib::Propagation::Stop
-        }
-    ));
-    window.add_controller(tabs);
-
-    let undo = gtk::EventControllerKey::new();
-    undo.connect_key_pressed(glib::clone!(
-        #[weak]
-        window,
-        #[upgrade_or]
-        glib::Propagation::Proceed,
-        move |_, key, _, mods| {
-            let wanted = ModifierType::CONTROL_MASK | ModifierType::ALT_MASK;
-            let is_z = matches!(key, Key::z | Key::Z);
-            if !is_z
-                || mods & (wanted | ModifierType::SHIFT_MASK | ModifierType::SUPER_MASK) != wanted
-                || focus_is_text(&window)
-            {
-                return glib::Propagation::Proceed;
-            }
-            let _ = WidgetExt::activate_action(&window, "win.layout-undo", None);
-            glib::Propagation::Stop
-        }
-    ));
-    window.add_controller(undo);
-}
-
-/// Whether the focused widget takes text input.
-fn focus_is_text(window: &impl IsA<gtk::Window>) -> bool {
-    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window.upcast_ref()) else {
-        return false;
-    };
-    focus.is::<gtk::Text>()
-        || focus.is::<gtk::TextView>()
-        || focus.dynamic_cast_ref::<gtk::Editable>().is_some()
 }
 
 fn install_actions(window: &gtk::ApplicationWindow, areas: &Areas, palette: &Palette) {
@@ -632,7 +546,6 @@ fn install_actions(window: &gtk::ApplicationWindow, areas: &Areas, palette: &Pal
     simple("layout-redo", Areas::redo_layout);
     simple("next-tab", |a| a.cycle_tab(1));
     simple("prev-tab", |a| a.cycle_tab(-1));
-    install_layout_keys(window.upcast_ref());
     // Enabled only with something to undo/redo.
     let sync_history = glib::clone!(
         #[weak]

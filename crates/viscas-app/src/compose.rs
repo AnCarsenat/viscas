@@ -37,7 +37,7 @@
 //! fcitx5 (environment variables, or input-method-v2 grabbing keys in the
 //! compositor, where dead keys never reach the application).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::glib::translate::IntoGlib;
@@ -207,6 +207,22 @@ fn insert(widget: &gtk::Widget, text: &str) {
     }
 }
 
+thread_local! {
+    /// Every window's fallback state, for [`is_pending`].
+    static INSTANCES: RefCell<Vec<std::rc::Weak<Compose>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether a dead-key / Compose sequence is in progress in any window
+/// (the keymap dispatcher then leaves plain keys to it).
+pub fn is_pending() -> bool {
+    INSTANCES.with_borrow_mut(|list| {
+        list.retain(|w| w.strong_count() > 0);
+        list.iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|s| s.pending.get())
+    })
+}
+
 /// State of the window's compose fallback.
 struct Compose {
     im: gtk::IMContextSimple,
@@ -367,6 +383,7 @@ pub fn install(window: &impl IsA<gtk::Window>) {
         committed: Cell::new(false),
     });
 
+    INSTANCES.with_borrow_mut(|list| list.push(Rc::downgrade(&state)));
     let weak = Rc::downgrade(&state);
     im.connect_commit(move |_, text| {
         let Some(s) = weak.upgrade() else { return };

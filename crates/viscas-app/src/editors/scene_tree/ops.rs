@@ -101,12 +101,13 @@ impl CommandProvider for NodeCommands {
         };
         let has_selection = !ctx.selection().selected().is_empty();
         let mut out = Vec::new();
-        let mut push = |id: String, title: String, shortcut: Option<&str>, run: Rc<dyn Fn()>| {
+        // Shortcut labels are filled in from the keymap (`AppCtx::commands`).
+        let mut push = |id: String, title: String, run: Rc<dyn Fn()>| {
             out.push(Command {
                 id,
                 title,
                 category: "Scene",
-                shortcut: shortcut.map(str::to_owned),
+                shortcut: None,
                 run,
             });
         };
@@ -115,7 +116,6 @@ impl CommandProvider for NodeCommands {
             push(
                 format!("scene.add::{}", kind.as_str()),
                 format!("Add {}", model::kind_title(kind)),
-                None,
                 Rc::new(move || {
                     if let Some(ctx) = weak.upgrade() {
                         add_node(&ctx, kind, None);
@@ -125,28 +125,22 @@ impl CommandProvider for NodeCommands {
         }
         if has_selection {
             type Op = fn(&AppCtx);
-            let ops: [(&str, &str, &str, Op); 3] = [
-                ("scene.delete", "Delete Selected Nodes", "Delete", |c| {
+            let ops: [(&str, &str, Op); 3] = [
+                ("scene.delete", "Delete Selected Nodes", |c| {
                     let _ = delete_selected(c);
                 }),
-                (
-                    "scene.duplicate",
-                    "Duplicate Selected Nodes",
-                    "Ctrl+D",
-                    |c| {
-                        let _ = duplicate_selected(c);
-                    },
-                ),
-                ("scene.group", "Group Selected into Folder", "Ctrl+G", |c| {
+                ("scene.duplicate", "Duplicate Selected Nodes", |c| {
+                    let _ = duplicate_selected(c);
+                }),
+                ("scene.group", "Group Selected into Folder", |c| {
                     let _ = group_selected(c);
                 }),
             ];
-            for (id, title, keys, op) in ops {
+            for (id, title, op) in ops {
                 let weak = self.ctx.clone();
                 push(
                     id.to_owned(),
                     title.to_owned(),
-                    Some(keys),
                     Rc::new(move || {
                         if let Some(ctx) = weak.upgrade() {
                             op(&ctx);

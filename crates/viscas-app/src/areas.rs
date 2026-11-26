@@ -1890,7 +1890,7 @@ impl Areas {
             glib::Propagation::Stop
         });
         self.install_drop_target(&window, Host::Floating(id));
-        crate::window::install_layout_keys(&window);
+        crate::keymap::live::install(&window, &self.inner.ctx);
         window.present();
         FloatWin { window, view }
     }

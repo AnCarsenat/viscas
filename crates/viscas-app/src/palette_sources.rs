@@ -141,7 +141,9 @@ pub const SETTINGS: &[(&str, &str)] = &[
     ("editing", "Definition Operator (:= or =)"),
     ("editing", "Undo Steps"),
     ("editing", "Console Adds Plots to Board"),
-    ("keymap", "Keymap"),
+    ("input", "Mouse: Zoom Direction, Sensitivity, Pan Button"),
+    ("input", "Emulate 3 Button Mouse"),
+    ("keymap", "Keymap: Edit Key Bindings"),
     ("save-load", "Save & Load Preferences"),
     ("system", "Follow System Light/Dark"),
 ];
@@ -184,6 +186,7 @@ mod tests {
             "themes",
             "viewport",
             "editing",
+            "input",
             "keymap",
             "save-load",
             "system",

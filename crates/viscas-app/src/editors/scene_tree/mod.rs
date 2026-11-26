@@ -25,6 +25,7 @@ use self::row::Row;
 use crate::ctx::AppCtx;
 use crate::doc::{DocEvent, Subscription};
 use crate::editors::pick_icon;
+use crate::keymap::{self, Context};
 
 const DROP_CLASSES: [&str; 3] = ["drop-before", "drop-after", "drop-into"];
 const DEP_CLASSES: [&str; 3] = ["dep-focus", "dep-up", "dep-down"];
@@ -797,20 +798,16 @@ impl SceneTree {
     fn install_keys(&self) {
         let keys = gtk::EventControllerKey::new();
         let weak = self.downgrade();
-        keys.connect_key_pressed(move |_, key, _, state| {
+        keys.connect_key_pressed(move |_, key, keycode, state| {
             let mut handled = false;
             Self::with_weak(&weak, |t| {
                 // Typing in the filter or a rename entry: keys are text.
                 if t.focus_in_text() {
                     return;
                 }
-                let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-                let action = match (key, ctrl) {
-                    (gdk::Key::F2, false) => "rename",
-                    (gdk::Key::Delete | gdk::Key::KP_Delete, false) => "delete",
-                    (gdk::Key::d | gdk::Key::D, true) => "duplicate",
-                    (gdk::Key::g | gdk::Key::G, true) => "group",
-                    _ => return,
+                let bound = keymap::live::action_for(Context::SceneTree, key, keycode, state);
+                let Some(action) = bound.as_deref().and_then(|id| id.strip_prefix("scene.")) else {
+                    return;
                 };
                 handled = t
                     .inner
@@ -825,6 +822,7 @@ impl SceneTree {
             }
         });
         self.inner.root.add_controller(keys);
+        keymap::live::mark(&self.inner.root, Context::SceneTree);
     }
 
     // ------------------------------------------------------------------

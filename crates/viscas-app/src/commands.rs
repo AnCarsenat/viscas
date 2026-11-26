@@ -8,7 +8,6 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 use crate::layout::EditorKind;
-use crate::shortcuts;
 use crate::workspace::Workspace;
 
 /// One registered command.
@@ -148,7 +147,7 @@ fn registry(window: &gtk::ApplicationWindow) -> Vec<Command> {
                 }
             });
             Command {
-                shortcut: shortcuts::label_for(&id),
+                shortcut: crate::keymap::live::label(&id),
                 id,
                 title,
                 category,

@@ -9,18 +9,18 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 use crate::ctx::AppCtx;
-use crate::prefs::{self, DefinitionOp, GridStyle, Preferences, Range};
+use crate::prefs::{self, DefinitionOp, GridStyle, PanButton, Preferences, Range};
 use crate::settings;
-use crate::shortcuts;
 use crate::theme::model::{Accent, Color, SECTIONS, Theme};
 use crate::widgets::{ColorSwatch, Panel, ScrubField, check_row, property_row};
 
 /// Categories in sidebar order: id and title.
-const CATEGORIES: [(&str, &str); 7] = [
+const CATEGORIES: [(&str, &str); 8] = [
     ("interface", "Interface"),
     ("themes", "Themes"),
     ("viewport", "Viewport"),
     ("editing", "Editing"),
+    ("input", "Input"),
     ("keymap", "Keymap"),
     ("save-load", "Save & Load"),
     ("system", "System"),
@@ -254,7 +254,8 @@ fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::Window {
     stack.add_named(&themes_page(&binder), Some("themes"));
     stack.add_named(&viewport_page(&binder), Some("viewport"));
     stack.add_named(&editing_page(&binder), Some("editing"));
-    stack.add_named(&keymap_page(), Some("keymap"));
+    stack.add_named(&input_page(&binder), Some("input"));
+    stack.add_named(&crate::prefs_keymap::page(ctx), Some("keymap"));
     stack.add_named(&save_load_page(&binder), Some("save-load"));
     stack.add_named(&system_page(&binder), Some("system"));
 
@@ -345,6 +346,9 @@ fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::Window {
     window.set_transient_for(parent.as_ref());
     install_menu_actions(&window, &binder);
     crate::compose::install(&window);
+    // App shortcuts (Ctrl+Q, Ctrl+,, Ctrl+?) work here too; suspended
+    // while the keymap editor captures a chord.
+    crate::keymap::live::install(&window, ctx);
 
     // Refresh bound widgets after every change; the refreshers live as
     // long as the window (owned by the destroy handler's closure).
@@ -1046,36 +1050,70 @@ fn editing_page(b: &Binder) -> gtk::Box {
     page
 }
 
-fn keymap_page() -> gtk::Box {
+fn input_page(b: &Binder) -> gtk::Box {
     let page = page();
-    let panel = Panel::new("Keyboard", true);
-    for (keys, title) in shortcuts::keymap() {
-        let keycap = gtk::Label::builder()
-            .label(&keys)
-            .xalign(0.0)
-            .halign(gtk::Align::Start)
-            .css_classes(["keycap"])
-            .build();
-        panel.append(&property_row(&title, &keycap));
-    }
-    page.append(panel.widget());
-    let mouse = Panel::new("Viewport Mouse", true);
-    for (keys, title) in [("Scroll", "Zoom at cursor"), ("Drag", "Pan")] {
+    let mouse = Panel::new("Mouse & Trackpad", true);
+    let invert = b.check(
+        "Invert Zoom Direction",
+        |p| p.input.invert_zoom,
+        |p, v| p.input.invert_zoom = v,
+    );
+    invert.set_tooltip_text(Some("Scrolling up zooms out instead of in"));
+    mouse.append(&invert);
+    let sensitivity = b.scrub(
+        prefs::ZOOM_SENSITIVITY,
+        |p| p.input.zoom_sensitivity,
+        |p, v| p.input.zoom_sensitivity = v,
+    );
+    sensitivity.set_suffix("×");
+    mouse.append(&property_row("Zoom Sensitivity", sensitivity.widget()));
+    let pan = b.choice(
+        &[
+            "Left Drag (Shift+drag box-zooms)",
+            "Middle Drag (left drag box-zooms)",
+        ],
+        |p| u32::from(p.input.pan_button == PanButton::Middle),
+        |p, i| {
+            p.input.pan_button = if i == 1 {
+                PanButton::Middle
+            } else {
+                PanButton::Left
+            }
+        },
+    );
+    pan.set_tooltip_text(Some(
+        "Mouse button that pans the viewport (middle drag always pans)",
+    ));
+    mouse.append(&property_row("Pan With", &pan));
+    let emulate = b.check(
+        "Emulate 3 Button Mouse",
+        |p| p.input.emulate_three_button,
+        |p, v| p.input.emulate_three_button = v,
+    );
+    emulate.set_tooltip_text(Some(
+        "Alt+left drag acts as the middle button: pans, with Ctrl stretches the axes. \
+         Many desktops move windows with Alt+drag; turn that off (or switch it to \
+         Super) in your desktop's window settings for this to reach Viscas.",
+    ));
+    mouse.append(&emulate);
+    page.append(mouse.widget());
+
+    let gestures = Panel::new("Viewport Gestures", true);
+    for (keys, title) in [
+        ("Scroll", "Zoom at cursor"),
+        ("Ctrl+Scroll / Alt+Scroll", "Stretch x / y only"),
+        ("Middle Drag", "Pan"),
+        ("Ctrl+Middle Drag", "Stretch axes"),
+        ("Pinch", "Zoom"),
+    ] {
         let keycap = gtk::Label::builder()
             .label(keys)
             .halign(gtk::Align::Start)
             .css_classes(["keycap"])
             .build();
-        mouse.append(&property_row(title, &keycap));
+        gestures.append(&property_row(title, &keycap));
     }
-    page.append(mouse.widget());
-    let note = gtk::Label::builder()
-        .label("Shortcuts are read-only for now; remapping arrives with the keymap editor.")
-        .wrap(true)
-        .xalign(0.0)
-        .css_classes(["prefs-note"])
-        .build();
-    page.append(&note);
+    page.append(gestures.widget());
     page
 }
 

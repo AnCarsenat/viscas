@@ -498,7 +498,15 @@ impl AppCtx {
     /// Current commands of every provider, in registration order.
     pub fn commands(&self) -> Vec<Command> {
         let providers = self.inner.providers.borrow().clone();
-        providers.iter().flat_map(|p| p.commands()).collect()
+        let mut list: Vec<Command> = providers.iter().flat_map(|p| p.commands()).collect();
+        // Shortcut labels come from the live keymap wherever it knows the
+        // command, so they follow rebinding.
+        for cmd in &mut list {
+            if let Some(label) = crate::keymap::live::palette_label(&cmd.id) {
+                cmd.shortcut = label;
+            }
+        }
+        list
     }
 }
 

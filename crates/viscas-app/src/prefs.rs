@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::keymap::KeymapPrefs;
 use crate::theme::model::{self, Accent, Theme};
 
 /// Version written to new files. Bump on incompatible changes.
@@ -73,6 +74,13 @@ pub const AUTOSAVE_MINUTES: Range = Range {
     step: 1.0,
     digits: 0,
     default: 2.0,
+};
+pub const ZOOM_SENSITIVITY: Range = Range {
+    min: 0.1,
+    max: 4.0,
+    step: 0.05,
+    digits: 2,
+    default: 1.0,
 };
 pub const RECENT_FILES: Range = Range {
     min: 0.0,
@@ -272,6 +280,80 @@ impl Default for SaveLoad {
     }
 }
 
+/// Mouse button that pans the viewport by dragging.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanButton {
+    /// Left drag pans (Shift+left drag box-zooms); middle drag pans too.
+    #[default]
+    Left,
+    /// Middle drag pans; left drag box-zooms (Blender-like).
+    Middle,
+}
+
+/// What a left-button drag in the viewport does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragMode {
+    Pan,
+    BoxZoom,
+    /// Stretch the axes (Ctrl+middle drag).
+    Stretch,
+}
+
+/// Mouse and trackpad behavior of the viewport camera.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Input {
+    /// Scrolling up zooms out instead of in.
+    pub invert_zoom: bool,
+    /// Multiplies the zoom of one wheel step.
+    #[serde(deserialize_with = "lenient::f64")]
+    pub zoom_sensitivity: f64,
+    pub pan_button: PanButton,
+    /// Alt+left drag acts as the middle button (laptops, trackpads).
+    pub emulate_three_button: bool,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self {
+            invert_zoom: false,
+            zoom_sensitivity: ZOOM_SENSITIVITY.default,
+            pan_button: PanButton::Left,
+            emulate_three_button: false,
+        }
+    }
+}
+
+impl Input {
+    /// Zoom exponent of a scroll delta `dy` (positive = down): the view
+    /// zooms by `step.powf(exponent)`.
+    pub fn zoom_exponent(&self, dy: f64) -> f64 {
+        let e = -dy * self.zoom_sensitivity;
+        if self.invert_zoom { -e } else { e }
+    }
+
+    /// What a left drag started with these modifiers does.
+    pub fn left_drag(&self, shift: bool, ctrl: bool, alt: bool) -> DragMode {
+        if shift {
+            // Shift+drag always box-zooms, emulation or not.
+            DragMode::BoxZoom
+        } else if self.emulate_three_button && alt {
+            // Behaves like the middle button.
+            if ctrl {
+                DragMode::Stretch
+            } else {
+                DragMode::Pan
+            }
+        } else {
+            match self.pan_button {
+                PanButton::Left => DragMode::Pan,
+                PanButton::Middle => DragMode::BoxZoom,
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct System {
@@ -383,6 +465,9 @@ pub struct Preferences {
     pub editing: Editing,
     pub save_load: SaveLoad,
     pub system: System,
+    pub input: Input,
+    /// Key bindings: preset and per-action overrides.
+    pub keymap: KeymapPrefs,
     /// Loaded and saved separately so missing colors fall back to the
     /// preset instead of failing the whole file.
     #[serde(skip)]
@@ -400,6 +485,8 @@ impl Default for Preferences {
             editing: Editing::default(),
             save_load: SaveLoad::default(),
             system: System::default(),
+            input: Input::default(),
+            keymap: KeymapPrefs::default(),
             theme: model::viscas_dark(),
         }
     }
@@ -424,6 +511,8 @@ impl Preferences {
         let s = &mut self.save_load;
         s.autosave_minutes = AUTOSAVE_MINUTES.clamp_u32(s.autosave_minutes);
         s.recent_files = RECENT_FILES.clamp_u32(s.recent_files);
+        self.input.zoom_sensitivity = ZOOM_SENSITIVITY.clamp(self.input.zoom_sensitivity);
+        self.keymap.validate();
         self.theme.name = clean_name(&self.theme.name, MAX_NAME_LEN);
         if self.theme.name.is_empty() {
             self.theme.name = "Untitled".to_owned();
@@ -494,6 +583,7 @@ impl Preferences {
                 base
             }
         };
+        warnings.extend(prefs.keymap.validate());
         prefs.validate();
         (prefs, warnings)
     }
@@ -756,6 +846,65 @@ pub fn theme_file_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::theme::model::Color;
+
+    #[test]
+    fn keymap_and_input_round_trip() {
+        let mut p = Preferences::default();
+        p.input.invert_zoom = true;
+        p.input.zoom_sensitivity = 2.5;
+        p.input.pan_button = PanButton::Middle;
+        p.input.emulate_three_button = true;
+        p.keymap.preset = "blender".into();
+        p.keymap
+            .bindings
+            .insert("win.save".into(), vec!["Ctrl+eacute".into(), "F5".into()]);
+        p.keymap.bindings.insert("win.undo".into(), Vec::new());
+        p.keymap
+            .bindings
+            .insert("someday.command".into(), vec!["Alt+F9".into()]);
+        let text = p.to_toml().unwrap();
+        let (back, warnings) = Preferences::from_toml(&text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn keymap_and_input_are_validated() {
+        let text = "[input]\nzoom_sensitivity = 99\npan_button = \"middle\"\n\
+                    [keymap]\nversion = 7\npreset = \"nope\"\n\
+                    [keymap.bindings]\n\"win.save\" = [\"Ctrl+dead_grave\", \"ctrl+s\"]\n";
+        let (p, warnings) = Preferences::from_toml(text);
+        assert_eq!(p.input.zoom_sensitivity, ZOOM_SENSITIVITY.max);
+        assert_eq!(p.input.pan_button, PanButton::Middle);
+        assert_eq!(p.keymap.version, crate::keymap::model::KEYMAP_VERSION);
+        assert_eq!(p.keymap.preset, "viscas");
+        assert_eq!(p.keymap.bindings["win.save"], vec!["Ctrl+S"]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        // A broken keymap section falls back alone.
+        let (p, w) = Preferences::from_toml("auto_save = false\nkeymap = 3\n");
+        assert!(!p.auto_save);
+        assert_eq!(p.keymap, KeymapPrefs::default());
+        assert!(!w.is_empty());
+    }
+
+    #[test]
+    fn input_zoom_and_drag_modes() {
+        let mut i = Input::default();
+        assert!(i.zoom_exponent(1.0) < 0.0, "scrolling down zooms out");
+        i.invert_zoom = true;
+        i.zoom_sensitivity = 2.0;
+        assert_eq!(i.zoom_exponent(1.0), 2.0);
+        assert_eq!(i.left_drag(false, false, false), DragMode::Pan);
+        assert_eq!(i.left_drag(true, false, false), DragMode::BoxZoom);
+        assert_eq!(i.left_drag(false, false, true), DragMode::Pan);
+        i.pan_button = PanButton::Middle;
+        assert_eq!(i.left_drag(false, false, false), DragMode::BoxZoom);
+        assert_eq!(i.left_drag(false, true, true), DragMode::BoxZoom);
+        i.emulate_three_button = true;
+        assert_eq!(i.left_drag(false, false, true), DragMode::Pan);
+        assert_eq!(i.left_drag(false, true, true), DragMode::Stretch);
+        assert_eq!(i.left_drag(true, false, true), DragMode::BoxZoom);
+    }
 
     #[test]
     fn round_trip_keeps_everything() {

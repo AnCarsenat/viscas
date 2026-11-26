@@ -1,10 +1,11 @@
-//! Application setup: app-level actions, accelerators and dialogs.
+//! Application setup: app-level actions and dialogs (key bindings are
+//! dispatched by `keymap::live`).
 
 use gtk::gio;
 use gtk::prelude::*;
 
 use crate::ctx::AppCtx;
-use crate::{prefs_window, settings, shortcuts, window};
+use crate::{prefs_window, settings, window};
 
 pub const APP_ID: &str = "io.github.ancarsenat.Viscas";
 
@@ -57,6 +58,7 @@ pub fn build() -> gtk::Application {
 fn setup(app: &gtk::Application, ctx: &AppCtx) {
     install_icon();
     settings::init(ctx);
+    crate::keymap::live::bind(ctx);
     crate::doc_ui::connect_prefs(ctx);
 
     // Quit goes through the window's close flow: one save prompt for the
@@ -82,8 +84,6 @@ fn setup(app: &gtk::Application, ctx: &AppCtx) {
         .activate(move |app: &gtk::Application, _, _| prefs_window::present(app, &prefs_ctx, None))
         .build();
     app.add_action_entries([quit, about, shortcuts, preferences]);
-
-    shortcuts::install(app);
 }
 
 fn show_about(app: &gtk::Application) {
@@ -113,7 +113,7 @@ fn show_about(app: &gtk::Application) {
 fn show_shortcuts(app: &gtk::Application) {
     let dialog = gtk::AlertDialog::builder()
         .message("Keyboard Shortcuts")
-        .detail(shortcuts::overview())
+        .detail(crate::keymap::live::overview())
         .buttons(["Close"])
         .modal(true)
         .build();

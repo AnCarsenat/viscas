@@ -19,6 +19,7 @@ pub use self::plots::{feature_label, format_coord};
 use self::view::View;
 use crate::ctx::AppCtx;
 use crate::doc::DocEvent;
+use crate::prefs::DragMode;
 
 /// Zoom factor applied per discrete scroll-wheel step.
 const ZOOM_PER_STEP: f64 = 1.15;
@@ -318,7 +319,7 @@ impl Viewport {
             let errors = self.plots.errors.borrow();
             let mut lines: Vec<String> = errors.clone();
             if self.plots.view_error.get() {
-                lines.push("View: this zoom level cannot be sampled — press Home".to_owned());
+                lines.push("View: this zoom level cannot be sampled — reset the view".to_owned());
             }
             (lines.len(), lines.join("\n"))
         };
@@ -350,7 +351,12 @@ impl Viewport {
 
     fn build_header_widgets(&self) -> Vec<gtk::Widget> {
         let view_menu = gio::Menu::new();
-        view_menu.append(Some("Frame All (Home)"), Some("vp.reset"));
+        let frame = gio::MenuItem::new(Some("Frame All"), Some("vp.reset"));
+        frame.set_attribute_value(
+            crate::keymap::live::KEYMAP_ID,
+            Some(&"viewport.reset-view".to_variant()),
+        );
+        view_menu.append_item(&frame);
         let axes = gio::Menu::new();
         axes.append(Some("Orthonormal (1:1 Axes)"), Some("vp.lock-aspect"));
         axes.append(Some("Stretch Horizontally"), Some("vp.stretch::wider"));
@@ -399,11 +405,22 @@ impl Viewport {
                 "view-fullscreen-symbolic",
                 "zoom-original-symbolic",
             ]))
-            .tooltip_text("Frame All — reset the view (Home)")
             .action_name("vp.reset")
             .css_classes(["area-tool"])
             .build();
         reset.insert_action_group("vp", Some(&self.actions));
+        // Tooltip and menu show the current Reset View binding.
+        let keys_menu = view_menu.clone();
+        let sync_keys = move |reset: &gtk::Button| {
+            let keys = crate::keymap::live::label("viewport.reset-view");
+            reset.set_tooltip_text(Some(&match keys {
+                Some(k) => format!("Frame All — reset the view ({k})"),
+                None => "Frame All — reset the view".to_owned(),
+            }));
+            crate::keymap::live::refresh_menu_accels(&keys_menu);
+        };
+        sync_keys(&reset);
+        crate::keymap::live::connect_changed_for(&reset, sync_keys);
         widgets.push(reset.upcast());
 
         *self.header.borrow_mut() = HeaderRefs {
@@ -498,18 +515,20 @@ impl Viewport {
         });
     }
 
+    /// Left drag: pan, box zoom or stretch depending on the modifiers and
+    /// Preferences ▸ Input (pan button, emulated middle button).
     fn install_drag(&self) {
         let area = &self.area;
         let drag = gtk::GestureDrag::new();
         let last = Rc::new(Cell::new((0.0, 0.0)));
-        let boxing = Rc::new(Cell::new(false));
+        let mode = Rc::new(Cell::new(DragMode::Pan));
         let this = self.downgrade();
 
         drag.connect_drag_begin(glib::clone!(
             #[strong]
             last,
             #[strong]
-            boxing,
+            mode,
             #[strong]
             this,
             move |g, x, y| {
@@ -519,15 +538,22 @@ impl Viewport {
                 last.set((0.0, 0.0));
                 vp.plots.dragged.set(false);
                 vp.area.grab_focus();
-                let shift = g
-                    .current_event_state()
-                    .contains(gdk::ModifierType::SHIFT_MASK);
-                boxing.set(shift);
-                if shift {
-                    vp.plots.zoom_box.set(Some(((x, y), (x, y))));
-                    vp.area.set_cursor_from_name(Some("crosshair"));
-                } else {
-                    vp.area.set_cursor_from_name(Some("grabbing"));
+                let state = g.current_event_state();
+                let m = vp.ctx().preferences().with(|p| {
+                    p.input.left_drag(
+                        state.contains(gdk::ModifierType::SHIFT_MASK),
+                        state.contains(gdk::ModifierType::CONTROL_MASK),
+                        state.contains(gdk::ModifierType::ALT_MASK),
+                    )
+                });
+                mode.set(m);
+                match m {
+                    DragMode::BoxZoom => {
+                        vp.plots.zoom_box.set(Some(((x, y), (x, y))));
+                        vp.area.set_cursor_from_name(Some("crosshair"));
+                    }
+                    DragMode::Stretch => vp.area.set_cursor_from_name(Some("all-scroll")),
+                    DragMode::Pan => vp.area.set_cursor_from_name(Some("grabbing")),
                 }
             }
         ));
@@ -535,7 +561,7 @@ impl Viewport {
             #[strong]
             last,
             #[strong]
-            boxing,
+            mode,
             #[strong]
             this,
             move |g, ox, oy| {
@@ -545,24 +571,31 @@ impl Viewport {
                 if ox.hypot(oy) > CLICK_SLOP {
                     vp.plots.dragged.set(true);
                 }
-                if boxing.get() {
-                    if let Some((sx, sy)) = g.start_point() {
-                        vp.plots.zoom_box.set(Some(((sx, sy), (sx + ox, sy + oy))));
-                        vp.queue_draw();
-                    }
-                    return;
-                }
                 let (lx, ly) = last.replace((ox, oy));
-                vp.update_view(|v| v.pan_by_pixels(ox - lx, oy - ly));
+                let (dx, dy) = (ox - lx, oy - ly);
+                match mode.get() {
+                    DragMode::BoxZoom => {
+                        if let Some((sx, sy)) = g.start_point() {
+                            vp.plots.zoom_box.set(Some(((sx, sy), (sx + ox, sy + oy))));
+                            vp.queue_draw();
+                        }
+                    }
+                    DragMode::Stretch => {
+                        let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
+                        let k = |d: f64| (d * STRETCH_PER_PX).exp();
+                        vp.stretch_at(k(dx), k(-dy), sx, sy);
+                    }
+                    DragMode::Pan => vp.update_view(|v| v.pan_by_pixels(dx, dy)),
+                }
             }
         ));
         drag.connect_cancel(glib::clone!(
             #[strong]
             this,
             #[strong]
-            boxing,
+            mode,
             move |_, _| {
-                boxing.set(false);
+                mode.set(DragMode::Pan);
                 if let Some(vp) = this.upgrade() {
                     vp.plots.zoom_box.set(None);
                     vp.area.set_cursor(None::<&gdk::Cursor>);
@@ -578,7 +611,7 @@ impl Viewport {
                     return;
                 };
                 vp.area.set_cursor(None::<&gdk::Cursor>);
-                if boxing.replace(false)
+                if mode.replace(DragMode::Pan) == DragMode::BoxZoom
                     && let Some((a, b)) = vp.plots.zoom_box.take()
                 {
                     let locked = vp.lock_aspect();
@@ -693,7 +726,9 @@ impl Viewport {
                     return glib::Propagation::Proceed;
                 };
                 let mods = c.current_event_state();
-                let f = ZOOM_PER_STEP.powf(-dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA));
+                let dy = dy.clamp(-MAX_SCROLL_DELTA, MAX_SCROLL_DELTA);
+                let exponent = vp.ctx().preferences().with(|p| p.input.zoom_exponent(dy));
+                let f = ZOOM_PER_STEP.powf(exponent);
                 let (w, h) = vp.view().size;
                 let (sx, sy) = pointer.get().unwrap_or((w / 2.0, h / 2.0));
                 if mods.contains(gdk::ModifierType::CONTROL_MASK) {
@@ -838,16 +873,22 @@ impl Viewport {
     fn install_keys(&self) {
         let keys = gtk::EventControllerKey::new();
         let this = self.downgrade();
-        keys.connect_key_pressed(move |_, key, _, _| {
+        keys.connect_key_pressed(move |_, key, keycode, state| {
             let Some(vp) = this.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            match key {
-                gdk::Key::Home | gdk::Key::KP_Home => {
+            let action = crate::keymap::live::action_for(
+                crate::keymap::Context::Viewport,
+                key,
+                keycode,
+                state,
+            );
+            match action.as_deref() {
+                Some("viewport.reset-view") => {
                     vp.reset_view();
                     glib::Propagation::Stop
                 }
-                gdk::Key::Escape => {
+                Some("viewport.clear-marks") => {
                     vp.plots.clear_marks();
                     vp.plots.zoom_box.set(None);
                     vp.ctx().selection().set_selected([]);
@@ -858,6 +899,7 @@ impl Viewport {
             }
         });
         self.area.add_controller(keys);
+        crate::keymap::live::mark(&self.area, crate::keymap::Context::Viewport);
     }
 
     fn downgrade(&self) -> WeakViewport {
