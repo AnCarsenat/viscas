@@ -335,15 +335,16 @@ impl Input {
 
     /// What a left drag started with these modifiers does.
     pub fn left_drag(&self, shift: bool, ctrl: bool, alt: bool) -> DragMode {
-        if self.emulate_three_button && alt {
+        if shift {
+            // Shift+drag always box-zooms, emulation or not.
+            DragMode::BoxZoom
+        } else if self.emulate_three_button && alt {
             // Behaves like the middle button.
             if ctrl {
                 DragMode::Stretch
             } else {
                 DragMode::Pan
             }
-        } else if shift {
-            DragMode::BoxZoom
         } else {
             match self.pan_button {
                 PanButton::Left => DragMode::Pan,
@@ -902,6 +903,7 @@ mod tests {
         i.emulate_three_button = true;
         assert_eq!(i.left_drag(false, false, true), DragMode::Pan);
         assert_eq!(i.left_drag(false, true, true), DragMode::Stretch);
+        assert_eq!(i.left_drag(true, false, true), DragMode::BoxZoom);
     }
 
     #[test]

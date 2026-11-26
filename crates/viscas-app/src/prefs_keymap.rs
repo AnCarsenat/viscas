@@ -120,8 +120,8 @@ pub fn page(ctx: &AppCtx) -> gtk::Box {
             .label(
                 "Click a binding to change it: Esc cancels, Backspace removes it. \
                  Keys are matched by the symbol your layout types (AZERTY é is É). \
-                 Bindings conflict only within one context; a focused editor's own \
-                 keys win over Window keys.",
+                 A key conflicts within its context and with Window keys (a \
+                 focused editor's own keys win over them).",
             )
             .wrap(true)
             .xalign(0.0)
@@ -235,8 +235,20 @@ pub fn page(ctx: &AppCtx) -> gtk::Box {
 
     editor.render(true);
     ctx.preferences()
-        .connect_changed_for(weak, |e, _| e.render(false));
+        .connect_changed_for(weak.clone(), |e, _| e.render(false));
     // The page owns the editor (its widgets point back only weakly).
+    // Leaving the page (another category, window hidden or closed)
+    // ends a capture, so shortcuts never stay suspended.
+    page.connect_unmap(glib::clone!(
+        #[strong]
+        weak,
+        move |_| {
+            live::set_capturing(false);
+            if let Some(e) = weak.upgrade() {
+                e.cancel_capture();
+            }
+        }
+    ));
     page.connect_destroy(move |_| {
         live::set_capturing(false);
         let _ = &editor;
@@ -822,7 +834,20 @@ fn import_keymap(button: &gtk::Button, ctx: &AppCtx) {
                 .and_then(|p| prefs::read_capped(p).map_err(|e| e.to_string()))
                 .and_then(|text| KeymapPrefs::from_toml(&text));
             match loaded {
-                Ok((km, warnings)) => {
+                Ok((km, mut warnings)) => {
+                    let specs = registry::with_commands(&ctx.commands());
+                    let unknown: Vec<&str> = km
+                        .bindings
+                        .keys()
+                        .filter(|id| !specs.iter().any(|s| &s.id == *id))
+                        .map(String::as_str)
+                        .collect();
+                    if !unknown.is_empty() {
+                        warnings.push(format!(
+                            "kept but inactive (no such action in this version): {}",
+                            unknown.join(", ")
+                        ));
+                    }
                     ctx.preferences().update(|p| p.keymap = km);
                     if !warnings.is_empty() {
                         alert(

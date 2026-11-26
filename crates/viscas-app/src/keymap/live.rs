@@ -14,7 +14,7 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use super::model::{ActionSpec, Chord, Context, KeymapPrefs, Mods};
+use super::model::{ActionSpec, Chord, Context, KeymapPrefs, Mods, is_unbindable_id};
 use crate::ctx::{AppCtx, WeakCtx};
 
 /// One resolved binding.
@@ -29,6 +29,8 @@ struct Live {
     prefs: KeymapPrefs,
     specs: Vec<ActionSpec>,
     table: Vec<Entry>,
+    /// Bindings of ids the registry does not know (see `rebuild`).
+    deferred: Vec<Entry>,
 }
 
 impl Live {
@@ -37,13 +39,16 @@ impl Live {
             prefs,
             specs: super::registry::specs(),
             table: Vec::new(),
+            deferred: Vec::new(),
         };
         live.rebuild();
         live
     }
 
-    /// Known actions first, then overrides of ids no action knows (bound
-    /// as Window commands: a provider may supply them at run time).
+    /// Bindings of the registered actions. Overrides of ids the registry
+    /// does not know (a palette provider's command, a newer build's
+    /// action) are kept aside: they never take part in conflicts and
+    /// run only if a provider supplies that command when pressed.
     fn rebuild(&mut self) {
         self.table.clear();
         for s in &self.specs {
@@ -56,12 +61,13 @@ impl Live {
                 });
             }
         }
+        self.deferred.clear();
         for (id, keys) in &self.prefs.bindings {
-            if self.specs.iter().any(|s| &s.id == id) {
+            if self.specs.iter().any(|s| &s.id == id) || is_unbindable_id(id) {
                 continue;
             }
             for chord in keys.iter().filter_map(|k| Chord::parse(k).ok()) {
-                self.table.push(Entry {
+                self.deferred.push(Entry {
                     context: Context::Window,
                     chord,
                     id: id.clone(),
@@ -157,6 +163,7 @@ pub fn bindings(id: &str) -> Vec<Chord> {
     with(|l| {
         l.table
             .iter()
+            .chain(&l.deferred)
             .filter(|e| e.id == id)
             .map(|e| e.chord.clone())
             .collect()
@@ -189,9 +196,15 @@ pub fn accel(id: &str) -> Option<String> {
 /// The action bound to one of `chords` in `context`, with the chord and
 /// whether it repeats.
 fn lookup(context: Context, chords: &[Chord]) -> Option<(String, Chord, bool)> {
+    lookup_in(context, chords, false)
+}
+
+/// Like [`lookup`], in the bindings of unknown ids when `deferred`.
+fn lookup_in(context: Context, chords: &[Chord], deferred: bool) -> Option<(String, Chord, bool)> {
     with(|l| {
+        let entries = if deferred { &l.deferred } else { &l.table };
         chords.iter().find_map(|c| {
-            l.table
+            entries
                 .iter()
                 .find(|e| e.context == context && &e.chord == c)
                 .map(|e| (e.id.clone(), c.clone(), e.repeat))
@@ -242,25 +255,42 @@ pub fn event_chords(key: gdk::Key, keycode: u32, state: gdk::ModifierType) -> Ve
     }
     if printable
         && keycode != 0
-        && !name.chars().all(|c| c.is_ascii_digit())
-        && let Some(digit) = digit_on_key(key, keycode)
-        && let Some(c) = Chord::from_event(&digit, mods, true)
+        && !mods.contains(Mods::SHIFT)
+        && let Some(entries) = gdk::Display::default().and_then(|d| d.map_keycode(keycode))
     {
-        out.push(c);
+        let levels: Vec<(i32, i32, gdk::Key)> = entries
+            .iter()
+            .map(|(m, k)| (m.group(), m.level(), *k))
+            .collect();
+        if let Some(digit) = digit_fallback(&levels, key, false)
+            && let Some(c) = Chord::from_event(&digit, mods, true)
+        {
+            out.push(c);
+        }
     }
     out
 }
 
-/// The digit another level of `keycode` types in the layout group where
-/// it typed `key`.
-fn digit_on_key(key: gdk::Key, keycode: u32) -> Option<String> {
-    let entries = gdk::Display::default()?.map_keycode(keycode)?;
-    let group = entries.iter().find(|(_, k)| *k == key)?.0.group();
-    entries
+/// The digit a key also carries, for `Ctrl+1` on layouts whose digits
+/// need Shift (AZERTY `&`/`1`). `levels` are the key's (group, level,
+/// keyval) entries, `key` what it typed. Only for an unshifted press of
+/// a key that typed a non-digit at level 0: a shifted symbol (US
+/// Shift+6 = `^`, DE Shift+6 = `&`) is that symbol, never a digit.
+pub fn digit_fallback(
+    levels: &[(i32, i32, gdk::Key)],
+    key: gdk::Key,
+    shift: bool,
+) -> Option<String> {
+    let is_digit = |k: &gdk::Key| k.to_unicode().is_some_and(|c| c.is_ascii_digit());
+    if shift || is_digit(&key) {
+        return None;
+    }
+    let group = levels.iter().find(|(_, l, k)| *l == 0 && *k == key)?.0;
+    levels
         .iter()
-        .filter(|(m, _)| m.group() == group)
-        .find(|(_, k)| k.to_unicode().is_some_and(|c| c.is_ascii_digit()))
-        .and_then(|(_, k)| k.name())
+        .filter(|(g, l, _)| *g == group && *l > 0)
+        .find(|(_, _, k)| is_digit(k))
+        .and_then(|(_, _, k)| k.name())
         .map(|n| n.to_string())
 }
 
@@ -312,15 +342,63 @@ fn is_text(w: &gtk::Widget) -> bool {
         || w.dynamic_cast_ref::<gtk::Editable>().is_some()
 }
 
-/// Whether `chord` types in a text field rather than being a shortcut:
-/// no command modifier (function keys excepted), or Ctrl+Alt (AltGr on
-/// some layouts).
-pub fn types_text(chord: &Chord) -> bool {
+/// Whether a key press types in a text field rather than being a
+/// shortcut: no command modifier (function keys excepted), or the
+/// layout itself used Ctrl/Alt to produce a printable character
+/// (`layout_typed`: AltGr reported as Ctrl+Alt). Ctrl+Alt+1 on a layout
+/// where that is not text stays a shortcut.
+pub fn types_text(chord: &Chord, layout_typed: bool) -> bool {
     let function_key = chord.key.len() > 1
         && chord.key.starts_with('F')
         && chord.key[1..].chars().all(|c| c.is_ascii_digit());
-    (!chord.has_command_mod() && !function_key)
-        || (chord.mods.contains(Mods::CTRL) && chord.mods.contains(Mods::ALT))
+    (!chord.has_command_mod() && !function_key) || layout_typed
+}
+
+/// Phase of the window dispatcher that runs a Window chord.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Before the focused widget (command chords: they must win over
+    /// focus navigation and widget defaults, like Ctrl+Tab).
+    Capture,
+    /// After the focused widget declined the key: plain keys (Space must
+    /// still press a focused button), and in text fields Ctrl+Space and
+    /// Alt chords, which an input method or the widget may want first.
+    Bubble,
+}
+
+/// The phase that handles `chord`.
+pub fn phase_for(chord: &Chord, text_focus: bool) -> Phase {
+    let m = chord.mods;
+    let alt_only = m.contains(Mods::ALT) && !m.contains(Mods::CTRL) && !m.contains(Mods::SUPER);
+    let ctrl_space = chord.key == "space" && m == Mods::CTRL;
+    if !chord.has_command_mod() || (text_focus && (alt_only || ctrl_space)) {
+        Phase::Bubble
+    } else {
+        Phase::Capture
+    }
+}
+
+/// What surrounds a key press, for [`should_run`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Situation {
+    /// A text field has focus.
+    pub text_focus: bool,
+    /// The layout used Ctrl/Alt to type a character (see [`types_text`]).
+    pub layout_typed: bool,
+    /// A dead-key / Compose sequence is in progress.
+    pub compose_pending: bool,
+    /// The focused editor (or a text-editing feature) binds this key.
+    pub local_bound: bool,
+}
+
+/// Whether the dispatcher in `phase` runs the Window action bound to
+/// `chord`.
+pub fn should_run(phase: Phase, chord: &Chord, s: Situation) -> bool {
+    let shadowed = s.local_bound;
+    let typing = s.text_focus && types_text(chord, s.layout_typed);
+    let composing = s.compose_pending && !chord.has_command_mod();
+    let blocked = shadowed || typing || composing;
+    phase_for(chord, s.text_focus) == phase && !blocked
 }
 
 /// Runs command `id` on `window`: an action, else a palette command.
@@ -333,6 +411,11 @@ fn run(window: &gtk::Window, ctx: &WeakCtx, id: &str) -> bool {
             Err(_) => false,
         };
     }
+    run_command(ctx, id)
+}
+
+/// Runs the palette command `id`, if a provider has it now.
+fn run_command(ctx: &WeakCtx, id: &str) -> bool {
     let Some(ctx) = ctx.upgrade() else {
         return false;
     };
@@ -345,70 +428,123 @@ fn run(window: &gtk::Window, ctx: &WeakCtx, id: &str) -> bool {
     }
 }
 
-/// Installs the keymap dispatcher on `window`.
+/// Installs the keymap dispatcher on `window`: a capture-phase and a
+/// bubble-phase controller (see [`Phase`]).
 pub fn install(window: &impl IsA<gtk::Window>, ctx: &AppCtx) {
     let window: &gtk::Window = window.upcast_ref();
-    let keys = gtk::EventControllerKey::new();
-    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    // Keys held down, to tell auto-repeat apart; the capture controller
+    // sees every press first and records whether it repeated.
     let held: Rc<RefCell<HashSet<u32>>> = Rc::default();
-    keys.connect_key_released(glib::clone!(
-        #[strong]
-        held,
-        move |_, _, keycode, _| {
-            held.borrow_mut().remove(&keycode);
+    let repeated = Rc::new(Cell::new(false));
+    for phase in [Phase::Capture, Phase::Bubble] {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(match phase {
+            Phase::Capture => gtk::PropagationPhase::Capture,
+            Phase::Bubble => gtk::PropagationPhase::Bubble,
+        });
+        if phase == Phase::Capture {
+            keys.connect_key_released(glib::clone!(
+                #[strong]
+                held,
+                move |_, _, keycode, _| {
+                    held.borrow_mut().remove(&keycode);
+                }
+            ));
         }
-    ));
-    let weak_ctx = ctx.downgrade();
-    keys.connect_key_pressed(glib::clone!(
-        #[weak]
-        window,
-        #[upgrade_or]
-        glib::Propagation::Proceed,
-        move |_, key, keycode, state| {
-            let repeated = !held.borrow_mut().insert(keycode);
-            dispatch(&window, &weak_ctx, key, keycode, state, repeated)
+        let weak_ctx = ctx.downgrade();
+        let (held, repeated) = (held.clone(), repeated.clone());
+        keys.connect_key_pressed(glib::clone!(
+            #[weak]
+            window,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |c, key, keycode, state| {
+                if phase == Phase::Capture {
+                    repeated.set(!held.borrow_mut().insert(keycode));
+                }
+                let layout_typed = c
+                    .current_event()
+                    .and_then(|e| e.downcast::<gdk::KeyEvent>().ok())
+                    .is_some_and(|ev| {
+                        key.to_unicode().is_some_and(|ch| !ch.is_control())
+                            && ev.consumed_modifiers().intersects(
+                                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK,
+                            )
+                    });
+                let press = Press {
+                    key,
+                    keycode,
+                    state,
+                    repeated: repeated.get(),
+                    layout_typed,
+                };
+                dispatch(&window, &weak_ctx, phase, &press)
+            }
+        ));
+        window.add_controller(keys);
+    }
+    // Releases that happen in another window never reach this one.
+    window.connect_is_active_notify(move |w| {
+        if !w.is_active() {
+            held.borrow_mut().clear();
         }
-    ));
-    window.add_controller(keys);
+    });
 }
 
-fn dispatch(
-    window: &gtk::Window,
-    ctx: &WeakCtx,
+/// One key press as the dispatcher sees it.
+struct Press {
     key: gdk::Key,
     keycode: u32,
     state: gdk::ModifierType,
     repeated: bool,
-) -> glib::Propagation {
+    layout_typed: bool,
+}
+
+fn dispatch(window: &gtk::Window, ctx: &WeakCtx, phase: Phase, p: &Press) -> glib::Propagation {
     let proceed = glib::Propagation::Proceed;
     if CAPTURING.get() {
         return proceed;
     }
-    let chords = event_chords(key, keycode, state);
+    let chords = event_chords(p.key, p.keycode, p.state);
     if chords.is_empty() {
         return proceed;
     }
     let focus = gtk::prelude::GtkWindowExt::focus(window);
-    let text = focus.as_ref().is_some_and(is_text);
+    let text_focus = focus.as_ref().is_some_and(is_text);
     // The focused editor's own bindings (and text-editing features)
     // win over Window bindings.
     let mut local = focus_contexts(focus.as_ref());
-    if text {
+    if text_focus {
         local.push(Context::TextEditing);
     }
-    if local.into_iter().any(|c| lookup(c, &chords).is_some()) {
-        return proceed;
-    }
-    let Some((id, chord, repeat)) = lookup(Context::Window, &chords) else {
-        return proceed;
+    let local_bound = local.into_iter().any(|c| lookup(c, &chords).is_some());
+    let (found, deferred) = match lookup(Context::Window, &chords) {
+        Some(f) => (f, false),
+        None => match lookup_in(Context::Window, &chords, true) {
+            Some(f) => (f, true),
+            None => return proceed,
+        },
     };
-    if text && types_text(&chord) {
+    let (id, chord, repeat) = found;
+    let situation = Situation {
+        text_focus,
+        layout_typed: p.layout_typed,
+        compose_pending: crate::compose::is_pending(),
+        local_bound,
+    };
+    if !should_run(phase, &chord, situation) {
         return proceed;
     }
-    if repeated && !repeat {
+    if p.repeated && !repeat {
         return glib::Propagation::Stop;
     }
-    if run(window, ctx, &id) {
+    // An unknown id runs only if a provider has that command now.
+    let ran = if deferred {
+        run_command(ctx, &id)
+    } else {
+        run(window, ctx, &id)
+    };
+    if ran {
         glib::Propagation::Stop
     } else {
         proceed
@@ -525,7 +661,14 @@ mod tests {
         assert_eq!(palette_label("win.save"), Some(Some("Ctrl+É".to_owned())));
         assert_eq!(palette_label("node.goto::1"), None);
         // Unknown ids still resolve (a provider may run them).
-        assert_eq!(lookup(Context::Window, &[c("F9")]).unwrap().0, "future.cmd");
+        // Unknown ids are not in the table (no conflicts), only deferred
+        // until a provider supplies the command; their label still shows.
+        assert!(lookup(Context::Window, &[c("F9")]).is_none());
+        assert_eq!(
+            lookup_in(Context::Window, &[c("F9")], true).unwrap().0,
+            "future.cmd"
+        );
+        assert_eq!(label("future.cmd").as_deref(), Some("F9"));
         // Same keymap again: no notification.
         set_prefs(&prefs);
         assert_eq!(fired.get(), 1);
@@ -574,11 +717,92 @@ mod tests {
 
     #[test]
     fn text_fields_keep_typing_keys() {
-        assert!(types_text(&c("space")));
-        assert!(types_text(&c("Shift+a")));
-        assert!(types_text(&c("Ctrl+Alt+z")));
-        assert!(!types_text(&c("Ctrl+z")));
-        assert!(!types_text(&c("Alt+x")));
-        assert!(!types_text(&c("F3")));
+        assert!(types_text(&c("space"), false));
+        assert!(types_text(&c("Shift+a"), false));
+        assert!(!types_text(&c("Ctrl+z"), false));
+        assert!(!types_text(&c("Alt+x"), false));
+        assert!(!types_text(&c("F3"), false));
+        // Ctrl+Alt+1 switches workspaces unless the layout typed with it.
+        assert!(!types_text(&c("Ctrl+Alt+1"), false));
+        assert!(types_text(&c("Ctrl+Alt+q"), true));
+    }
+
+    #[test]
+    fn plain_keys_bubble_so_focused_widgets_get_them_first() {
+        assert_eq!(phase_for(&c("space"), false), Phase::Bubble);
+        assert_eq!(phase_for(&c("F3"), false), Phase::Bubble);
+        assert_eq!(phase_for(&c("Ctrl+Tab"), false), Phase::Capture);
+        assert_eq!(phase_for(&c("Ctrl+space"), false), Phase::Capture);
+        // In text fields the input method and widget see these first.
+        assert_eq!(phase_for(&c("Ctrl+space"), true), Phase::Bubble);
+        assert_eq!(phase_for(&c("Alt+x"), true), Phase::Bubble);
+        assert_eq!(phase_for(&c("Ctrl+Alt+z"), true), Phase::Capture);
+    }
+
+    #[test]
+    fn dispatch_decisions() {
+        let none = Situation::default();
+        let text = Situation {
+            text_focus: true,
+            ..none
+        };
+        // Space presses a focused button: only the bubble phase runs it.
+        assert!(!should_run(Phase::Capture, &c("space"), none));
+        assert!(should_run(Phase::Bubble, &c("space"), none));
+        // ...and never in a text field.
+        assert!(!should_run(Phase::Bubble, &c("space"), text));
+        assert!(should_run(Phase::Capture, &c("Ctrl+s"), text));
+        assert!(should_run(Phase::Capture, &c("Ctrl+Alt+1"), text));
+        let altgr = Situation {
+            layout_typed: true,
+            ..text
+        };
+        assert!(!should_run(Phase::Capture, &c("Ctrl+Alt+q"), altgr));
+        // A local binding shadows the Window one.
+        let local = Situation {
+            local_bound: true,
+            ..none
+        };
+        assert!(!should_run(Phase::Capture, &c("Ctrl+s"), local));
+        // A pending dead-key sequence keeps plain keys; shortcuts still
+        // work (compose abandons the sequence on them).
+        let compose = Situation {
+            compose_pending: true,
+            ..none
+        };
+        assert!(!should_run(Phase::Bubble, &c("F3"), compose));
+        assert!(should_run(Phase::Capture, &c("Ctrl+s"), compose));
+    }
+
+    #[test]
+    fn digit_fallback_is_layout_aware() {
+        use gdk::Key;
+        // AZERTY: the 1 key types `&`, Shift gives `1`.
+        let azerty = [(0, 0, Key::ampersand), (0, 1, Key::_1)];
+        assert_eq!(
+            digit_fallback(&azerty, Key::ampersand, false).as_deref(),
+            Some("1")
+        );
+        assert_eq!(digit_fallback(&azerty, Key::_1, true), None);
+        // AZERTY é/2 key.
+        let e2 = [
+            (0, 0, Key::eacute),
+            (0, 1, Key::_2),
+            (0, 2, Key::asciitilde),
+        ];
+        assert_eq!(
+            digit_fallback(&e2, Key::eacute, false).as_deref(),
+            Some("2")
+        );
+        // US: 6 types `6`, Shift+6 is `^`: never a fallback.
+        let us = [(0, 0, Key::_6), (0, 1, Key::asciicircum)];
+        assert_eq!(digit_fallback(&us, Key::_6, false), None);
+        assert_eq!(digit_fallback(&us, Key::asciicircum, true), None);
+        // DE: Shift+6 is `&`.
+        let de = [(0, 0, Key::_6), (0, 1, Key::ampersand)];
+        assert_eq!(digit_fallback(&de, Key::ampersand, true), None);
+        // A key from another group does not count.
+        let other = [(0, 0, Key::q), (1, 0, Key::ampersand), (1, 1, Key::_1)];
+        assert_eq!(digit_fallback(&other, Key::q, false), None);
     }
 }

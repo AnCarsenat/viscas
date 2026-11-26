@@ -223,8 +223,11 @@ mod tests {
         let spec = list.iter().find(|s| s.id == "text.test-complete").unwrap();
         assert_eq!(spec.context, Context::TextEditing);
         assert_eq!(spec.defaults, vec![Chord::parse("Ctrl+space").unwrap()]);
-        // Ctrl+Space is also Maximize Area, but in another context.
+        // Ctrl+Space is also Maximize Area: a Window key fires in text
+        // fields too, so the two conflict.
         let km = KeymapPrefs::default();
-        assert!(km.conflicts(&list).is_empty());
+        let found = km.conflicts(&list);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ids.contains(&"win.maximize-area".to_owned()));
     }
 }

@@ -346,6 +346,9 @@ fn build(app: &gtk::Application, ctx: &AppCtx) -> gtk::Window {
     window.set_transient_for(parent.as_ref());
     install_menu_actions(&window, &binder);
     crate::compose::install(&window);
+    // App shortcuts (Ctrl+Q, Ctrl+,, Ctrl+?) work here too; suspended
+    // while the keymap editor captures a chord.
+    crate::keymap::live::install(&window, ctx);
 
     // Refresh bound widgets after every change; the refreshers live as
     // long as the window (owned by the destroy handler's closure).
@@ -1088,7 +1091,9 @@ fn input_page(b: &Binder) -> gtk::Box {
         |p, v| p.input.emulate_three_button = v,
     );
     emulate.set_tooltip_text(Some(
-        "Alt+left drag acts as the middle button: pans, with Ctrl stretches the axes",
+        "Alt+left drag acts as the middle button: pans, with Ctrl stretches the axes. \
+         Many desktops move windows with Alt+drag; turn that off (or switch it to \
+         Super) in your desktop's window settings for this to reach Viscas.",
     ));
     mouse.append(&emulate);
     page.append(mouse.widget());

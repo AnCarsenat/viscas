@@ -410,11 +410,14 @@ impl Context {
         }
     }
 
-    /// Whether bindings of the two contexts can fire for the same key
-    /// press: the same context, or the console (a text field) and text
-    /// editing.
+    /// Whether bindings of the two contexts can compete for the same key
+    /// press: the same context; Window and any context (a Window key is
+    /// shadowed where a local one is active); text editing and the
+    /// contexts that accept text (the console).
     pub fn overlaps(self, other: Context) -> bool {
         self == other
+            || self == Context::Window
+            || other == Context::Window
             || matches!(
                 (self, other),
                 (Context::Console, Context::TextEditing) | (Context::TextEditing, Context::Console)
@@ -535,6 +538,15 @@ pub struct Conflict {
     pub ids: Vec<String>,
 }
 
+/// Id prefixes of per-item palette commands (one per node, function or
+/// setting) that are never bindable.
+pub const UNBINDABLE_PREFIXES: [&str; 3] = ["node.goto::", "function.insert::", "setting::"];
+
+/// Whether `id` names a per-item command that cannot be bound.
+pub fn is_unbindable_id(id: &str) -> bool {
+    UNBINDABLE_PREFIXES.iter().any(|p| id.starts_with(p))
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_ID_LEN && !id.chars().any(char::is_control)
 }
@@ -557,6 +569,10 @@ impl KeymapPrefs {
         for (id, keys) in old {
             if !valid_id(&id) {
                 warnings.push("ignoring a keymap entry with an invalid id".to_owned());
+                continue;
+            }
+            if is_unbindable_id(&id) {
+                warnings.push(format!("ignoring `{id}`: this command cannot be bound"));
                 continue;
             }
             if self.bindings.len() >= MAX_ACTIONS {
@@ -897,9 +913,16 @@ mod tests {
         let s = specs();
         let mut km = KeymapPrefs::default();
         assert!(km.conflicts(&s).is_empty());
-        // Same chord in different contexts: no conflict.
-        km.assign(&s[3], Some(0), Some(c("Ctrl+S")));
+        // Same chord in two unrelated local contexts: no conflict.
+        km.assign(&s[3], Some(0), Some(c("Home")));
         assert!(km.conflicts(&s).is_empty());
+        // A local key shadows a Window key: conflict.
+        km.assign(&s[4], None, Some(c("Ctrl+P")));
+        assert_eq!(
+            km.conflicts_with(&s, "viewport.reset", Context::Viewport, &c("Ctrl+P")),
+            vec!["win.palette".to_owned()]
+        );
+        km.reset("viewport.reset");
         // Same context: conflict.
         km.assign(&s[1], Some(0), Some(c("Ctrl+S")));
         let found = km.conflicts(&s);
@@ -940,9 +963,11 @@ mod tests {
             [bindings]
             "win.save" = ["ctrl+s", "Ctrl+S", "F5", "Ctrl+dead_acute", "Bogus+x"]
             "never.heard.of" = ["F9"]
+            "node.goto::3" = ["F8"]
         "#;
         let (km, warnings) = KeymapPrefs::from_toml(text).unwrap();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(!km.bindings.contains_key("node.goto::3"));
         assert_eq!(km.preset(), Preset::Blender);
         assert_eq!(km.bindings["win.save"], vec!["Ctrl+S", "F5"]);
         assert_eq!(km.bindings["never.heard.of"], vec!["F9"]);
