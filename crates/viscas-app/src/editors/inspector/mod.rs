@@ -608,6 +608,17 @@ impl Inspector {
             .build();
         panel.append(&property_row(label, &entry));
         panel.append(&error);
+        // Expression fields get completion, signature help and live
+        // diagnostics (the assistant owns the underline attributes).
+        let assist = field.map(|_| {
+            let a = crate::intellisense::Assist::for_entry(
+                &self.inner.ctx,
+                &entry,
+                viscas_engine::Scope::Expression,
+            );
+            a.install_keys();
+            a
+        });
         let updating = Rc::new(Cell::new(false));
         let local_err: Rc<RefCell<Option<String>>> = Rc::default();
         let set = Rc::new(set);
@@ -685,17 +696,24 @@ impl Inspector {
                     },
                 );
             }
-            let attrs = pango::AttrList::new();
             let text = e.text();
-            for er in &errors {
-                if let Some((s, en)) = er.span.and_then(|sp| model::clamp_span(&text, sp)) {
-                    let mut a = pango::AttrInt::new_underline(pango::Underline::Error);
-                    a.set_start_index(s as u32);
-                    a.set_end_index(en as u32);
-                    attrs.insert(a);
+            let marks: Vec<(usize, usize)> = errors
+                .iter()
+                .filter_map(|er| er.span.and_then(|sp| model::clamp_span(&text, sp)))
+                .collect();
+            match &assist {
+                Some(a) => a.set_external_marks(marks),
+                None => {
+                    let attrs = pango::AttrList::new();
+                    for (s, en) in marks {
+                        let mut a = pango::AttrInt::new_underline(pango::Underline::Error);
+                        a.set_start_index(s as u32);
+                        a.set_end_index(en as u32);
+                        attrs.insert(a);
+                    }
+                    e.set_attributes(&attrs);
                 }
             }
-            e.set_attributes(&attrs);
             if errors.is_empty() {
                 error.set_visible(false);
                 e.remove_css_class("error");
