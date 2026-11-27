@@ -54,6 +54,10 @@ use rank::Ranked;
 
 /// Delay between the last keystroke and diagnostics / preview.
 const DEBOUNCE: Duration = Duration::from_millis(150);
+/// Scenes with more nodes than this debounce completion refreshes.
+const LARGE_SCENE: usize = 300;
+/// Debounce of completion refreshes on large scenes.
+const REFRESH_DEBOUNCE: Duration = Duration::from_millis(30);
 /// A preview still running after this is cancelled.
 const PREVIEW_TIMEOUT: Duration = Duration::from_millis(400);
 /// Squiggle color of warnings (themes have no warning color).
@@ -108,6 +112,12 @@ struct Inner {
     preview_timer: RefCell<Option<glib::SourceId>>,
     preview_cancel: RefCell<Option<Arc<AtomicBool>>>,
     generation: Cell<u64>,
+    /// A preview evaluation is running on the worker.
+    preview_running: Cell<bool>,
+    /// The latest input waiting for the worker.
+    preview_pending: RefCell<Option<(String, viscas_engine::PreviewTask)>>,
+    /// Pending debounced completion refresh (large scenes).
+    refresh_timer: RefCell<Option<glib::SourceId>>,
 }
 
 /// Assistance attached to one math input. Cloning yields a handle to the
@@ -155,6 +165,9 @@ impl Assist {
                 preview_timer: RefCell::default(),
                 preview_cancel: RefCell::default(),
                 generation: Cell::new(0),
+                preview_running: Cell::new(false),
+                preview_pending: RefCell::default(),
+                refresh_timer: RefCell::default(),
             }),
         };
         assist.connect();
@@ -340,9 +353,34 @@ impl Assist {
             .nth(caret.wrapping_sub(1))
             .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':');
         if self.popup_open() || (grew && !own && ident_before && self.features().popup) {
-            self.refresh_completions(false);
+            self.schedule_refresh();
         }
         self.refresh_hint();
+    }
+
+    /// Refreshes the popup now, or after a short pause on large scenes
+    /// (fast typing then costs one refresh, not one per key).
+    fn schedule_refresh(&self) {
+        if let Some(id) = self.inner.refresh_timer.take() {
+            id.remove();
+        }
+        let big = self
+            .inner
+            .ctx
+            .engine()
+            .with(|e| e.scene().iter().count() > LARGE_SCENE);
+        if !big {
+            self.refresh_completions(false);
+            return;
+        }
+        let weak = self.downgrade();
+        let id = glib::timeout_add_local_once(REFRESH_DEBOUNCE, move || {
+            if let Some(a) = Assist::from_weak(&weak) {
+                a.inner.refresh_timer.take();
+                a.refresh_completions(false);
+            }
+        });
+        *self.inner.refresh_timer.borrow_mut() = Some(id);
     }
 
     fn on_cursor_moved(&self) {
@@ -1004,6 +1042,18 @@ impl Assist {
         let Some(task) = self.inner.ctx.engine().with(|e| e.preview_task(&text)) else {
             return;
         };
+        // One evaluation at a time: a newer input waits in the slot (the
+        // running one was cancelled by `schedule_preview`) and replaces
+        // any older waiting one.
+        if self.inner.preview_running.get() {
+            *self.inner.preview_pending.borrow_mut() = Some((text, task));
+            return;
+        }
+        self.start_preview(text, task);
+    }
+
+    fn start_preview(&self, text: String, task: viscas_engine::PreviewTask) {
+        self.inner.preview_running.set(true);
         let cancel = Arc::new(AtomicBool::new(false));
         *self.inner.preview_cancel.borrow_mut() = Some(cancel.clone());
         let generation = self.inner.generation.get();
@@ -1017,6 +1067,12 @@ impl Assist {
             let Some(a) = Assist::from_weak(&weak) else {
                 return;
             };
+            a.inner.preview_running.set(false);
+            let pending = a.inner.preview_pending.take();
+            if let Some((t, task)) = pending {
+                a.start_preview(t, task);
+                return;
+            }
             if a.inner.generation.get() != generation || a.inner.field.text() != text {
                 return;
             }
