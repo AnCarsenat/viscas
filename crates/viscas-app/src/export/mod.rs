@@ -640,10 +640,10 @@ impl CommandProvider for ExportCommands {
         }
         let weak = ctx.downgrade();
         out.push(Command {
-            id: "export.box".to_owned(),
+            id: "viewport.export-box".to_owned(),
             title: "Export Box Region… (drag in the viewport)".to_owned(),
             category: "Export",
-            shortcut: Some("Shift+E".to_owned()),
+            shortcut: crate::keymap::live::label("viewport.export-box"),
             run: Rc::new(move || {
                 if weak.upgrade().is_some() {
                     pick::arm_box();

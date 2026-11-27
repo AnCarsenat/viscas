@@ -382,7 +382,12 @@ impl Viewport {
         view_menu.append_section(None, &hint);
         let export = gio::Menu::new();
         export.append(Some("Export View…"), Some("vp.export"));
-        export.append(Some("Export Box Region… (Shift+E)"), Some("vp.export-box"));
+        let export_box = gio::MenuItem::new(Some("Export Box Region…"), Some("vp.export-box"));
+        export_box.set_attribute_value(
+            crate::keymap::live::KEYMAP_ID,
+            Some(&"viewport.export-box".to_variant()),
+        );
+        export.append_item(&export_box);
         export.append(Some("Copy View as SVG"), Some("vp.copy::svg"));
         export.append(Some("Copy View as PNG"), Some("vp.copy::png"));
         view_menu.append_section(Some("Export"), &export);
