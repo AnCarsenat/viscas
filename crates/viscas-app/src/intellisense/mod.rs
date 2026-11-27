@@ -92,6 +92,12 @@ struct Inner {
     last_len: Cell<usize>,
     /// An edit made by the assistant itself (no auto-popup after it).
     own_edit: Cell<bool>,
+    /// A key press that types or deletes is being handled (the change it
+    /// makes keeps the snippet session; other edits end it).
+    typing: Cell<bool>,
+    /// The user navigated the popup or opened it explicitly: Enter
+    /// accepts. An auto-opened, untouched popup lets Enter through.
+    engaged: Cell<bool>,
     change_pending: Cell<bool>,
     snippet: RefCell<Option<SnippetSession>>,
     /// Diagnostics and the text they belong to.
@@ -139,6 +145,8 @@ impl Assist {
                 items: RefCell::default(),
                 start: Cell::new(0),
                 own_edit: Cell::new(false),
+                typing: Cell::new(false),
+                engaged: Cell::new(false),
                 change_pending: Cell::new(false),
                 snippet: RefCell::default(),
                 diags: RefCell::default(),
@@ -194,8 +202,8 @@ impl Assist {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = self.downgrade();
-        keys.connect_key_pressed(move |_, key, _, mods| match Assist::from_weak(&weak) {
-            Some(a) => a.on_key(key, mods),
+        keys.connect_key_pressed(move |_, key, code, mods| match Assist::from_weak(&weak) {
+            Some(a) => a.on_key(key, code, mods),
             None => glib::Propagation::Proceed,
         });
         self.inner.field.widget().add_controller(keys);
@@ -306,8 +314,14 @@ impl Assist {
         let grew = len > self.inner.last_len.get();
         self.inner.last_len.set(len);
         let own = self.inner.own_edit.replace(false);
+        let typing = self.inner.typing.replace(false);
         {
             let mut snip = self.inner.snippet.borrow_mut();
+            // Foreign edits (history recall, undo, a model sync) make the
+            // placeholder offsets meaningless.
+            if !own && !typing {
+                *snip = None;
+            }
             if let Some(s) = snip.as_mut()
                 && !s.update(len, caret)
             {
@@ -350,24 +364,49 @@ impl Assist {
 
     /// Handles a key press first (call it from the editor's capture
     /// controller before its own bindings). Returns `Stop` when consumed.
-    pub fn on_key(&self, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
+    pub fn on_key(
+        &self,
+        key: gdk::Key,
+        keycode: u32,
+        mods: gdk::ModifierType,
+    ) -> glib::Propagation {
         let stop = glib::Propagation::Stop;
-        let action = text_action(key, mods);
+        let go = glib::Propagation::Proceed;
+        let action = text_action(key, keycode, mods);
         if self.popup_open() {
+            let has_items = !self.inner.items.borrow().is_empty();
             match action {
-                Some(TextAction::Up) => self.move_selection(-1),
-                Some(TextAction::Down) => self.move_selection(1),
-                Some(TextAction::PageUp) => self.move_selection(-8),
-                Some(TextAction::PageDown) => self.move_selection(8),
-                Some(TextAction::Accept | TextAction::NextField | TextAction::PrevField) => {
+                Some(TextAction::Up) => self.navigate(-1),
+                Some(TextAction::Down) => self.navigate(1),
+                Some(TextAction::PageUp) => self.navigate(-8),
+                Some(TextAction::PageDown) => self.navigate(8),
+                Some(TextAction::NextField | TextAction::PrevField) if has_items => {
                     self.accept_selected();
                 }
+                Some(TextAction::Accept) if self.inner.engaged.get() && has_items => {
+                    self.accept_selected();
+                }
+                Some(TextAction::Accept) => {
+                    // Untouched auto-popup: Enter evaluates / commits.
+                    self.hide_popup();
+                    return go;
+                }
                 Some(TextAction::Dismiss) => self.hide_popup(),
+                _ if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) => {
+                    // Shift+Enter and friends never accept.
+                    self.hide_popup();
+                    return go;
+                }
                 _ => return self.on_key_closed(key, mods, action),
             }
             return stop;
         }
         self.on_key_closed(key, mods, action)
+    }
+
+    fn navigate(&self, delta: i32) {
+        self.inner.engaged.set(true);
+        self.move_selection(delta);
     }
 
     /// [`Assist::on_key`] when the completion popup is closed.
@@ -385,7 +424,9 @@ impl Assist {
             || mods.contains(gdk::ModifierType::SUPER_MASK);
         match action {
             Some(TextAction::Complete) => {
-                self.refresh_completions(true);
+                if self.refresh_completions(true) == 0 {
+                    self.inner.field.widget().error_bell();
+                }
                 return stop;
             }
             Some(TextAction::QuickFix) => {
@@ -394,50 +435,56 @@ impl Assist {
                 }
                 return stop;
             }
-            _ => {}
-        }
-        if ctrl || alt {
-            return go;
-        }
-        match key {
-            _ if matches!(action, Some(TextAction::NextField | TextAction::PrevField))
-                && self.inner.snippet.borrow().is_some() =>
+            Some(TextAction::NextField | TextAction::PrevField)
+                if self.inner.snippet.borrow().is_some() =>
             {
                 self.snippet_jump(action == Some(TextAction::PrevField));
                 return stop;
             }
-            Key::Tab if self.has_fragment() => {
-                self.refresh_completions(true);
-                let only = self.inner.items.borrow().len() == 1;
-                if only {
-                    self.accept(0);
-                }
-                return stop;
+            Some(TextAction::NextField) if self.has_fragment() => {
+                // Nothing to offer: Tab moves focus as usual.
+                return match self.refresh_completions(true) {
+                    0 => go,
+                    1 => {
+                        self.accept(0);
+                        stop
+                    }
+                    _ => stop,
+                };
             }
-            _ if action == Some(TextAction::Dismiss)
-                && (self.inner.snippet.borrow().is_some() || self.hint_open()) =>
+            Some(TextAction::Dismiss)
+                if self.inner.snippet.borrow().is_some() || self.hint_open() =>
             {
                 self.inner.snippet.borrow_mut().take();
                 self.hide_hint();
                 return stop;
             }
-            Key::BackSpace if self.features().pairs => {
-                let f = &self.inner.field;
-                if let Some(e) = edit::on_backspace(&f.text(), f.cursor(), f.selection()) {
-                    self.apply_edit(&e);
-                    return stop;
-                }
-            }
             _ => {}
+        }
+        if ctrl || alt {
+            return go;
+        }
+        // Keys that type or delete keep a snippet session alive.
+        let types = key.to_unicode().is_some_and(|c| !c.is_control())
+            || matches!(key, Key::BackSpace | Key::Delete | Key::KP_Delete);
+        self.inner.typing.set(types);
+        // Never pair over a pending dead key / Compose sequence: the key
+        // belongs to the sequence.
+        if !self.features().pairs || crate::compose::is_pending() {
+            return go;
+        }
+        if key == Key::BackSpace {
+            let f = &self.inner.field;
+            if let Some(e) = edit::on_backspace(&f.text(), f.cursor(), f.selection()) {
+                self.apply_edit(&e);
+                return stop;
+            }
         }
         if let Some(ch) = key.to_unicode()
             && matches!(ch, '(' | '[' | '{' | ')' | ']' | '}' | '|')
-            && self.features().pairs
         {
             let f = &self.inner.field;
             if let Some(e) = edit::on_char(&f.text(), f.cursor(), f.selection(), ch) {
-                // A closer typed over the auto-inserted one ends the
-                // snippet's last placeholder naturally.
                 self.apply_edit(&e);
                 return stop;
             }
@@ -469,10 +516,13 @@ impl Assist {
 
     // ---------------------------------------------------- completion
 
-    fn refresh_completions(&self, force: bool) {
+    /// Recomputes the popup; returns how many items it shows. `force`
+    /// (Ctrl+Space, Tab) also shows every name for an empty fragment and
+    /// engages the popup (Enter accepts).
+    fn refresh_completions(&self, force: bool) -> usize {
         let field = &self.inner.field;
         if !field.widget().is_mapped() {
-            return;
+            return 0;
         }
         let text = field.text();
         let caret = char_to_byte(&text, field.cursor());
@@ -486,13 +536,17 @@ impl Assist {
         let ranked = rank::rank(&set.fragment, items);
         if ranked.is_empty() || (!force && rank::is_redundant(&set.fragment, &ranked)) {
             self.hide_popup();
-            if force && ranked.is_empty() {
-                field.widget().error_bell();
-            }
-            return;
+            return 0;
+        }
+        if force {
+            self.inner.engaged.set(true);
+        } else if !self.popup_open() {
+            self.inner.engaged.set(false);
         }
         self.inner.start.set(byte_to_char(&text, set.start));
+        let n = ranked.len();
         self.show_popup(ranked);
+        n
     }
 
     fn ensure_popup(&self) {
@@ -999,8 +1053,8 @@ impl Assist {
     }
 }
 
-/// Keyboard actions of math inputs. Every binding goes through
-/// [`text_action`], the one place to hand over to a keymap registry.
+/// Keyboard actions of math inputs, bound in the keymap's Text Editing
+/// context ([`register_keys`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextAction {
     /// Open the completion popup (Ctrl+Space).
@@ -1011,9 +1065,9 @@ pub enum TextAction {
     Down,
     PageUp,
     PageDown,
-    /// Accept the selected completion (Enter; Tab also accepts).
+    /// Accept the completion the user picked (Enter).
     Accept,
-    /// Next snippet placeholder / accept (Tab).
+    /// Next snippet placeholder; accepts an open completion (Tab).
     NextField,
     /// Previous snippet placeholder (Shift+Tab).
     PrevField,
@@ -1021,35 +1075,92 @@ pub enum TextAction {
     Dismiss,
 }
 
-/// The action `key` with `mods` triggers in a math input.
-pub fn text_action(key: gdk::Key, mods: gdk::ModifierType) -> Option<TextAction> {
-    use gdk::Key;
-    let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
-    let alt =
-        mods.contains(gdk::ModifierType::ALT_MASK) || mods.contains(gdk::ModifierType::SUPER_MASK);
-    let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
-    if alt {
-        return None;
+/// One bindable math-input key: action, keymap id, title, default keys.
+type TextActionSpec = (
+    TextAction,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+);
+
+/// Keymap ids, titles and default keys of the [`TextAction`]s.
+pub const TEXT_ACTIONS: [TextActionSpec; 10] = [
+    (
+        TextAction::Complete,
+        "text.complete",
+        "Show Completions",
+        &["Ctrl+space"],
+    ),
+    (
+        TextAction::QuickFix,
+        "text.quick-fix",
+        "Apply Quick Fix",
+        &["Ctrl+period"],
+    ),
+    (
+        TextAction::Up,
+        "text.completion-up",
+        "Previous Completion",
+        &["Up"],
+    ),
+    (
+        TextAction::Down,
+        "text.completion-down",
+        "Next Completion",
+        &["Down"],
+    ),
+    (
+        TextAction::PageUp,
+        "text.completion-page-up",
+        "Completions Page Up",
+        &["Page_Up"],
+    ),
+    (
+        TextAction::PageDown,
+        "text.completion-page-down",
+        "Completions Page Down",
+        &["Page_Down"],
+    ),
+    (
+        TextAction::Accept,
+        "text.accept-completion",
+        "Accept Completion",
+        &["Return", "KP_Enter"],
+    ),
+    (
+        TextAction::NextField,
+        "text.next-placeholder",
+        "Next Placeholder / Accept",
+        &["Tab"],
+    ),
+    (
+        TextAction::PrevField,
+        "text.previous-placeholder",
+        "Previous Placeholder",
+        &["Shift+ISO_Left_Tab", "Shift+Tab"],
+    ),
+    (
+        TextAction::Dismiss,
+        "text.dismiss",
+        "Dismiss Completions",
+        &["Escape"],
+    ),
+];
+
+/// Registers the math-input keys with the keymap (call at startup,
+/// before windows are built).
+pub fn register_keys() {
+    for (_, id, title, defaults) in TEXT_ACTIONS {
+        crate::keymap::registry::register_text_action(id, title, defaults);
     }
-    if ctrl {
-        return match key {
-            Key::space | Key::nobreakspace => Some(TextAction::Complete),
-            Key::period | Key::KP_Decimal | Key::semicolon => Some(TextAction::QuickFix),
-            _ => None,
-        };
-    }
-    match key {
-        Key::Up | Key::KP_Up => Some(TextAction::Up),
-        Key::Down | Key::KP_Down => Some(TextAction::Down),
-        Key::Page_Up => Some(TextAction::PageUp),
-        Key::Page_Down => Some(TextAction::PageDown),
-        Key::Return | Key::KP_Enter => Some(TextAction::Accept),
-        Key::ISO_Left_Tab => Some(TextAction::PrevField),
-        Key::Tab if shift => Some(TextAction::PrevField),
-        Key::Tab => Some(TextAction::NextField),
-        Key::Escape => Some(TextAction::Dismiss),
-        _ => None,
-    }
+}
+
+/// The action this key press triggers in a math input.
+pub fn text_action(key: gdk::Key, keycode: u32, mods: gdk::ModifierType) -> Option<TextAction> {
+    TEXT_ACTIONS
+        .iter()
+        .find(|(_, id, _, _)| crate::keymap::live::matches(id, key, keycode, mods))
+        .map(|(a, ..)| *a)
 }
 
 /// Ghost text for a preview: `= exact`, plus `≈ decimal` when it differs;
@@ -1148,27 +1259,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registered_keys_do_not_conflict() {
+        use crate::keymap::model::{KeymapPrefs, Preset};
+        register_keys();
+        let list = crate::keymap::registry::specs();
+        for preset in Preset::ALL {
+            let mut km = KeymapPrefs::default();
+            km.set_preset(preset, &list);
+            let found = km.conflicts(&list);
+            assert!(found.is_empty(), "{preset:?}: {found:?}");
+        }
+    }
+
+    #[test]
     fn key_bindings() {
         use gdk::{Key, ModifierType as M};
+        register_keys();
+        let a = |k, m| text_action(k, 0, m);
+        assert_eq!(a(Key::space, M::CONTROL_MASK), Some(TextAction::Complete));
+        assert_eq!(a(Key::space, M::empty()), None, "Space types");
+        assert_eq!(a(Key::period, M::CONTROL_MASK), Some(TextAction::QuickFix));
         assert_eq!(
-            text_action(Key::space, M::CONTROL_MASK),
-            Some(TextAction::Complete)
-        );
-        assert_eq!(text_action(Key::space, M::empty()), None, "Space types");
-        assert_eq!(
-            text_action(Key::period, M::CONTROL_MASK),
-            Some(TextAction::QuickFix)
-        );
-        assert_eq!(
-            text_action(Key::Tab, M::SHIFT_MASK),
+            a(Key::ISO_Left_Tab, M::SHIFT_MASK),
             Some(TextAction::PrevField)
         );
+        assert_eq!(a(Key::Tab, M::empty()), Some(TextAction::NextField));
+        assert_eq!(a(Key::Return, M::empty()), Some(TextAction::Accept));
         assert_eq!(
-            text_action(Key::Tab, M::empty()),
-            Some(TextAction::NextField)
+            a(Key::Return, M::SHIFT_MASK),
+            None,
+            "Shift+Enter never accepts"
         );
-        assert_eq!(text_action(Key::dead_circumflex, M::empty()), None);
-        assert_eq!(text_action(Key::Up, M::ALT_MASK), None);
+        assert_eq!(a(Key::dead_circumflex, M::empty()), None);
     }
 
     #[test]

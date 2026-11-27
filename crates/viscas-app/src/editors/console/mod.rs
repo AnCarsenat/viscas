@@ -606,7 +606,7 @@ impl Console {
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let stop = glib::Propagation::Stop;
-        if self.inner.assist.on_key(key, mods) == stop {
+        if self.inner.assist.on_key(key, keycode, mods) == stop {
             return stop;
         }
         // Rebindable console keys (Preferences ▸ Keymap ▸ Console).

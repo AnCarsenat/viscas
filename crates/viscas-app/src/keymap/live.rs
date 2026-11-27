@@ -305,7 +305,6 @@ pub fn action_for(
 }
 
 /// Whether this key press is bound to action `id`.
-#[allow(dead_code, reason = "matching hook for text-editing features")]
 pub fn matches(id: &str, key: gdk::Key, keycode: u32, state: gdk::ModifierType) -> bool {
     let chords = event_chords(key, keycode, state);
     bindings(id).iter().any(|b| chords.contains(b))

@@ -612,11 +612,11 @@ impl Expressions {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let w = weak.clone();
-        keys.connect_key_pressed(move |_, key, _, mods| {
+        keys.connect_key_pressed(move |_, key, code, mods| {
             let Some(ed) = Expressions::from_weak(&w) else {
                 return glib::Propagation::Proceed;
             };
-            ed.on_row_key(id, key, mods)
+            ed.on_row_key(id, key, code, mods)
         });
         row.entry.add_controller(keys);
 
@@ -739,13 +739,19 @@ impl Expressions {
         row.root.add_controller(drop);
     }
 
-    fn on_row_key(&self, id: NodeId, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
+    fn on_row_key(
+        &self,
+        id: NodeId,
+        key: gdk::Key,
+        code: u32,
+        mods: gdk::ModifierType,
+    ) -> glib::Propagation {
         use gdk::Key;
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let Some(row) = self.row(id) else {
             return glib::Propagation::Proceed;
         };
-        if row.assist.on_key(key, mods) == glib::Propagation::Stop {
+        if row.assist.on_key(key, code, mods) == glib::Propagation::Stop {
             return glib::Propagation::Stop;
         }
         match key {
@@ -1249,9 +1255,9 @@ impl Expressions {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = self.downgrade();
-        keys.connect_key_pressed(move |_, key, _, mods| {
+        keys.connect_key_pressed(move |_, key, code, mods| {
             if let Some(ed) = Expressions::from_weak(&weak)
-                && ed.inner.add_assist.on_key(key, mods) == glib::Propagation::Stop
+                && ed.inner.add_assist.on_key(key, code, mods) == glib::Propagation::Stop
             {
                 return glib::Propagation::Stop;
             }

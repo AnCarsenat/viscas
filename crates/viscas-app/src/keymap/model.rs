@@ -423,6 +423,14 @@ impl Context {
                 (Context::Console, Context::TextEditing) | (Context::TextEditing, Context::Console)
             )
     }
+
+    /// Whether a binding of `self` deliberately wins over the same key in
+    /// `other`: text-editing keys override Window keys while typing (e.g.
+    /// Ctrl+Space completes instead of maximizing the area). Such pairs
+    /// are overrides, not conflicts.
+    pub fn shadows(self, other: Context) -> bool {
+        self == Context::TextEditing && other == Context::Window
+    }
 }
 
 /// Keymap preset: the set of default bindings overrides apply to.
@@ -673,6 +681,25 @@ impl KeymapPrefs {
         specs
             .iter()
             .filter(|s| s.id != id && s.context.overlaps(context))
+            .filter(|s| !s.context.shadows(context) && !context.shadows(s.context))
+            .filter(|s| self.bindings_of(s).contains(chord))
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// Ids of the actions bound to `chord` that `id` (of `context`)
+    /// overrides, or that override it ([`Context::shadows`]): intentional,
+    /// shown as a note rather than a conflict.
+    pub fn overrides_with(
+        &self,
+        specs: &[ActionSpec],
+        id: &str,
+        context: Context,
+        chord: &Chord,
+    ) -> Vec<String> {
+        specs
+            .iter()
+            .filter(|s| s.id != id && (s.context.shadows(context) || context.shadows(s.context)))
             .filter(|s| self.bindings_of(s).contains(chord))
             .map(|s| s.id.clone())
             .collect()
@@ -932,6 +959,21 @@ mod tests {
             found[0].ids,
             vec!["win.save".to_owned(), "win.undo".to_owned()]
         );
+        // A text-editing key over a Window key is an override.
+        km.assign(&s[6], None, Some(c("Ctrl+P")));
+        assert!(
+            km.conflicts_with(&s, "text.x", Context::TextEditing, &c("Ctrl+P"))
+                .is_empty()
+        );
+        assert_eq!(
+            km.overrides_with(&s, "text.x", Context::TextEditing, &c("Ctrl+P")),
+            vec!["win.palette".to_owned()]
+        );
+        assert_eq!(
+            km.overrides_with(&s, "win.palette", Context::Window, &c("Ctrl+P")),
+            vec!["text.x".to_owned()]
+        );
+        km.reset("text.x");
         // Console and text editing are active together.
         km.assign(&s[6], None, Some(c("Ctrl+L")));
         assert_eq!(
