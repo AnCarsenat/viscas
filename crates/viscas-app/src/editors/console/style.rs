@@ -195,6 +195,29 @@ popover.completion > contents { padding: 2px; min-width: 260px; }
 .kind-badge.console { color: @vx_console_result; background: alpha(@vx_console_result, 0.12); }
 .kind-badge.builtin { color: @vx_console_prompt; background: alpha(@vx_console_prompt, 0.12); }
 .kind-badge.command { color: @vx_ui_fg; }
+.kind-badge.constant { color: @vx_console_hint; background: alpha(@vx_console_hint, 0.12); }
+
+popover.assist-popup > contents { padding: 0; background-color: @vx_ui_bg1; }
+popover.assist-popup list { background: transparent; }
+popover.assist-popup scrolledwindow { padding: 2px; }
+.assist-doc {
+  padding: 8px 10px;
+  color: @vx_ui_fg;
+  font-size: 11px;
+}
+popover.assist-hint > contents {
+  padding: 3px 8px;
+  background-color: @vx_ui_tooltip_bg;
+  color: @vx_ui_tooltip_fg;
+  border: 1px solid @vx_ui_line;
+}
+.assist-hint-text { font-size: 12px; }
+.assist-ghost {
+  color: alpha(@vx_console_hint, 0.85);
+  font-family: __MONO__;
+  font-size: 12px;
+  font-style: italic;
+}
 
 .expr-list { background-color: @vx_ui_bg1; }
 .expr-row {

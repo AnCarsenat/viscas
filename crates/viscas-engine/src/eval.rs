@@ -210,7 +210,7 @@ impl SceneEvaluator {
         d
     }
 
-    fn live_env(&self) -> Env {
+    pub(crate) fn live_env(&self) -> Env {
         let mut env = Env::new();
         env.set_resolver(Some(Arc::new(LiveResolver(self.live.clone()))));
         env

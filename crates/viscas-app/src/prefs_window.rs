@@ -992,6 +992,14 @@ fn viewport_page(b: &Binder) -> gtk::Box {
     page
 }
 
+/// A labelled preference checkbox: label, tooltip, getter, setter.
+type Toggle = (
+    &'static str,
+    &'static str,
+    fn(&Preferences) -> bool,
+    fn(&mut Preferences, bool),
+);
+
 fn editing_page(b: &Binder) -> gtk::Box {
     let page = page();
     let undo = Panel::new("Undo", true);
@@ -1047,6 +1055,40 @@ fn editing_page(b: &Binder) -> gtk::Box {
     ));
     console.append(&defs);
     page.append(console.widget());
+
+    let assist = Panel::new("Assistance", true);
+    let toggles: [Toggle; 4] = [
+        (
+            "Completion popup while typing",
+            "Suggest functions, constants and names as you type (Ctrl+Space always opens it)",
+            |p| p.editing.auto_complete_popup,
+            |p, v| p.editing.auto_complete_popup = v,
+        ),
+        (
+            "Auto-pair brackets",
+            "Typing ( [ { or | inserts the closing one; Backspace removes an empty pair",
+            |p| p.editing.auto_pair_brackets,
+            |p, v| p.editing.auto_pair_brackets = v,
+        ),
+        (
+            "Inline value preview",
+            "The console shows the value of a simple input as ghost text before Enter",
+            |p| p.editing.inline_preview,
+            |p, v| p.editing.inline_preview = v,
+        ),
+        (
+            "Live diagnostics",
+            "Underline parse errors and unknown names while typing (Ctrl+. applies the fix)",
+            |p| p.editing.live_diagnostics,
+            |p, v| p.editing.live_diagnostics = v,
+        ),
+    ];
+    for (label, tip, get, set) in toggles {
+        let check = b.check(label, get, set);
+        check.set_tooltip_text(Some(tip));
+        assist.append(&check);
+    }
+    page.append(assist.widget());
     page
 }
 

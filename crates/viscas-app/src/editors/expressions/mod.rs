@@ -22,12 +22,14 @@ use std::rc::{Rc, Weak};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use viscas_core::syntax::Span;
+use viscas_engine::Scope;
 use viscas_scene::{Color as SceneColor, NodeId, NodeKind, SceneEvent, SourceField, Status};
 
 use crate::ctx::AppCtx;
 use crate::doc::{DocEvent, Subscription};
 use crate::editors::console::{header_menu_button, render, style};
 use crate::editors::pick_icon;
+use crate::intellisense::Assist;
 use crate::theme::model::{Color as UiColor, trim_float};
 use crate::widgets::scrub::{ScrubField, ScrubSpec};
 use crate::widgets::swatch::ColorSwatch;
@@ -98,6 +100,9 @@ struct Row {
     swatch: ColorSwatch,
     eye: gtk::Button,
     entry: gtk::Entry,
+    /// Completion, signature help, diagnostics (owns the entry's
+    /// underline attributes).
+    assist: Assist,
     value: gtk::Label,
     error: gtk::Label,
     slider: RefCell<Option<SliderUi>>,
@@ -136,6 +141,7 @@ struct Inner {
     list: gtk::Box,
     empty: gtk::Box,
     add_entry: gtk::Entry,
+    add_assist: Assist,
     add_error: gtk::Label,
     rows: RefCell<HashMap<NodeId, Rc<Row>>>,
     order: RefCell<Vec<NodeId>>,
@@ -185,6 +191,7 @@ impl Expressions {
                 .build(),
         );
         add_line.append(&add_entry);
+        let add_assist = Assist::for_entry(ctx, &add_entry, Scope::Expression);
         add_row.append(&add_line);
         add_row.append(&add_error);
 
@@ -212,6 +219,7 @@ impl Expressions {
                 list,
                 empty,
                 add_entry,
+                add_assist,
                 add_error,
                 rows: RefCell::default(),
                 order: RefCell::default(),
@@ -499,6 +507,7 @@ impl Expressions {
         root.append(&value);
         root.append(&error);
 
+        let assist = Assist::for_entry(&self.inner.ctx, &entry, Scope::Expression);
         let row = Rc::new(Row {
             id,
             root,
@@ -506,6 +515,7 @@ impl Expressions {
             swatch,
             eye,
             entry,
+            assist,
             value,
             error,
             slider: RefCell::new(None),
@@ -602,11 +612,11 @@ impl Expressions {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let w = weak.clone();
-        keys.connect_key_pressed(move |_, key, _, mods| {
+        keys.connect_key_pressed(move |_, key, code, mods| {
             let Some(ed) = Expressions::from_weak(&w) else {
                 return glib::Propagation::Proceed;
             };
-            ed.on_row_key(id, key, mods)
+            ed.on_row_key(id, key, code, mods)
         });
         row.entry.add_controller(keys);
 
@@ -729,12 +739,21 @@ impl Expressions {
         row.root.add_controller(drop);
     }
 
-    fn on_row_key(&self, id: NodeId, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
+    fn on_row_key(
+        &self,
+        id: NodeId,
+        key: gdk::Key,
+        code: u32,
+        mods: gdk::ModifierType,
+    ) -> glib::Propagation {
         use gdk::Key;
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let Some(row) = self.row(id) else {
             return glib::Propagation::Proceed;
         };
+        if row.assist.on_key(key, code, mods) == glib::Propagation::Stop {
+            return glib::Propagation::Stop;
+        }
         match key {
             Key::Up | Key::Down if !ctrl => {
                 if row.dirty.get() && !self.commit(id) {
@@ -1039,34 +1058,13 @@ impl Expressions {
     /// Wavy underline of the error span inside the entry, only while it
     /// shows the text the span was reported for.
     fn apply_underline(&self, row: &Row) {
-        let attrs = pango::AttrList::new();
         let current = row.entry.text();
         let range = row
             .underline
             .borrow()
             .as_ref()
             .and_then(|(text, span)| underline_range(text, current.as_str(), *span));
-        if let Some((start, end)) = range {
-            let color = self
-                .inner
-                .ctx
-                .preferences()
-                .with(|p| p.effective_theme().console.error);
-            let mut u = pango::AttrInt::new_underline(pango::Underline::Error);
-            u.set_start_index(start as u32);
-            u.set_end_index(end as u32);
-            attrs.insert(u);
-            let scale = |v: u8| u16::from(v) * 257;
-            let mut uc = pango::AttrColor::new_underline_color(
-                scale(color.r),
-                scale(color.g),
-                scale(color.b),
-            );
-            uc.set_start_index(start as u32);
-            uc.set_end_index(end as u32);
-            attrs.insert(uc);
-        }
-        row.entry.set_attributes(&attrs);
+        row.assist.set_external_marks(range.into_iter().collect());
     }
 
     fn sync_slider(&self, row: &Rc<Row>, data: &RowData) {
@@ -1257,7 +1255,12 @@ impl Expressions {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = self.downgrade();
-        keys.connect_key_pressed(move |_, key, _, _| {
+        keys.connect_key_pressed(move |_, key, code, mods| {
+            if let Some(ed) = Expressions::from_weak(&weak)
+                && ed.inner.add_assist.on_key(key, code, mods) == glib::Propagation::Stop
+            {
+                return glib::Propagation::Stop;
+            }
             if key == gdk::Key::Up
                 && let Some(ed) = Expressions::from_weak(&weak)
                 && let Some(last) = ed.inner.order.borrow().last().copied()

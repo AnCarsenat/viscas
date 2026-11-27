@@ -24,7 +24,6 @@ pub fn register(spec: ActionSpec) {
 
 /// Registers a "Text Editing" action with default keys such as
 /// `"Ctrl+space"`. Handlers check it with [`super::live::matches`].
-#[allow(dead_code, reason = "registration hook for text-editing features")]
 pub fn register_text_action(id: &str, title: &str, defaults: &[&str]) {
     register(ActionSpec::new(
         id,
@@ -230,11 +229,17 @@ mod tests {
         let spec = list.iter().find(|s| s.id == "text.test-complete").unwrap();
         assert_eq!(spec.context, Context::TextEditing);
         assert_eq!(spec.defaults, vec![Chord::parse("Ctrl+space").unwrap()]);
-        // Ctrl+Space is also Maximize Area: a Window key fires in text
-        // fields too, so the two conflict.
+        // Ctrl+Space is also Maximize Area: the text-editing key
+        // overrides it while typing, which is not a conflict.
         let km = KeymapPrefs::default();
         let found = km.conflicts(&list);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].ids.contains(&"win.maximize-area".to_owned()));
+        assert!(found.is_empty(), "{found:?}");
+        let over = km.overrides_with(
+            &list,
+            "text.test-complete",
+            Context::TextEditing,
+            &Chord::parse("Ctrl+space").unwrap(),
+        );
+        assert_eq!(over, vec!["win.maximize-area".to_owned()]);
     }
 }

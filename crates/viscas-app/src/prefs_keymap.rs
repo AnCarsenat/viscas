@@ -404,6 +404,7 @@ impl Editor {
             _ => None,
         };
         let mut conflicts: Vec<(Chord, Vec<String>)> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         for (i, chord) in bindings.iter().enumerate() {
             let others = km.conflicts_with(specs, &spec.id, spec.context, chord);
             let capturing = capture_index == Some(Some(i));
@@ -426,8 +427,13 @@ impl Editor {
                 )));
                 conflicts.push((chord.clone(), others));
             } else {
-                button
-                    .set_tooltip_text(Some("Click to change · Backspace while capturing removes"));
+                let over = km.overrides_with(specs, &spec.id, spec.context, chord);
+                let note = override_note(spec, specs, &over);
+                button.set_tooltip_text(Some(&match &note {
+                    Some(n) => format!("{n} · click to change"),
+                    None => "Click to change · Backspace while capturing removes".to_owned(),
+                }));
+                notes.extend(note);
             }
             row.append(&button);
             let remove = icon_button("window-close-symbolic", "Remove this binding");
@@ -472,6 +478,15 @@ impl Editor {
         }
         for (chord, others) in conflicts {
             row.append(&self.conflict_chip(spec, specs, &chord, &others));
+        }
+        for note in notes {
+            row.append(
+                &gtk::Label::builder()
+                    .label(format!("ⓘ {note}"))
+                    .css_classes(["dim", "keymap-override"])
+                    .valign(gtk::Align::Center)
+                    .build(),
+            );
         }
         let reset = icon_button("edit-undo-symbolic", "");
         let defaults: Vec<String> = spec
@@ -889,6 +904,21 @@ fn export_keymap(button: &gtk::Button, ctx: &AppCtx) {
             }
         },
     );
+}
+
+/// Info note for an intentional override ([`crate::keymap::model::Context::shadows`]).
+fn override_note(spec: &ActionSpec, specs: &[ActionSpec], over: &[String]) -> Option<String> {
+    if over.is_empty() {
+        return None;
+    }
+    let names = titles(specs, over);
+    Some(
+        if spec.context == crate::keymap::model::Context::TextEditing {
+            format!("overrides {names} while typing")
+        } else {
+            format!("{names} takes this key while typing")
+        },
+    )
 }
 
 #[cfg(test)]

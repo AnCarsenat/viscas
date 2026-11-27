@@ -58,6 +58,7 @@ pub fn build() -> gtk::Application {
 fn setup(app: &gtk::Application, ctx: &AppCtx) {
     install_icon();
     settings::init(ctx);
+    crate::intellisense::register_keys();
     crate::keymap::live::bind(ctx);
     crate::doc_ui::connect_prefs(ctx);
 
