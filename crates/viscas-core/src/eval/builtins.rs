@@ -151,6 +151,11 @@ pub static BUILTINS: &[Builtin] = &[
     c!("roots", 1, 2, sy::b_roots, &[1]),
     c!("subs", 2, 3, sy::b_subs, &[1]),
     c!("steps", 1, 1, sy::b_steps, &[]),
+    c!("integrate", 1, 4, sy::b_integrate, &[1]),
+    c!("limit", 3, 4, sy::b_limit, &[1]),
+    c!("series", 1, 4, sy::b_series, &[1]),
+    c!("summation", 4, 4, sy::b_summation, &[1]),
+    c!("product", 4, 4, sy::b_product, &[1]),
 ];
 
 /// Alternative names: `alias → canonical`.
@@ -169,6 +174,7 @@ pub static ALIASES: &[(&str, &str)] = &[
     ("arccosh", "acosh"),
     ("artanh", "atanh"),
     ("arctanh", "atanh"),
+    ("taylor", "series"),
 ];
 
 struct Table {

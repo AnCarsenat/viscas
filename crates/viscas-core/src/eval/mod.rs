@@ -77,14 +77,14 @@
 //!   (`L.x` = x-coordinates). Lists have no `.length` (use `len(L)`).
 //!   `v.f(args)` calls `f(v, args)` when `f` is not a member
 //!   (`L.sort()`, `L.sum()`).
-//! - **Calculus.** `∑`/`∏` with integer bounds are exact loops. `d/dx`
+//! - **Calculus.** `∑`/`∏` with integer bounds are exact loops; with
+//!   symbolic or infinite bounds they use closed forms. `d/dx`
 //!   and `f'(x)` are symbolic in exact mode (`d/dx x^3 = 3x^2`, evaluated
 //!   exactly at the current value of `x` if it has one), numeric (5-point
 //!   central differences) in `float64` mode or when the body has no
-//!   symbolic derivative. Definite `∫` is numeric (adaptive Gauss–Kronrod
-//!   7/15, infinite bounds by substitution). Indefinite integrals and
-//!   infinite sums need the CAS integration stage (hooks in
-//!   `calculus.rs`).
+//!   symbolic derivative. Indefinite `∫` is symbolic; definite `∫` is exact
+//!   when an antiderivative agrees with the numeric value (adaptive
+//!   Gauss–Kronrod 7/15), numeric otherwise.
 //! - **Units** (`5 km/h to m/s`) report "units are not supported yet".
 //!
 //! # Name resolution
@@ -209,6 +209,8 @@
 //! | `solve(eq, x[, a, b])`, `solve([eqs], [vars])` | exact solving: equations, systems, inequalities |
 //! | `nsolve(eq, x, guess)`, `nsolve(eq, x, a, b)`, `roots(p)` | numeric roots, polynomial roots |
 //! | `steps(expr)` | the CAS rewrite steps of `expr` |
+//! | `integrate(f, x[, a, b])`, `limit(f, x, a[, dir])`, `series(f, x, a, n)` | calculus (`taylor` = `series`) |
+//! | `summation(f, k, a, b)`, `product(f, k, a, b)` | closed-form sums and products |
 
 mod builtins;
 mod calculus;
@@ -222,6 +224,8 @@ mod statement;
 mod symbolic;
 mod value;
 
+#[cfg(test)]
+mod calculus_cas_tests;
 #[cfg(test)]
 mod cas_tests;
 #[cfg(test)]

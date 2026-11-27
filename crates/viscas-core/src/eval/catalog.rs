@@ -684,6 +684,70 @@ static CATALOG: &[FnDoc] = &[
         &[("roots(x^3 - x)", "[-1, 0, 1]")],
         C::Solving,
     ),
+    with_aliases(
+        cas(
+            "integrate",
+            &[
+                "integrate(f, x)",
+                "integrate(f, x, a, b)",
+                "∫ f dx",
+                "∫(a, b) f dx",
+            ],
+            "antiderivative (no constant) or exact definite integral; numeric when no antiderivative is found",
+            &[
+                ("integrate(x^2, x)", "x^3/3"),
+                ("integrate(x e^x, x)", "e^x·(x - 1)"),
+                ("integrate(1/(1 + x^2), x, 0, 1)", "π/4"),
+                ("integrate(e^(-x), x, 0, ∞)", "1"),
+            ],
+            C::Calculus,
+        ),
+        &[],
+    ),
+    cas(
+        "limit",
+        &["limit(f, x, a)", "limit(f, x, a, \"+\")", "limit(f, x, ∞)"],
+        "limit at a point (two-sided or one-sided) or at ±∞; ∞ is a symbol",
+        &[
+            ("limit(sin(x)/x, x, 0)", "1"),
+            ("limit((1 + 1/x)^x, x, ∞)", "e"),
+            ("limit(1/x, x, 0, \"+\")", "∞"),
+        ],
+        C::Calculus,
+    ),
+    with_aliases(
+        cas(
+            "series",
+            &["series(f, x)", "series(f, x, a, n)"],
+            "Taylor (or Laurent) polynomial at a with the terms of order < n (default a = 0, n = 6)",
+            &[
+                ("series(e^x, x, 0, 4)", "x^3/6 + x^2/2 + x + 1"),
+                ("series(sin(x)/x, x, 0, 4)", "-x^2/6 + 1"),
+            ],
+            C::Calculus,
+        ),
+        &["taylor"],
+    ),
+    cas(
+        "summation",
+        &["summation(f, k, a, b)", "∑(k = a, b) f"],
+        "sum with a closed form for symbolic or infinite upper bounds (polynomial, geometric, telescoping)",
+        &[
+            ("summation(k^2, k, 1, n)", "n·(n + 1)(2n + 1)/6"),
+            ("summation(1/2^k, k, 1, ∞)", "1"),
+        ],
+        C::Calculus,
+    ),
+    cas(
+        "product",
+        &["product(f, k, a, b)", "∏(k = a, b) f"],
+        "product with a closed form for symbolic bounds",
+        &[
+            ("product(k, k, 1, 5)", "120"),
+            ("product(2, k, 1, n)", "2^n"),
+        ],
+        C::Calculus,
+    ),
     cas(
         "steps",
         &["steps(expr)"],

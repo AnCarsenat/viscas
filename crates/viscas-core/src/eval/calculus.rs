@@ -4,9 +4,13 @@
 //! Derivatives are symbolic in exact mode (`d/dx x^2 = 2x`, evaluated at
 //! the current value of `x` when it has one) with a numeric fallback
 //! (central finite differences) when the body has no symbolic derivative
-//! and in `float64` (plot) mode. Definite integrals are numeric: adaptive
-//! Gauss–Kronrod (7/15) quadrature, with variable substitution for
-//! infinite bounds; the CAS integration hooks in at the marked places.
+//! and in `float64` (plot) mode. Indefinite integrals are symbolic
+//! ([`crate::cas::integrate`]). Definite integrals are computed
+//! numerically (adaptive Gauss–Kronrod 7/15, infinite bounds by
+//! substitution) and, in exact mode, also from an antiderivative: the
+//! exact value is returned when it agrees with the numeric one. `∑`/`∏`
+//! with symbolic or infinite bounds use closed forms
+//! ([`crate::cas::summation`], [`crate::cas::product`]).
 
 use num_traits::ToPrimitive;
 
@@ -205,14 +209,23 @@ impl Evaluator<'_> {
         var: &str,
         span: Span,
     ) -> EvalResult<Value> {
-        // CAS hook: symbolic antiderivative (and exact definite value).
-        let Some((lo, hi)) = bounds else {
-            return Err(EvalError::unsupported(
-                "indefinite integrals need the CAS (not implemented yet); give bounds: ∫(a, b) f(x) dx",
-                span,
-            ));
-        };
         let var = canonical_name(var).to_string();
+        let Some((lo, hi)) = bounds else {
+            // Indefinite: symbolic antiderivative (no constant).
+            let found = if self.opts.float64 {
+                None
+            } else {
+                self.symbolic_body(&var, body)
+                    .and_then(|f| crate::cas::integrate(&f, &var))
+            };
+            return match found {
+                Some(r) => self.sym_result(r, false, span),
+                None => Err(EvalError::unsupported(
+                    "no antiderivative found; give bounds for a numeric value: ∫(a, b) f(x) dx",
+                    span,
+                )),
+            };
+        };
         let a = self.bound(lo)?;
         let b = self.bound(hi)?;
         if a.is_nan() || b.is_nan() {
@@ -225,7 +238,70 @@ impl Evaluator<'_> {
         } else {
             self.integrate(&var, body, a, b, span)?
         };
+        if !self.opts.float64
+            && let Some(exact) = self.exact_definite(&var, body, lo, hi, v)
+        {
+            return self.sym_result(exact, false, span);
+        }
         Ok(Value::Number(Number::f64(v).at(span)?))
+    }
+
+    /// `body` as a symbolic expression in `var` (symbolic mode).
+    pub(crate) fn symbolic_body(&mut self, var: &str, body: &Expr) -> Option<crate::cas::Sym> {
+        use crate::cas::Sym;
+        let x = Value::Expr(super::value::SymValue::new(Sym::var(var)));
+        let saved = self.symbolic;
+        self.symbolic = true;
+        self.push_scope(vec![(var.to_string(), x)]);
+        let r = self.eval(body);
+        self.pop_scope();
+        self.symbolic = saved;
+        r.ok()?.as_sym()
+    }
+
+    /// A bound as a symbolic value (`∞` as the infinity symbol).
+    fn sym_bound(&mut self, e: &Expr) -> Option<crate::cas::Sym> {
+        let saved = self.symbolic;
+        self.symbolic = true;
+        let r = self.eval(e);
+        self.symbolic = saved;
+        r.ok()?.as_sym()
+    }
+
+    /// Exact value of a definite integral by an antiderivative, accepted
+    /// only if it agrees with the numeric value (guards against
+    /// antiderivatives that jump inside the interval).
+    fn exact_definite(
+        &mut self,
+        var: &str,
+        body: &Expr,
+        lo: &Expr,
+        hi: &Expr,
+        numeric: f64,
+    ) -> Option<crate::cas::Sym> {
+        use crate::cas::limit::{Dir, Lim, Point, as_infinity, limit};
+        let f = self.symbolic_body(var, body)?;
+        let anti = crate::cas::integrate(&f, var)?;
+        let at = |ev: &mut Self, e: &Expr| -> Option<crate::cas::Sym> {
+            let b = ev.sym_bound(e)?;
+            match as_infinity(&b) {
+                Some(s) => {
+                    let p = if s > 0 { Point::PosInf } else { Point::NegInf };
+                    match limit(&anti, var, &p, Dir::Both).ok()? {
+                        Lim::Fin(v) => Some(v),
+                        _ => None,
+                    }
+                }
+                None => {
+                    let v = anti.subs(var, &b);
+                    (!v.has_undefined()).then_some(v)
+                }
+            }
+        };
+        let (a, b) = (at(self, lo)?, at(self, hi)?);
+        let r = crate::cas::simplify(&(b - a));
+        let approx = crate::cas::approx_f64(&r)?;
+        ((approx - numeric).abs() <= 1e-7 * numeric.abs().max(1.0)).then_some(r)
     }
 
     /// An integral bound: `∞`, `-∞` or a real number.
@@ -324,11 +400,36 @@ impl Evaluator<'_> {
         body: &Expr,
         span: Span,
     ) -> EvalResult<Value> {
-        // CAS hook: closed forms for symbolic bounds / infinite sums.
         let is_inf = |e: &Expr| matches!(&*e.kind, ExprKind::Ident(n) if canonical_name(n) == "∞");
-        if is_inf(to) {
+        if !self.opts.float64 {
+            // Closed forms for symbolic or infinite bounds.
+            let lo_v = self.sym_bound(from);
+            let hi_v = self.sym_bound(to);
+            let integral =
+                |s: &Option<crate::cas::Sym>| s.as_ref().is_some_and(|s| s.as_integer().is_some());
+            if !(integral(&lo_v) && integral(&hi_v)) {
+                let (Some(a), Some(b)) = (lo_v, hi_v) else {
+                    return Err(EvalError::other("invalid bounds", span));
+                };
+                let var = canonical_name(var).to_string();
+                let f = self
+                    .symbolic_body(&var, body)
+                    .ok_or_else(|| EvalError::other("the body has no symbolic form", body.span))?;
+                let r = match op {
+                    BigOpKind::Sum => crate::cas::summation(&f, &var, &a, &b),
+                    BigOpKind::Product => crate::cas::product(&f, &var, &a, &b),
+                };
+                return match r {
+                    Some(r) => self.sym_result(r, false, span),
+                    None => Err(EvalError::unsupported(
+                        "no closed form found for this sum/product",
+                        span,
+                    )),
+                };
+            }
+        } else if is_inf(to) {
             return Err(EvalError::unsupported(
-                "infinite sums and products need the CAS (not implemented yet)",
+                "infinite sums and products are not available in plots",
                 to.span,
             ));
         }
@@ -423,4 +524,69 @@ fn gk15<E>(
         }
     }
     Ok((kron * h, ((kron - gauss) * h).abs()))
+}
+
+/// Adaptive Gauss–Kronrod quadrature of a plain `f64` function on
+/// `[a, b]` (bounds may be infinite); `None` if it does not converge or
+/// the integrand is not finite.
+pub(crate) fn quad(f: &dyn Fn(f64) -> f64, a: f64, b: f64) -> Option<f64> {
+    if a == b {
+        return Some(0.0);
+    }
+    if a > b {
+        return quad(f, b, a).map(|v| -v);
+    }
+    type Map = Box<dyn Fn(f64) -> (f64, f64)>;
+    let (ta, tb, map): (f64, f64, Map) = match (a.is_finite(), b.is_finite()) {
+        (true, true) => (a, b, Box::new(|t| (t, 1.0))),
+        (true, false) => (
+            0.0,
+            1.0,
+            Box::new(move |t: f64| (a + t / (1.0 - t), 1.0 / ((1.0 - t) * (1.0 - t)))),
+        ),
+        (false, true) => (
+            0.0,
+            1.0,
+            Box::new(move |t: f64| (b - t / (1.0 - t), 1.0 / ((1.0 - t) * (1.0 - t)))),
+        ),
+        (false, false) => (
+            -1.0,
+            1.0,
+            Box::new(|t: f64| {
+                let d = 1.0 - t * t;
+                (t / d, (1.0 + t * t) / (d * d))
+            }),
+        ),
+    };
+    let mut g = |_: &mut (), t: f64| -> EvalResult<f64> {
+        let (x, jac) = map(t);
+        let y = f(x);
+        if !y.is_finite() {
+            return Err(EvalError::other("not finite", Span::default()));
+        }
+        Ok(y * jac)
+    };
+    let mut unit = ();
+    let first = gk15(&mut unit, &mut g, ta, tb).ok()?;
+    let mut parts = vec![(ta, tb, first.0, first.1)];
+    for _ in 0..400 {
+        let total: f64 = parts.iter().map(|p| p.2).sum();
+        let err: f64 = parts.iter().map(|p| p.3).sum();
+        if err <= 1e-11_f64.max(1e-11 * total.abs()) {
+            return Some(total);
+        }
+        let (k, _) = parts
+            .iter()
+            .enumerate()
+            .max_by(|x, y| x.1.3.total_cmp(&y.1.3))?;
+        let (lo, hi, _, _) = parts.swap_remove(k);
+        let mid = 0.5 * (lo + hi);
+        let l = gk15(&mut unit, &mut g, lo, mid).ok()?;
+        let r = gk15(&mut unit, &mut g, mid, hi).ok()?;
+        parts.push((lo, mid, l.0, l.1));
+        parts.push((mid, hi, r.0, r.1));
+    }
+    let total: f64 = parts.iter().map(|p| p.2).sum();
+    let err: f64 = parts.iter().map(|p| p.3).sum();
+    (err <= 1e-6 * total.abs().max(1.0)).then_some(total)
 }

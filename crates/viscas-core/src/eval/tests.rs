@@ -302,7 +302,7 @@ error_cases! {
     index_zero: "[1, 2, 3][0]" => ErrorKind::Index,
     index_fraction: "[1, 2, 3][1.5]" => ErrorKind::Index,
     units_unsupported: "5 km to m" => ErrorKind::Unsupported,
-    indefinite_integral: "∫ 2 dx" => ErrorKind::Unsupported,
+    indefinite_integral: "∫ e^(u^2) du" => ErrorKind::Unsupported,
     infinite_sum: "∑(k = 1, ∞) 1/k^2" => ErrorKind::Unsupported,
     redefine_builtin: "sin := 3" => ErrorKind::Definition,
     redefine_constant: "π := 3" => ErrorKind::Definition,
@@ -1651,7 +1651,8 @@ fn polar_inequalities_and_angles() {
 
 #[test]
 fn numeric_calculus_results_are_marked_approximate() {
-    assert!(ev("∫(0, 1) x^2 dx").starts_with('≈'));
+    assert!(ev("∫(0, 1) e^(-x^2) dx").starts_with('≈'));
+    assert_eq!(ev("∫(0, 1) x^2 dx"), "1/3");
     assert_eq!(ev("∑(k = 1, 3) k"), "6");
 }
 

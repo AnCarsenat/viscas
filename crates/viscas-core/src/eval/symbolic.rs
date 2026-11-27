@@ -720,6 +720,196 @@ pub(super) fn b_subs(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> Ev
     ev.sym_result(r, false, span)
 }
 
+fn integer_arg(v: &Value, span: Span, what: &str) -> EvalResult<i64> {
+    match v {
+        Value::Number(n) => n
+            .integer_value()
+            .ok()
+            .and_then(|k| k.to_i64())
+            .filter(|k| (0..=60).contains(k))
+            .ok_or_else(|| EvalError::other(format!("{what} must be an integer in 0..60"), span)),
+        other => Err(EvalError::ty(
+            format!("{what} must be an integer, got a {}", other.type_name()),
+            span,
+        )),
+    }
+}
+
+/// `integrate(f, x)`, `integrate(f, x, a, b)`.
+pub(super) fn b_integrate(
+    ev: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    span: Span,
+) -> EvalResult<Value> {
+    use crate::cas::limit::{Dir, Lim, Point, as_infinity, limit};
+    let f = arg_sym(first(&args), span)?;
+    let x = opt_var(&args, 1, &f, span)?;
+    let anti = cas::integrate(&f, &x);
+    match (args.get(2), args.get(3)) {
+        (None, None) => match anti {
+            Some(r) => ev.sym_result(r, false, span),
+            None => Err(EvalError::unsupported(
+                "no antiderivative found (try bounds for a numeric value)",
+                span,
+            )),
+        },
+        (Some(a), Some(b)) => {
+            let (a, b) = (arg_sym(a, span)?, arg_sym(b, span)?);
+            let numeric = numeric_integral(&f, &x, &a, &b);
+            if let Some(anti) = anti {
+                let at = |s: &Sym| -> Option<Sym> {
+                    match as_infinity(s) {
+                        Some(k) => {
+                            let p = if k > 0 { Point::PosInf } else { Point::NegInf };
+                            match limit(&anti, &x, &p, Dir::Both).ok()? {
+                                Lim::Fin(v) => Some(v),
+                                _ => None,
+                            }
+                        }
+                        None => Some(anti.subs(&x, s)).filter(|v| !v.has_undefined()),
+                    }
+                };
+                if let (Some(fa), Some(fb)) = (at(&a), at(&b)) {
+                    let r = cas::simplify(&(fb - fa));
+                    let ok = match (cas::approx_f64(&r), numeric) {
+                        (Some(e), Some(n)) => (e - n).abs() <= 1e-7 * n.abs().max(1.0),
+                        (Some(_), None) => !r.is_constant() || a.free_vars().is_empty(),
+                        _ => !r.is_constant(),
+                    };
+                    if ok {
+                        return ev.sym_result(r, false, span);
+                    }
+                }
+            }
+            match numeric {
+                Some(n) => Number::f64(n).map(Value::Number).at(span),
+                None => Err(EvalError::other(
+                    "the integral could not be evaluated",
+                    span,
+                )),
+            }
+        }
+        _ => Err(EvalError::other(
+            "give both bounds: integrate(f, x, a, b)",
+            span,
+        )),
+    }
+}
+
+/// Simpson-free numeric check: adaptive Gauss–Kronrod on `f64`.
+fn numeric_integral(f: &Sym, x: &str, a: &Sym, b: &Sym) -> Option<f64> {
+    use crate::cas::limit::as_infinity;
+    let bound = |s: &Sym| match as_infinity(s) {
+        Some(k) => Some(if k > 0 {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        }),
+        None => cas::approx_f64(s),
+    };
+    let (a, b) = (bound(a)?, bound(b)?);
+    if !f.free_vars().iter().all(|v| v == x) {
+        return None;
+    }
+    let g = |t: f64| cas::eval_f64(f, x, t);
+    super::calculus::quad(&g, a, b)
+}
+
+/// `limit(f, x, a)`, `limit(f, x, a, "+"|"-")`.
+pub(super) fn b_limit(_ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult<Value> {
+    use crate::cas::limit::{Dir, Point, as_infinity, limit};
+    let f = arg_sym(first(&args), span)?;
+    let x = var_name(&args[1], span)?;
+    let a = arg_sym(&args[2], span)?;
+    let point = match as_infinity(&a) {
+        Some(1) => Point::PosInf,
+        Some(_) => Point::NegInf,
+        None => Point::Finite(a),
+    };
+    let dir = match args.get(3) {
+        None => Dir::Both,
+        Some(Value::Str(s)) if s == "+" || s == "right" => Dir::Plus,
+        Some(Value::Str(s)) if s == "-" || s == "left" => Dir::Minus,
+        Some(Value::Number(n)) if n.is_real() && !n.is_zero() => {
+            if n.is_negative() {
+                Dir::Minus
+            } else {
+                Dir::Plus
+            }
+        }
+        Some(_) => {
+            return Err(EvalError::other(
+                "the direction is \"+\" (from the right) or \"-\" (from the left)",
+                span,
+            ));
+        }
+    };
+    let r = limit(&f, &x, &point, dir).map_err(|e| EvalError::other(e.0, span))?;
+    Ok(Value::sym(r.to_sym()))
+}
+
+/// `series(f, x, a, n)`: Taylor/Laurent polynomial with terms of order
+/// `< n` in `x − a`.
+pub(super) fn b_series(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult<Value> {
+    let f = arg_sym(first(&args), span)?;
+    let x = opt_var(&args, 1, &f, span)?;
+    let a = match args.get(2) {
+        Some(v) => arg_sym(v, span)?,
+        None => Sym::zero(),
+    };
+    let n = match args.get(3) {
+        Some(v) => integer_arg(v, span, "the order")?,
+        None => 6,
+    };
+    let r = cas::series(&f, &x, &a, n)
+        .ok_or_else(|| EvalError::other("no series expansion found at this point", span))?;
+    ev.sym_result(r, false, span)
+}
+
+/// `summation(f, k, a, b)`: closed form (b may be ∞).
+pub(super) fn b_summation(
+    ev: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    span: Span,
+) -> EvalResult<Value> {
+    let f = arg_sym(first(&args), span)?;
+    let k = var_name(&args[1], span)?;
+    let (a, b) = (arg_sym(&args[2], span)?, arg_sym(&args[3], span)?);
+    if let (Some(lo), Some(hi)) = (a.as_i64(), b.as_i64())
+        && hi - lo <= 100_000
+    {
+        let mut terms = Vec::new();
+        for i in lo..=hi {
+            ev.tick(span)?;
+            terms.push(f.subs(&k, &Sym::int(i)));
+        }
+        return ev.sym_result(Sym::add(terms), false, span);
+    }
+    let r = cas::summation(&f, &k, &a, &b)
+        .ok_or_else(|| EvalError::unsupported("no closed form found for this sum", span))?;
+    ev.sym_result(r, false, span)
+}
+
+/// `product(f, k, a, b)`.
+pub(super) fn b_product(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult<Value> {
+    let f = arg_sym(first(&args), span)?;
+    let k = var_name(&args[1], span)?;
+    let (a, b) = (arg_sym(&args[2], span)?, arg_sym(&args[3], span)?);
+    if let (Some(lo), Some(hi)) = (a.as_i64(), b.as_i64())
+        && hi - lo <= 100_000
+    {
+        let mut fs = Vec::new();
+        for i in lo..=hi {
+            ev.tick(span)?;
+            fs.push(f.subs(&k, &Sym::int(i)));
+        }
+        return ev.sym_result(Sym::mul(fs), false, span);
+    }
+    let r = cas::product(&f, &k, &a, &b)
+        .ok_or_else(|| EvalError::unsupported("no closed form found for this product", span))?;
+    ev.sym_result(r, false, span)
+}
+
 /// `steps(expr)` is evaluated by the caller (it needs the unevaluated
 /// argument); this body only runs for `steps` applied to a value.
 pub(super) fn b_steps(
