@@ -8,7 +8,6 @@ use viscas_core::eval::{classify, eval_expr, format_value};
 use viscas_core::syntax::{ExprKind, StmtKind, parse_statement_with};
 
 use crate::engine::Engine;
-use crate::eval::env_with;
 
 /// Steps a preview may take before giving up (an input needing more is
 /// not "cheap").
@@ -16,6 +15,9 @@ pub const PREVIEW_MAX_STEPS: u64 = 20_000;
 
 /// Longest input previewed (bytes).
 pub const PREVIEW_MAX_LEN: usize = 200;
+
+/// Most list elements a preview may create.
+pub const PREVIEW_MAX_ELEMENTS: u64 = 10_000;
 
 /// The evaluation a [`PreviewTask`] runs: exact and decimal texts.
 type PreviewFn = Box<dyn FnOnce(Arc<AtomicBool>) -> Option<(String, String)> + Send>;
@@ -68,8 +70,9 @@ impl Engine {
         {
             return None;
         }
-        let defs = self.evaluator().snapshot_shared();
-        let mut env = env_with(&defs);
+        // Resolves scene names through the shared live table on the
+        // worker: nothing is copied on the calling (GTK) thread.
+        let mut env = self.evaluator().live_env();
         for (n, v) in self.console.defs() {
             if !self.evaluator().defines(n) {
                 let _ = env.define(n, v.clone());
@@ -85,6 +88,7 @@ impl Engine {
             run: Box::new(move |cancel| {
                 let mut opts = settings.eval_options(Some(cancel));
                 opts.max_steps = PREVIEW_MAX_STEPS;
+                opts.max_elements = PREVIEW_MAX_ELEMENTS;
                 let v = eval_expr(&expr, &env, &opts).ok()?;
                 Some((
                     format_value(&v, &settings.exact_format()),

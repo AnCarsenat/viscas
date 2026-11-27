@@ -210,21 +210,7 @@ impl SceneEvaluator {
         d
     }
 
-    /// [`SceneEvaluator::snapshot`] without caching it (for `&self`
-    /// callers such as the input preview).
-    pub(crate) fn snapshot_shared(&self) -> Defs {
-        if let Some(d) = &self.frozen {
-            return d.clone();
-        }
-        Arc::new(
-            self.live
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
-        )
-    }
-
-    fn live_env(&self) -> Env {
+    pub(crate) fn live_env(&self) -> Env {
         let mut env = Env::new();
         env.set_resolver(Some(Arc::new(LiveResolver(self.live.clone()))));
         env

@@ -219,48 +219,35 @@ impl Engine {
     /// filtering, no commands): scene nodes, console locals, builtins and
     /// aliases, constants.
     pub fn completion_candidates(&self) -> Vec<Completion> {
+        self.candidates_matching(|_| true)
+    }
+
+    /// The candidates whose name passes `keep`. Names are tested before
+    /// any item is built; builtin items come from a static cache.
+    fn candidates_matching(&self, keep: impl Fn(&str) -> bool) -> Vec<Completion> {
         let mut out: Vec<Completion> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mut push = |c: Completion, out: &mut Vec<Completion>| {
-            if seen.insert(c.text.clone()) {
-                out.push(c);
-            }
-        };
         for n in self.scene().iter() {
-            if let Some(name) = n.defined_name() {
-                push(self.node_item(n, name), &mut out);
+            if let Some(name) = n.defined_name()
+                && keep(name)
+                && seen.insert(name.to_string())
+            {
+                out.push(self.node_item(n, name));
             }
         }
         let defs = self.console.defs();
         for name in self.console_names() {
-            if let Some(v) = defs.get(&name) {
-                push(self.value_item(&name, v), &mut out);
+            if keep(&name)
+                && let Some(v) = defs.get(&name)
+                && seen.insert(name.clone())
+            {
+                out.push(self.value_item(&name, v));
             }
         }
-        for f in catalog().functions() {
-            push(
-                Completion::function(&f.name, CompletionKind::Builtin, &f),
-                &mut out,
-            );
-        }
-        for b in BUILTINS {
-            // Builtins the catalog does not list.
-            let detail = function_help(b.name)
-                .map(|h| format!("{} — {}", h.signature, h.summary))
-                .unwrap_or_default();
-            let mut c = Completion::new(b.name, CompletionKind::Builtin, &detail);
-            c.snippet = Snippet::call(b.name, &[]);
-            push(c, &mut out);
-        }
-        for (alias, target) in ALIASES {
-            if let Some(f) = catalog().function(target) {
-                let mut c = Completion::function(alias, CompletionKind::Builtin, &f);
-                c.detail = format!("alias of {target}");
-                push(c, &mut out);
+        for c in builtin_items() {
+            if keep(&c.text) && seen.insert(c.text.clone()) {
+                out.push(c.clone());
             }
-        }
-        for c in CONSTANTS.iter().chain(ASCII_ALIASES) {
-            push(constant_item(c), &mut out);
         }
         out
     }
@@ -340,11 +327,7 @@ impl Engine {
         if fragment.is_empty() || in_string(before) {
             return set;
         }
-        let mut items: Vec<Completion> = self
-            .completion_candidates()
-            .into_iter()
-            .filter(|c| loose_match(&fragment, &c.text))
-            .collect();
+        let mut items = self.candidates_matching(|name| loose_match(&fragment, name));
         if scope == Scope::Console && before.trim_start().starts_with(":help") {
             items.extend(
                 COMMAND_HELP
@@ -384,9 +367,9 @@ impl Engine {
                 .find(|c| c.name == name)
                 .map(command_item);
         }
-        self.completion_candidates()
+        self.candidates_matching(|n| n == name)
             .into_iter()
-            .find(|c| c.text == name)
+            .next()
             .or_else(|| {
                 PLOT_VARS.contains(&name).then(|| {
                     let mut c = Completion::new(name, CompletionKind::Constant, "plot variable");
@@ -396,6 +379,43 @@ impl Engine {
                 })
             })
     }
+}
+
+/// Items for the catalog functions, builtins, aliases and constants
+/// (built once: they do not depend on the document).
+fn builtin_items() -> &'static [Completion] {
+    static ITEMS: std::sync::OnceLock<Vec<Completion>> = std::sync::OnceLock::new();
+    ITEMS.get_or_init(|| {
+        let mut out: Vec<Completion> = Vec::new();
+        let mut push = |c: Completion| {
+            if !out.iter().any(|o| o.text == c.text) {
+                out.push(c);
+            }
+        };
+        for f in catalog().functions() {
+            push(Completion::function(&f.name, CompletionKind::Builtin, &f));
+        }
+        for b in BUILTINS {
+            // Builtins the catalog does not list.
+            let detail = function_help(b.name)
+                .map(|h| format!("{} — {}", h.signature, h.summary))
+                .unwrap_or_default();
+            let mut c = Completion::new(b.name, CompletionKind::Builtin, &detail);
+            c.snippet = Snippet::call(b.name, &[]);
+            push(c);
+        }
+        for (alias, target) in ALIASES {
+            if let Some(f) = catalog().function(target) {
+                let mut c = Completion::function(alias, CompletionKind::Builtin, &f);
+                c.detail = format!("alias of {target}");
+                push(c);
+            }
+        }
+        for c in CONSTANTS.iter().chain(ASCII_ALIASES) {
+            push(constant_item(c));
+        }
+        out
+    })
 }
 
 fn constant_item(name: &str) -> Completion {
