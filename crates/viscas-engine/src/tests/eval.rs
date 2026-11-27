@@ -229,8 +229,11 @@ fn exact_and_approx_renderings() {
 #[test]
 fn irrational_values_are_marked_inexact() {
     let mut e = engine();
-    let a = var(&mut e, "a", "sqrt(2)");
+    let a = var(&mut e, "a", "sin(1)");
     assert!(exact(&e, a).starts_with('≈'));
+    // Surds and π stay exact.
+    let b = var(&mut e, "b", "sqrt(2)");
+    assert_eq!(exact(&e, b), "√2");
 }
 
 #[test]

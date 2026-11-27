@@ -12,6 +12,7 @@ use super::env::AngleUnit;
 use super::error::{ErrorKind, EvalError, EvalResult, NumSpan};
 use super::interp::Evaluator;
 use super::ops::Arith;
+use super::symbolic as sy;
 use super::value::{Function, Matrix, Value};
 use crate::number::{Number, NumberError, Precision};
 use crate::syntax::Span;
@@ -28,17 +29,40 @@ pub struct Builtin {
     /// `usize::MAX` for variadic functions.
     pub max: usize,
     pub f: BuiltinFn,
+    /// CAS function: arguments are evaluated in symbolic mode (unknown
+    /// names are symbols).
+    pub symbolic: bool,
+    /// Argument positions whose bare names (or lists of names) are
+    /// variables, bound to symbols while the arguments are evaluated
+    /// (`x` in `diff(f, x)`).
+    pub vars: &'static [usize],
 }
 
 const VAR: usize = usize::MAX;
 
 macro_rules! b {
-    ($name:literal, $min:expr, $max:expr, $f:ident) => {
+    ($name:literal, $min:expr, $max:expr, $f:expr) => {
         Builtin {
             name: $name,
             min: $min,
             max: $max,
             f: $f,
+            symbolic: false,
+            vars: &[],
+        }
+    };
+}
+
+/// CAS builtin (symbolic arguments).
+macro_rules! c {
+    ($name:literal, $min:expr, $max:expr, $f:expr, $vars:expr) => {
+        Builtin {
+            name: $name,
+            min: $min,
+            max: $max,
+            f: $f,
+            symbolic: true,
+            vars: $vars,
         }
     };
 }
@@ -91,7 +115,7 @@ pub static BUILTINS: &[Builtin] = &[
     b!("binom", 2, 2, b_binom),
     b!("perm", 2, 2, b_perm),
     b!("isprime", 1, 1, b_isprime),
-    b!("factor", 1, 1, b_factor),
+    c!("factor", 1, 1, sy::b_factor, &[]),
     // lists
     b!("min", 1, VAR, b_min),
     b!("max", 1, VAR, b_max),
@@ -110,6 +134,23 @@ pub static BUILTINS: &[Builtin] = &[
     b!("arg", 1, 1, b_arg),
     // matrices
     b!("transpose", 1, 1, b_transpose),
+    // computer algebra
+    c!("simplify", 1, 1, sy::b_simplify, &[]),
+    c!("expand", 1, 1, sy::b_expand, &[]),
+    c!("together", 1, 1, sy::b_together, &[]),
+    c!("cancel", 1, 1, sy::b_cancel, &[]),
+    c!("numerator", 1, 1, sy::b_numerator, &[]),
+    c!("denominator", 1, 1, sy::b_denominator, &[]),
+    c!("collect", 2, 2, sy::b_collect, &[1]),
+    c!("coeffs", 1, 2, sy::b_coeffs, &[1]),
+    c!("degree", 1, 2, sy::b_degree, &[1]),
+    c!("partfrac", 1, 2, sy::b_partfrac, &[1]),
+    c!("diff", 1, VAR, sy::b_diff, &[1, 2, 3, 4]),
+    c!("solve", 1, 4, sy::b_solve, &[1]),
+    c!("nsolve", 2, 4, sy::b_nsolve, &[1]),
+    c!("roots", 1, 2, sy::b_roots, &[1]),
+    c!("subs", 2, 3, sy::b_subs, &[1]),
+    c!("steps", 1, 1, sy::b_steps, &[]),
 ];
 
 /// Alternative names: `alias → canonical`.
@@ -500,18 +541,6 @@ fn b_isprime(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult
     })
 }
 
-fn b_factor(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult<Value> {
-    let n = ev.expect_num(first(args), span)?;
-    let factors = n.factorize().at(span)?;
-    let mut out = Vec::new();
-    for (p, k) in factors {
-        for _ in 0..k {
-            out.push(Value::Number(Number::Integer(p.clone())));
-        }
-    }
-    Ok(Value::List(out))
-}
-
 // ----- lists ------------------------------------------------------------
 
 fn list_arg(v: Value, name: &str, span: Span) -> EvalResult<Vec<Value>> {
@@ -633,7 +662,13 @@ fn b_range(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult<V
 fn b_num(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult<Value> {
     let p = ev.opts.precision;
     let f64_mode = ev.opts.float64;
-    ev.map_num(&first(args), span, &|n| {
+    let v = first(args);
+    if let Value::Expr(s) = &v
+        && !s.sym().is_constant()
+    {
+        return Ok(Value::sym(crate::cas::evalf(s.sym(), p)));
+    }
+    ev.map_num(&v, span, &|n| {
         Ok(if f64_mode {
             n.clone().into_f64_kind()
         } else {
@@ -646,7 +681,11 @@ fn b_num(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult<Val
 /// precision (`exact(0.75) = 3/4`, `exact(1/3.0) = 1/3`). Values that need
 /// a denominator above 10^15 are returned unchanged.
 fn b_exact(ev: &mut Evaluator<'_>, args: Vec<Value>, span: Span) -> EvalResult<Value> {
-    ev.map_num(&first(args), span, &|n| Ok(rationalize(n)))
+    let v = first(args);
+    if let Value::Expr(_) = v {
+        return Ok(v);
+    }
+    ev.map_num(&v, span, &|n| Ok(rationalize(n)))
 }
 
 pub(crate) fn rationalize(n: &Number) -> Number {

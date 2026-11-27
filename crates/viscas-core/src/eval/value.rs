@@ -4,14 +4,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::builtins::Builtin;
-use crate::number::Number;
+use crate::cas::Sym;
+use crate::number::{Number, Precision};
 use crate::syntax::{Block, Expr};
 
 /// A runtime value.
 ///
-/// The enum is `#[non_exhaustive]`: the CAS milestone will add a symbolic
-/// variant (`Value::Expr`, an unevaluated/simplified expression tree) so that
-/// `d/dx x^2` or `√2` can stay exact. Code outside this crate must keep a
+/// The enum is `#[non_exhaustive]`: code outside this crate must keep a
 /// wildcard arm.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -31,6 +30,48 @@ pub enum Value {
     /// Result of a failed restriction or a piecewise without a matching
     /// branch. Propagates through arithmetic.
     Undefined,
+    /// A symbolic expression ([`crate::cas`]): exact irrational constants
+    /// (`π`, `√2`), expressions in free symbols (`2x + 1`, results of
+    /// `diff`, `solve` with parameters) and relations (`x = 2`,
+    /// `-2 < x < 2`). Never a plain number (that is a [`Value::Number`]).
+    Expr(SymValue),
+}
+
+/// A symbolic value with its cached numeric approximation (constant
+/// expressions only), so that numeric consumers ([`Value::as_number`],
+/// [`Value::to_f64`]) keep working on `π`, `√2`, ...
+#[derive(Clone, Debug)]
+pub struct SymValue {
+    sym: Sym,
+    approx: Option<Number>,
+}
+
+impl SymValue {
+    pub fn new(sym: Sym) -> SymValue {
+        let approx = if sym.is_constant() {
+            crate::cas::approx(&sym, Precision::default())
+                .ok()
+                .map(|n| n.to_float(Precision::default()))
+        } else {
+            None
+        };
+        SymValue { sym, approx }
+    }
+
+    pub fn sym(&self) -> &Sym {
+        &self.sym
+    }
+
+    /// Numeric value of a constant expression (default precision).
+    pub fn approx(&self) -> Option<&Number> {
+        self.approx.as_ref()
+    }
+}
+
+impl PartialEq for SymValue {
+    fn eq(&self, other: &SymValue) -> bool {
+        self.sym == other.sym
+    }
 }
 
 /// Row-major numeric matrix.
@@ -152,12 +193,34 @@ impl Value {
             Value::Matrix(_) => "matrix",
             Value::Function(_) => "function",
             Value::Undefined => "undefined",
+            Value::Expr(s) if s.sym().is_rel() => "relation",
+            Value::Expr(_) => "expression",
         }
     }
 
+    /// The number, or the numeric approximation of a constant symbolic
+    /// expression (`π`, `√2`).
     pub fn as_number(&self) -> Option<&Number> {
         match self {
             Value::Number(n) => Some(n),
+            Value::Expr(s) => s.approx(),
+            _ => None,
+        }
+    }
+
+    /// A symbolic value (numbers become [`Value::Number`]).
+    pub fn sym(s: Sym) -> Value {
+        match s.as_num() {
+            Some(n) => Value::Number(n.clone()),
+            None => Value::Expr(SymValue::new(s)),
+        }
+    }
+
+    /// The symbolic expression of a number or expression value.
+    pub fn as_sym(&self) -> Option<Sym> {
+        match self {
+            Value::Number(n) => Some(Sym::num(n.clone())),
+            Value::Expr(s) => Some(s.sym().clone()),
             _ => None,
         }
     }
@@ -170,6 +233,10 @@ impl Value {
     pub fn to_f64(&self) -> f64 {
         match self {
             Value::Number(n) => n.to_f64(),
+            Value::Expr(s) => s
+                .approx()
+                .filter(|n| n.is_real())
+                .map_or(f64::NAN, |n| n.to_f64()),
             _ => f64::NAN,
         }
     }
@@ -185,6 +252,7 @@ impl PartialEq for Value {
             (Value::Matrix(a), Value::Matrix(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => Arc::ptr_eq(a, b),
             (Value::Undefined, Value::Undefined) => true,
+            (Value::Expr(a), Value::Expr(b)) => a == b,
             _ => false,
         }
     }
@@ -294,6 +362,16 @@ fn write_value(out: &mut String, value: &Value, opts: &FormatOptions) {
             }
         },
         Value::Undefined => out.push_str("undefined"),
+        Value::Expr(s) => match opts.style {
+            NumberStyle::Exact => out.push_str(&s.sym().to_text(opts.digits)),
+            NumberStyle::Approx => match s.approx() {
+                Some(n) => out.push_str(&n.to_decimal_string(opts.digits)),
+                None => {
+                    let p = Precision::digits(opts.digits.clamp(1, 200) as u32 + 5);
+                    out.push_str(&crate::cas::evalf(s.sym(), p).to_text(opts.digits));
+                }
+            },
+        },
     }
 }
 
