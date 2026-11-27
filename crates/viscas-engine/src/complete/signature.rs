@@ -51,8 +51,10 @@ pub fn call_at(line: &str, cursor: usize) -> Option<Call> {
                     .last()
                     .map(|(j, _)| j);
                 if let Some(s) = name_start {
+                    // A coefficient is not part of the name: `2sin(`.
+                    let s = s + head[s..].bytes().take_while(u8::is_ascii_digit).count();
                     let name = &head[s..];
-                    if !name.starts_with(|c: char| c.is_ascii_digit()) {
+                    if !name.is_empty() {
                         return Some(Call {
                             name: name.to_string(),
                             name_start: s,

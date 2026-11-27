@@ -16,6 +16,20 @@ pub struct Ranked {
     pub score: i32,
 }
 
+/// Everyday names, most common first: a tie-break so `s` offers `sin`
+/// before `sec`.
+const COMMON: [&str; 24] = [
+    "sin", "cos", "tan", "sqrt", "ln", "log", "exp", "abs", "pi", "e", "x", "y", "floor",
+    "ceil", "round", "min", "max", "sum", "asin", "acos", "atan", "fact", "gcd", "theta",
+];
+
+fn common_bonus(name: &str) -> i32 {
+    COMMON
+        .iter()
+        .position(|c| *c == name)
+        .map_or(0, |i| 48 - i32::try_from(i).unwrap_or(48))
+}
+
 fn kind_bonus(kind: CompletionKind) -> i32 {
     match kind {
         CompletionKind::Node => 30,
@@ -39,18 +53,29 @@ pub fn rank(fragment: &str, items: Vec<Completion>) -> Vec<Ranked> {
             let name = item.text.strip_prefix(':').unwrap_or(&item.text);
             let offset = item.text.len() - name.len();
             let m = fuzzy_match(query, name)?;
-            let mut score = m.score + kind_bonus(item.kind);
+            let len = name.chars().count();
+            let scene = matches!(item.kind, CompletionKind::Node | CompletionKind::Console);
+            // For a one-letter fragment, scene names only win when short
+            // and spelled with exactly that letter (`a` → `a1`, not
+            // `alpha` over `abs`).
+            let short_query = query.chars().count() < 2;
+            let kind = match (scene && short_query, name.starts_with(query) && len <= 3) {
+                (true, true) => kind_bonus(item.kind) + 40,
+                (true, false) => 0,
+                _ => kind_bonus(item.kind),
+            };
+            let mut score = m.score + kind + common_bonus(name);
             if !query.is_empty() {
                 if name.starts_with(query) {
-                    score += 200;
+                    score += 300;
                 } else if name.to_lowercase().starts_with(&lower) {
-                    score += 120;
+                    score += 200;
                 }
                 if name == query {
-                    score += 50;
+                    score += 80;
                 }
             }
-            score -= i32::try_from(name.chars().count()).unwrap_or(i32::MAX / 2);
+            score -= i32::try_from(len).unwrap_or(i32::MAX / 2);
             let positions = m.positions.iter().map(|p| p + offset).collect();
             Some(Ranked {
                 item,
@@ -102,6 +127,30 @@ mod tests {
         assert_eq!(names(&r)[..2], ["sin", "sinh"]);
         // `sign` and `asin` match loosely, after the prefix matches.
         assert_eq!(r.len(), 4);
+    }
+
+    #[test]
+    fn common_functions_first_for_one_letter() {
+        let items = vec![
+            c("sec", CompletionKind::Builtin),
+            c("sum", CompletionKind::Builtin),
+            c("sqrt", CompletionKind::Builtin),
+            c("sin", CompletionKind::Builtin),
+            c("speed", CompletionKind::Node),
+        ];
+        let r = rank("s", items);
+        assert_eq!(names(&r)[..3], ["sin", "sqrt", "sum"]);
+        // A short node spelled with the letter still ranks high.
+        let r = rank(
+            "a",
+            vec![c("abs", CompletionKind::Builtin), c("a1", CompletionKind::Node)],
+        );
+        assert_eq!(names(&r)[0], "a1");
+        let r = rank(
+            "a",
+            vec![c("abs", CompletionKind::Builtin), c("alpha", CompletionKind::Node)],
+        );
+        assert_eq!(names(&r)[0], "abs");
     }
 
     #[test]

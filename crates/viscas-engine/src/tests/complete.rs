@@ -222,6 +222,8 @@ fn call_at_finds_the_innermost_call() {
     assert_eq!((c.name.as_str(), c.arg), ("f", 1));
     assert!(call_at("(1, 2", 5).is_none());
     assert!(call_at("2(", 2).is_none());
+    let c = call_at("2sin(", 5).unwrap();
+    assert_eq!((c.name.as_str(), c.name_start), ("sin", 1));
     assert!(call_at("sin(1)", 6).is_none());
     assert!(call_at("f(\"a,(\", ", 9).is_some_and(|c| c.arg == 1));
 }
@@ -241,6 +243,7 @@ fn signature_help_for_builtins() {
     let s = e.signature_at("arcsin(", 7).unwrap();
     assert_eq!(s.active().label, "arcsin(x)");
     assert!(e.signature_at("nope(", 5).is_none());
+    assert_eq!(e.signature_at("3 + 2sin(", 9).unwrap().name, "sin");
     // Too many arguments: no parameter is active.
     let s = e.signature_at("sin(1, ", 7).unwrap();
     assert_eq!(s.active_param, None);
