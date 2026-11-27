@@ -157,6 +157,23 @@ pub static FUNCTION_HELP: &[HelpEntry] = &[
         "steps(expr)",
         "step-by-step rewrite steps of a CAS computation",
     ),
+    h(
+        "integrate",
+        "integrate(f, x, a, b)",
+        "antiderivative or exact definite integral",
+    ),
+    h("limit", "limit(f, x, a, dir)", "limit at a point or at ±∞"),
+    h(
+        "series",
+        "series(f, x, a, n)",
+        "Taylor/Laurent polynomial (also taylor)",
+    ),
+    h(
+        "summation",
+        "summation(f, k, a, b)",
+        "closed-form sum (symbolic or infinite bound)",
+    ),
+    h("product", "product(f, k, a, b)", "closed-form product"),
 ];
 
 /// Constants (canonical names).

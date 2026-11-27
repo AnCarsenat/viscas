@@ -329,9 +329,14 @@ impl<'a> Evaluator<'a> {
             "i" => Number::i(),
             "true" => return Ok(Some(Value::Bool(true))),
             "false" => return Ok(Some(Value::Bool(false))),
+            "∞" if self.symbolic => {
+                return Ok(Some(Value::Expr(super::value::SymValue::new(
+                    crate::cas::limit::infinity(),
+                ))));
+            }
             "∞" => {
                 return Err(EvalError::unsupported(
-                    "`∞` can only be used as a bound of ∫",
+                    "`∞` can only be used as a bound of ∫, ∑, ∏ or in CAS functions (limit)",
                     span,
                 ));
             }
