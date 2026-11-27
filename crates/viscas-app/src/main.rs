@@ -11,6 +11,7 @@ mod doc;
 mod doc_ui;
 mod docking;
 mod editors;
+mod export;
 mod fuzzy;
 mod keymap;
 mod layout;

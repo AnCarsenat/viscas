@@ -127,6 +127,13 @@ pub fn specs() -> Vec<ActionSpec> {
             &["Escape"],
         ),
         ActionSpec::new(
+            "viewport.export-box",
+            "Export Box Region (drag a box)",
+            "Viewport",
+            Context::Viewport,
+            &["Shift+e"],
+        ),
+        ActionSpec::new(
             "scene.rename",
             "Rename Node",
             "Scene Tree",

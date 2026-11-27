@@ -790,6 +790,11 @@ impl SceneTree {
             }),
             false,
         );
+        add_action(
+            "export",
+            Rc::new(|t, _| crate::export::open(&t.inner.ctx, Default::default())),
+            false,
+        );
         add_action("expand-all", Rc::new(|t, _| t.expand_all()), false);
         add_action("collapse-all", Rc::new(|t, _| t.collapse_all()), false);
         self.inner.root.insert_action_group("tree", Some(&group));
@@ -1387,6 +1392,7 @@ impl SceneTree {
         edit.append(Some("Delete\tDel"), Some("tree.delete"));
         menu.append_section(None, &edit);
         let more = gio::Menu::new();
+        more.append(Some("Export…"), Some("tree.export"));
         more.append(Some("Reveal in Dependency Graph"), Some("tree.reveal"));
         menu.append_section(None, &more);
         self.inner.menu.set_menu_model(Some(&menu));

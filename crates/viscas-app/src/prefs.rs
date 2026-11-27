@@ -468,6 +468,8 @@ pub struct Preferences {
     pub input: Input,
     /// Key bindings: preset and per-action overrides.
     pub keymap: KeymapPrefs,
+    /// Last export dialog settings.
+    pub export: crate::export::settings::ExportSettings,
     /// Loaded and saved separately so missing colors fall back to the
     /// preset instead of failing the whole file.
     #[serde(skip)]
@@ -487,6 +489,7 @@ impl Default for Preferences {
             system: System::default(),
             input: Input::default(),
             keymap: KeymapPrefs::default(),
+            export: Default::default(),
             theme: model::viscas_dark(),
         }
     }
@@ -501,6 +504,7 @@ impl Default for Theme {
 impl Preferences {
     /// Clamps numbers into range and repairs invalid values.
     pub fn validate(&mut self) {
+        self.export.validate();
         let i = &mut self.interface;
         i.ui_scale = UI_SCALE.clamp(i.ui_scale);
         i.font_size = FONT_SIZE.clamp(i.font_size);
