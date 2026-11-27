@@ -124,6 +124,22 @@ pub fn on_char(text: &str, caret: usize, sel: Option<(usize, usize)>, ch: char) 
     None
 }
 
+/// The closer to add after `open` was typed and committed: the char
+/// before `caret` is `open` and pairing applies to the text without it.
+pub fn closer_after_commit(text: &str, caret: usize, open: char) -> Option<char> {
+    let chars: Vec<char> = text.chars().collect();
+    if caret == 0 || chars.get(caret - 1) != Some(&open) {
+        return None;
+    }
+    let mut before: String = chars[..caret - 1].iter().collect();
+    let tail: String = chars[caret..].iter().collect();
+    before.push_str(&tail);
+    let e = on_char(&before, caret - 1, None, open)?;
+    (e.text.chars().count() == 2)
+        .then(|| e.text.chars().nth(1))
+        .flatten()
+}
+
 /// Smart backspace: deletes an empty pair (`(|)`, `[|]`, `{|}`, `||`)
 /// at once; `None` lets the key delete one char.
 pub fn on_backspace(text: &str, caret: usize, sel: Option<(usize, usize)>) -> Option<Edit> {
@@ -333,6 +349,18 @@ mod tests {
         // Step over the auto-inserted closing bar.
         let e = on_char("|x|", 2, None, '|').unwrap();
         assert_eq!((e.text.as_str(), e.caret), ("", 3));
+    }
+
+    #[test]
+    fn closers_follow_committed_openers() {
+        assert_eq!(closer_after_commit("2 + (", 5, '('), Some(')'));
+        // A dead key committed `^(` at once: still paired.
+        assert_eq!(closer_after_commit("x^(", 3, '('), Some(')'));
+        assert_eq!(closer_after_commit("2 + |", 5, '|'), Some('|'));
+        // The key typed something else (a compose result).
+        assert_eq!(closer_after_commit("2 + ê", 5, '('), None);
+        // Glued to a word: no closer.
+        assert_eq!(closer_after_commit("(ab", 1, '('), None);
     }
 
     #[test]

@@ -19,8 +19,8 @@ pub struct Ranked {
 /// Everyday names, most common first: a tie-break so `s` offers `sin`
 /// before `sec`.
 const COMMON: [&str; 24] = [
-    "sin", "cos", "tan", "sqrt", "ln", "log", "exp", "abs", "pi", "e", "x", "y", "floor",
-    "ceil", "round", "min", "max", "sum", "asin", "acos", "atan", "fact", "gcd", "theta",
+    "sin", "cos", "tan", "sqrt", "ln", "log", "exp", "abs", "pi", "e", "x", "y", "floor", "ceil",
+    "round", "min", "max", "sum", "asin", "acos", "atan", "fact", "gcd", "theta",
 ];
 
 fn common_bonus(name: &str) -> i32 {
@@ -143,12 +143,18 @@ mod tests {
         // A short node spelled with the letter still ranks high.
         let r = rank(
             "a",
-            vec![c("abs", CompletionKind::Builtin), c("a1", CompletionKind::Node)],
+            vec![
+                c("abs", CompletionKind::Builtin),
+                c("a1", CompletionKind::Node),
+            ],
         );
         assert_eq!(names(&r)[0], "a1");
         let r = rank(
             "a",
-            vec![c("abs", CompletionKind::Builtin), c("alpha", CompletionKind::Node)],
+            vec![
+                c("abs", CompletionKind::Builtin),
+                c("alpha", CompletionKind::Node),
+            ],
         );
         assert_eq!(names(&r)[0], "abs");
     }

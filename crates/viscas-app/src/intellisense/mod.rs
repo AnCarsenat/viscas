@@ -99,6 +99,9 @@ struct Inner {
     /// A key press that types or deletes is being handled (the change it
     /// makes keeps the snippet session; other edits end it).
     typing: Cell<bool>,
+    /// An opening bracket key was let through: its closer follows once
+    /// the char is in the text.
+    pending_pair: Cell<Option<char>>,
     /// The user navigated the popup or opened it explicitly: Enter
     /// accepts. An auto-opened, untouched popup lets Enter through.
     engaged: Cell<bool>,
@@ -156,6 +159,7 @@ impl Assist {
                 start: Cell::new(0),
                 own_edit: Cell::new(false),
                 typing: Cell::new(false),
+                pending_pair: Cell::new(None),
                 engaged: Cell::new(false),
                 change_pending: Cell::new(false),
                 snippet: RefCell::default(),
@@ -328,6 +332,14 @@ impl Assist {
         self.inner.last_len.set(len);
         let own = self.inner.own_edit.replace(false);
         let typing = self.inner.typing.replace(false);
+        if let Some(open) = self.inner.pending_pair.take()
+            && grew
+            && let Some(close) = edit::closer_after_commit(&text, caret, open)
+        {
+            self.inner.own_edit.set(true);
+            field.replace(caret, caret, &close.to_string());
+            field.set_cursor(caret);
+        }
         {
             let mut snip = self.inner.snippet.borrow_mut();
             // Foreign edits (history recall, undo, a model sync) make the
@@ -522,7 +534,15 @@ impl Assist {
             && matches!(ch, '(' | '[' | '{' | ')' | ']' | '}' | '|')
         {
             let f = &self.inner.field;
-            if let Some(e) = edit::on_char(&f.text(), f.cursor(), f.selection(), ch) {
+            let (text, caret, sel) = (f.text(), f.cursor(), f.selection());
+            if let Some(e) = edit::on_char(&text, caret, sel, ch) {
+                if sel.is_none() && e.text.chars().count() == 2 {
+                    // Opening a pair: let the key type its char (through
+                    // any input method or dead key in progress) and add
+                    // the closer once it is committed (`after_change`).
+                    self.inner.pending_pair.set(Some(ch));
+                    return go;
+                }
                 self.apply_edit(&e);
                 return stop;
             }
