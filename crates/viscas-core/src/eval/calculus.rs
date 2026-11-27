@@ -1,10 +1,12 @@
 //! Calculus operators: `d/dx`, `f'`, `∫`, `∑`, `∏`.
 //!
 //! Sums and products with finite integer bounds are computed exactly.
-//! Derivatives and definite integrals are numeric (`f64`) for now: central
-//! finite differences and adaptive Gauss–Kronrod (7/15) quadrature, with
-//! variable substitution for infinite bounds. The CAS milestone hooks in at
-//! the marked places to try a symbolic result first.
+//! Derivatives are symbolic in exact mode (`d/dx x^2 = 2x`, evaluated at
+//! the current value of `x` when it has one) with a numeric fallback
+//! (central finite differences) when the body has no symbolic derivative
+//! and in `float64` (plot) mode. Definite integrals are numeric: adaptive
+//! Gauss–Kronrod (7/15) quadrature, with variable substitution for
+//! infinite bounds; the CAS integration hooks in at the marked places.
 
 use num_traits::ToPrimitive;
 
@@ -39,8 +41,12 @@ impl Evaluator<'_> {
         body: &Expr,
         span: Span,
     ) -> EvalResult<Value> {
-        // CAS hook: symbolic differentiation of `body` goes here.
         let var = canonical_name(var).to_string();
+        if !self.opts.float64
+            && let Some(v) = self.symbolic_derivative(&var, order, body, span)?
+        {
+            return Ok(v);
+        }
         let Some(at) = self.lookup_known(&var, span)? else {
             return Err(EvalError::unsupported(
                 format!(
@@ -56,6 +62,84 @@ impl Evaluator<'_> {
             })?;
             Ok(Value::Number(Number::f64(d).at(span)?))
         })
+    }
+
+    /// `d^n/dx^n body` symbolically: `None` when the body has no symbolic
+    /// derivative (the caller falls back to numeric differentiation).
+    fn symbolic_derivative(
+        &mut self,
+        var: &str,
+        order: u32,
+        body: &Expr,
+        span: Span,
+    ) -> EvalResult<Option<Value>> {
+        use crate::cas::{Sym, diff_n};
+        let x = Value::Expr(super::value::SymValue::new(Sym::var(var)));
+        let saved = self.symbolic;
+        self.symbolic = true;
+        self.push_scope(vec![(var.to_string(), x)]);
+        let r = self.eval(body);
+        self.pop_scope();
+        self.symbolic = saved;
+        let Ok(v) = r else { return Ok(None) };
+        let Some(s) = v.as_sym() else { return Ok(None) };
+        let Ok(d) = diff_n(&s, var, order) else {
+            return Ok(None);
+        };
+        crate::cas::steps::record("derivative", || (s.clone(), d.clone()));
+        match self.lookup_known(var, span)? {
+            None => self.sym_result(d, false, span).map(Some),
+            Some(at) => {
+                let r = self.map_value(at, span, &mut |ev, a| match a.as_sym() {
+                    Some(a) => ev.sym_result(d.subs(var, &a), true, span),
+                    None => Err(EvalError::ty(
+                        format!(
+                            "`d/d{var}` needs a number for `{var}`, got a {}",
+                            a.type_name()
+                        ),
+                        span,
+                    )),
+                });
+                r.map(Some)
+            }
+        }
+    }
+
+    /// `f'(x)` for a one-parameter user function, symbolically: `None`
+    /// to fall back to numeric differentiation.
+    pub(crate) fn symbolic_prime(
+        &mut self,
+        f: &std::sync::Arc<super::value::Function>,
+        order: u32,
+        arg: &Value,
+        span: Span,
+    ) -> EvalResult<Option<Value>> {
+        use crate::cas::{Sym, diff_n};
+        let super::value::Function::User(u) = &**f else {
+            return Ok(None);
+        };
+        if u.params.len() != 1 || self.opts.float64 {
+            return Ok(None);
+        }
+        let p = u.params[0].clone();
+        let x = Value::Expr(super::value::SymValue::new(Sym::var(&p)));
+        let saved = self.symbolic;
+        self.symbolic = true;
+        let r = self.call_function(f, vec![x], span);
+        self.symbolic = saved;
+        let Ok(v) = r else { return Ok(None) };
+        let Some(s) = v.as_sym() else { return Ok(None) };
+        let Ok(d) = diff_n(&s, &p, order) else {
+            return Ok(None);
+        };
+        let r = self.map_value(arg.clone(), span, &mut |ev, a| match a.as_sym() {
+            Some(a) => ev.sym_result(d.subs(&p, &a), true, span),
+            None => Err(EvalError::ty(
+                format!("`f'` needs a number, got a {}", a.type_name()),
+                span,
+            )),
+        });
+        r.map(Some)
     }
 
     /// Numeric derivative of order `n` of `f` at `x`: 5-point stencils for

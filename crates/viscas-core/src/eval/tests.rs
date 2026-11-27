@@ -36,6 +36,8 @@ fn num(src: &str) -> f64 {
     let mut s = session();
     match s.eval(src) {
         Ok(Value::Number(n)) => n.to_f64(),
+        // Exact symbolic constants (π, √2) approximate.
+        Ok(v @ Value::Expr(_)) if v.as_number().is_some() => v.to_f64(),
         other => panic!("`{src}`: expected a number, got {other:?}"),
     }
 }
@@ -553,8 +555,10 @@ fn complex_mode_sqrt_negative() {
     let mut s = session();
     s.opts.complex = true;
     assert_eq!(ev_with(&mut s, "sqrt(-4)"), "2i");
+    // ln(-1) = iπ exactly.
+    assert_eq!(ev_with(&mut s, "ln(-1)"), "i·π");
     let v = s.eval("ln(-1)").unwrap();
-    let Value::Number(n) = v else { panic!() };
+    let n = v.as_number().unwrap();
     assert!(close(n.im().to_f64(), std::f64::consts::PI, 1e-12));
 }
 
@@ -845,12 +849,23 @@ fn derivative_at_point() {
 }
 
 #[test]
-fn derivative_without_value_is_unsupported() {
+fn derivative_without_value_is_symbolic() {
     let e = parse_expr("d/dx x^2").unwrap();
-    let r = eval_expr(&e, &Env::new(), &EvalOptions::default()).unwrap_err();
-    assert_eq!(r.kind, ErrorKind::Unsupported);
+    let r = eval_expr(&e, &Env::new(), &EvalOptions::default()).unwrap();
+    assert_eq!(r.to_string(), "2x");
     // At top level it is a plottable relation in x.
     assert!(err("d/dx x^2").message.contains("relation"));
+}
+
+#[test]
+fn derivative_exact_at_point() {
+    let mut s = session();
+    ev_with(&mut s, "let x = 2");
+    assert_eq!(ev_with(&mut s, "d/dx x^3"), "12");
+    assert_eq!(ev_with(&mut s, "d^2/dx^2 x^3"), "12");
+    ev_with(&mut s, "f(t) := sin(t)");
+    assert_eq!(ev_with(&mut s, "f'(π)"), "-1");
+    assert_eq!(ev_with(&mut s, "f'(1)"), "cos(1)");
 }
 
 #[test]
@@ -932,11 +947,13 @@ fn format_exact_and_approx() {
 
 #[test]
 fn format_float_uses_digits() {
-    let v = session().eval("π").unwrap();
+    let v = session().eval("num(π)").unwrap();
     assert_eq!(
         format_value(&v, &FormatOptions::default()),
         "≈3.14159265359"
     );
+    let v = session().eval("π").unwrap();
+    assert_eq!(format_value(&v, &FormatOptions::default()), "π");
     assert_eq!(format_value(&v, &FormatOptions::approx(5)), "3.1416");
 }
 

@@ -17,8 +17,19 @@
 //!
 //! [`Value`] is a number of the [numeric tower](crate::number), a boolean,
 //! a string, a list, a point/vector (`Tuple`, any dimension), a numeric
-//! [`Matrix`], a function (user closure or builtin) or `Undefined`. The
-//! enum is non-exhaustive: the CAS adds a symbolic variant later.
+//! [`Matrix`], a function (user closure or builtin), `Undefined`, or a
+//! symbolic expression (`Value::Expr`, see [`crate::cas`]): `π`, `√2`,
+//! `2x + 1`, `x = 2`. The enum is non-exhaustive.
+//!
+//! **Exact first.** In exact mode `π`, `e`, `τ`, `φ` are exact symbolic
+//! constants and surds stay exact (`√8 = 2√2`, `sin(π/4) = √2/2`,
+//! `asin(1/2) = π/6`); transcendental functions of plain rationals
+//! without a special value (`sin(1)`) are numeric. Constant expressions
+//! turn into numbers wherever a number is needed (`Value::as_number`
+//! gives their approximation). Inside the arguments of CAS functions
+//! (`simplify`, `solve`, `diff`, …) unknown names are symbols. See the
+//! glue module `symbolic.rs` for the exact rules and [`catalog`] for the
+//! documented function list (used by help and completion).
 //!
 //! - A list literal whose elements are equal-length lists of numbers is a
 //!   matrix (`[[1, 2], [3, 4]]`); `*` between matrices is the matrix
@@ -66,12 +77,14 @@
 //!   (`L.x` = x-coordinates). Lists have no `.length` (use `len(L)`).
 //!   `v.f(args)` calls `f(v, args)` when `f` is not a member
 //!   (`L.sort()`, `L.sum()`).
-//! - **Calculus.** `∑`/`∏` with integer bounds are exact loops. `d/dx`,
-//!   `f'(x)` and definite `∫` are numeric (`f64` results, shown with `≈`
-//!   even in exact mode): 5-point central
-//!   differences, adaptive Gauss–Kronrod 7/15 (infinite bounds by
-//!   substitution). Indefinite integrals, symbolic derivatives and
-//!   infinite sums need the CAS (marked hooks in `calculus.rs`).
+//! - **Calculus.** `∑`/`∏` with integer bounds are exact loops. `d/dx`
+//!   and `f'(x)` are symbolic in exact mode (`d/dx x^3 = 3x^2`, evaluated
+//!   exactly at the current value of `x` if it has one), numeric (5-point
+//!   central differences) in `float64` mode or when the body has no
+//!   symbolic derivative. Definite `∫` is numeric (adaptive Gauss–Kronrod
+//!   7/15, infinite bounds by substitution). Indefinite integrals and
+//!   infinite sums need the CAS integration stage (hooks in
+//!   `calculus.rs`).
 //! - **Units** (`5 km/h to m/s`) report "units are not supported yet".
 //!
 //! # Name resolution
@@ -190,21 +203,32 @@
 //! | `exact(x)` | simplest fraction within the float's precision (`exact(0.25) = 1/4`) |
 //! | `re im conj arg` | complex parts, conjugate, argument |
 //! | `transpose(M)` | matrix transpose (a list becomes a column) |
+//! | `simplify expand factor together cancel` | CAS rewriting (`factor(n)` on an integer: prime factors) |
+//! | `numerator denominator collect coeffs degree partfrac subs` | rational functions and polynomials |
+//! | `diff(f, x[, n])` | symbolic derivative |
+//! | `solve(eq, x[, a, b])`, `solve([eqs], [vars])` | exact solving: equations, systems, inequalities |
+//! | `nsolve(eq, x, guess)`, `nsolve(eq, x, a, b)`, `roots(p)` | numeric roots, polynomial roots |
+//! | `steps(expr)` | the CAS rewrite steps of `expr` |
 
 mod builtins;
 mod calculus;
+mod catalog;
 mod env;
 mod error;
 mod interp;
 mod ops;
 mod plot;
 mod statement;
+mod symbolic;
 mod value;
 
+#[cfg(test)]
+mod cas_tests;
 #[cfg(test)]
 mod tests;
 
 pub use builtins::{ALIASES, BUILTINS, Builtin, BuiltinFn};
+pub use catalog::{Category, FnDoc, catalog, function_doc};
 pub use env::{AngleUnit, CONSTANTS, Env, EvalOptions, Resolver, canonical_name, is_reserved};
 pub use error::{ErrorKind, EvalError, EvalResult};
 pub use interp::Evaluator;
@@ -214,7 +238,7 @@ pub use statement::{
     run_program,
 };
 pub use value::{
-    FnBody, FormatOptions, Function, Matrix, NumberStyle, UserFn, Value, format_value,
+    FnBody, FormatOptions, Function, Matrix, NumberStyle, SymValue, UserFn, Value, format_value,
 };
 
 use crate::syntax::Expr;

@@ -67,6 +67,9 @@ pub struct Evaluator<'a> {
     /// Captured variables of the closure being executed (shared).
     captured: Arc<Vec<(String, Value)>>,
     pi: Option<Number>,
+    /// Symbolic mode (arguments of CAS functions): unknown names are
+    /// symbols and functions stay exact.
+    pub(crate) symbolic: bool,
     _guard: Option<InterruptGuard>,
 }
 
@@ -96,6 +99,7 @@ impl<'a> Evaluator<'a> {
             elements: 0,
             captured: Arc::new(Vec::new()),
             pi: None,
+            symbolic: false,
             _guard: guard,
         }
     }
@@ -294,6 +298,19 @@ impl<'a> Evaluator<'a> {
 
     fn constant(&mut self, name: &str, span: Span) -> EvalResult<Option<Value>> {
         let prec = self.opts.precision;
+        if !self.opts.float64 {
+            use crate::cas::Sym;
+            let s = match name {
+                "π" => Some(Sym::pi()),
+                "τ" => Some(Sym::int(2) * Sym::pi()),
+                "e" => Some(Sym::e()),
+                "φ" => Some((Sym::one() + Sym::int(5).sqrt()) / Sym::int(2)),
+                _ => None,
+            };
+            if let Some(s) = s {
+                return Ok(Some(Value::sym(s)));
+            }
+        }
         let n = match name {
             "π" => self.pi()?,
             "τ" => self.pi()? * Number::from(2),
@@ -363,7 +380,43 @@ impl<'a> Evaluator<'a> {
         if let Some(pieces) = self.split_name(name) {
             return self.split_product(&pieces, span);
         }
+        if self.symbolic {
+            return self.symbol_value(name, span);
+        }
         Err(unknown_name(name, span))
+    }
+
+    /// An unknown name in symbolic mode: a symbol, or a product of
+    /// symbols and known values for a splittable name (`ab` = `a·b`).
+    fn symbol_value(&mut self, name: &str, span: Span) -> EvalResult<Value> {
+        use crate::cas::Sym;
+        let single = |p: &str| {
+            canonical_name(p)
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .count()
+                == 1
+        };
+        if single(name) || name.chars().count() > MAX_SPLIT_LEN {
+            return Ok(Value::Expr(super::value::SymValue::new(Sym::var(name))));
+        }
+        let Some(pieces) = split_with(name, &|p| self.is_known(canonical_name(p)) || single(p))
+        else {
+            return Ok(Value::Expr(super::value::SymValue::new(Sym::var(name))));
+        };
+        let mut acc: Option<Value> = None;
+        for p in pieces {
+            let p = canonical_name(&p).to_string();
+            let v = match self.lookup_known(&p, span)? {
+                Some(v) => v,
+                None => Value::Expr(super::value::SymValue::new(Sym::var(&p))),
+            };
+            acc = Some(match acc {
+                None => v,
+                Some(a) => self.arith(Arith::Mul, a, v, span)?,
+            });
+        }
+        Ok(acc.expect("at least one piece"))
     }
 
     /// Product of split pieces; a function piece applies to the product of
@@ -860,6 +913,7 @@ impl<'a> Evaluator<'a> {
     pub(crate) fn expect_num(&self, v: Value, span: Span) -> EvalResult<Number> {
         match v {
             Value::Number(n) => Ok(n),
+            Value::Expr(s) => self.expr_number(&s, span),
             other => Err(EvalError::ty(
                 format!("expected a number, got a {}", other.type_name()),
                 span,
@@ -957,6 +1011,11 @@ impl<'a> Evaluator<'a> {
                         Some(a) => self.arith(Arith::Mul, a, applied, span),
                     };
                 }
+                if self.symbolic {
+                    // An unknown "function" multiplies: f(x) = f·x.
+                    let v = self.symbol_value(name, callee.span)?;
+                    return self.apply_or_multiply(v, args, span);
+                }
                 Err(unknown_name(name, callee.span))
             }
             ExprKind::Prime { expr, order } => {
@@ -998,6 +1057,16 @@ impl<'a> Evaluator<'a> {
     /// `v(args)`: a call when `v` is a function, otherwise multiplication
     /// (`a(b + 1)` = `a·(b + 1)`, `a(1, 2)` = `a·(1, 2)`).
     fn apply_or_multiply(&mut self, v: Value, args: &[Expr], span: Span) -> EvalResult<Value> {
+        if let Value::Function(f) = &v
+            && let Function::Builtin(b) = &**f
+            && b.symbolic
+        {
+            if b.name == "steps" {
+                return self.eval_steps(args, span);
+            }
+            let argv = self.eval_symbolic_args(b, args)?;
+            return self.call_function(f, argv, span);
+        }
         let argv = self.eval_args(args)?;
         match v {
             Value::Function(f) => self.call_function(&f, argv, span),
@@ -1065,6 +1134,9 @@ impl<'a> Evaluator<'a> {
                 if args.len() < b.min || args.len() > b.max {
                     return Err(arity_error(b.name, b.min, b.max, args.len(), span));
                 }
+                if let Some(r) = self.try_symbolic_call(b, &args, span) {
+                    return r;
+                }
                 (b.f)(self, args, span)
             }
             Function::User(u) => {
@@ -1105,8 +1177,6 @@ impl<'a> Evaluator<'a> {
         args: Vec<Value>,
         span: Span,
     ) -> EvalResult<Value> {
-        // CAS hook: once symbolic differentiation exists, differentiate the
-        // body of a user function exactly here and evaluate the result.
         if args.len() != 1 {
             return Err(EvalError::new(
                 ErrorKind::Arity,
@@ -1115,6 +1185,9 @@ impl<'a> Evaluator<'a> {
             ));
         }
         let arg = args.into_iter().next().expect("one");
+        if let Some(v) = self.symbolic_prime(f, order, &arg, span)? {
+            return Ok(v);
+        }
         self.map_value(arg, span, &mut |ev, x| {
             let x0 = ev.real_f64(&x, span)?;
             let d = ev.numeric_derivative(order, x0, span, &mut |ev, t| {
@@ -1155,6 +1228,10 @@ impl<'a> Evaluator<'a> {
                 "expected a real number",
                 span,
             )),
+            Value::Expr(s) => {
+                let n = self.expr_number(s, span)?;
+                self.real_f64(&Value::Number(n), span)
+            }
             Value::Undefined => Ok(f64::NAN),
             other => Err(EvalError::ty(
                 format!("expected a number, got a {}", other.type_name()),

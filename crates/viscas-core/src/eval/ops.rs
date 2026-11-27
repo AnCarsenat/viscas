@@ -60,7 +60,15 @@ impl Evaluator<'_> {
         match (a, b) {
             (Value::Undefined, _) | (_, Value::Undefined) => Ok(Value::Undefined),
             (Value::Number(x), Value::Number(y)) => {
+                if op == Arith::Pow
+                    && let Some(v) = self.exact_surd_pow(&x, &y)
+                {
+                    return Ok(v);
+                }
                 self.num_arith(op, &x, &y, span).map(Value::Number)
+            }
+            (a @ (Value::Expr(_) | Value::Number(_)), b @ (Value::Expr(_) | Value::Number(_))) => {
+                self.sym_arith(op, a, b, span)
             }
             (Value::Matrix(m), Value::List(v)) if op == Arith::Mul => self.mat_vec(&m, &v, span),
             (Value::List(xs), Value::List(ys)) => {
@@ -125,7 +133,9 @@ impl Evaluator<'_> {
                 }
                 Ok(Value::Tuple(out))
             }
-            (Value::Tuple(xs), y @ Value::Number(_)) if matches!(op, Arith::Mul | Arith::Div) => {
+            (Value::Tuple(xs), y @ (Value::Number(_) | Value::Expr(_)))
+                if matches!(op, Arith::Mul | Arith::Div) =>
+            {
                 self.charge(xs.len() as u64, span)?;
                 let mut out = Vec::with_capacity(xs.len());
                 for x in xs {
@@ -133,7 +143,7 @@ impl Evaluator<'_> {
                 }
                 Ok(Value::Tuple(out))
             }
-            (x @ Value::Number(_), Value::Tuple(ys)) if op == Arith::Mul => {
+            (x @ (Value::Number(_) | Value::Expr(_)), Value::Tuple(ys)) if op == Arith::Mul => {
                 self.charge(ys.len() as u64, span)?;
                 let mut out = Vec::with_capacity(ys.len());
                 for y in ys {
@@ -200,7 +210,24 @@ impl Evaluator<'_> {
     }
 
     pub(crate) fn negate(&mut self, v: Value, span: Span) -> EvalResult<Value> {
-        self.map_num(&v, span, &|n| Ok(-n))
+        match v {
+            Value::Expr(s) => Ok(self.sym_negate(&s)),
+            Value::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(self.negate(it, span)?);
+                }
+                Ok(Value::List(out))
+            }
+            Value::Tuple(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(self.negate(it, span)?);
+                }
+                Ok(Value::Tuple(out))
+            }
+            v => self.map_num(&v, span, &|n| Ok(-n)),
+        }
     }
 
     /// Applies a numeric function to a number, or element-wise to lists,
@@ -237,6 +264,10 @@ impl Evaluator<'_> {
                 ev.check_real(x.is_real(), r, span)
             }),
             Value::Undefined => Ok(Value::Undefined),
+            Value::Expr(s) => {
+                let n = self.expr_number(s, span)?;
+                self.map_num(&Value::Number(n), span, f)
+            }
             other => Err(EvalError::ty(
                 format!("expected a number, got a {}", other.type_name()),
                 span,
@@ -254,6 +285,14 @@ impl Evaluator<'_> {
     ) -> EvalResult<Value> {
         match (a, b) {
             (Value::Undefined, _) | (_, Value::Undefined) => Ok(Value::Undefined),
+            (Value::Expr(s), y) => {
+                let n = Value::Number(self.expr_number(s, span)?);
+                self.zip_num(&n, y, span, f)
+            }
+            (x, Value::Expr(s)) => {
+                let n = Value::Number(self.expr_number(s, span)?);
+                self.zip_num(x, &n, span, f)
+            }
             (Value::Number(x), Value::Number(y)) => {
                 let r = f(x, y).at(span)?;
                 let r = self.check_real(x.is_real() && y.is_real(), r, span)?;
@@ -465,6 +504,8 @@ impl Evaluator<'_> {
                 };
                 Ok(Value::Bool(r))
             }
+            (Value::Expr(_), Value::Number(_) | Value::Expr(_))
+            | (Value::Number(_), Value::Expr(_)) => self.sym_compare(a, op, b, span),
             (Value::Str(x), Value::Str(y)) => Ok(Value::Bool(ordering_holds(op, x.cmp(y)))),
             (x, y) if matches!(op, CmpOp::Eq | CmpOp::Ne) => {
                 Ok(Value::Bool((x == y) == (op == CmpOp::Eq)))

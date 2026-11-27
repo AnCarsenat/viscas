@@ -6,6 +6,10 @@ use std::collections::BTreeSet;
 use super::env::{Env, EvalOptions, canonical_name};
 use super::error::{ErrorKind, EvalError, EvalResult};
 use super::interp::{Evaluator, Flow, function_signature, is_builtin_name, split_with};
+
+fn is_symbolic_builtin(name: &str) -> bool {
+    super::builtins::lookup(name).is_some_and(|b| b.symbolic)
+}
 use super::value::{FnBody, Value};
 use crate::syntax::{AddOp, CmpOp, Expr, ExprKind, Program, Span, Stmt, StmtKind, Term};
 
@@ -329,6 +333,15 @@ impl<'a> FreeVars<'a> {
             }
             ExprKind::Call { callee, args } => {
                 match &*callee.kind {
+                    // CAS functions: unknown names inside are symbols, not
+                    // free variables; only dependencies count.
+                    ExprKind::Ident(n) if is_symbolic_builtin(canonical_name(n)) => {
+                        let mut inner = FreeVars::new(self.env, self.locals);
+                        inner.bound = self.bound.clone();
+                        args.iter().for_each(|a| inner.expr(a));
+                        self.deps.extend(inner.deps);
+                        return;
+                    }
                     // `x(y+1)` with an unknown `x` is a product: `x` is free.
                     ExprKind::Ident(n) => self.name(n),
                     _ => self.expr(callee),
@@ -488,7 +501,7 @@ fn finish(ev: &mut Evaluator<'_>, v: Value) -> EvalResult<Value> {
     }
     let p = ev.opts.precision;
     match v {
-        Value::Number(_) | Value::List(_) | Value::Tuple(_) | Value::Matrix(_) => {
+        Value::Number(_) | Value::List(_) | Value::Tuple(_) | Value::Matrix(_) | Value::Expr(_) => {
             approx_value(ev, &v, p)
         }
         other => Ok(other),
@@ -518,6 +531,10 @@ fn approx_value(
         Value::Number(_) | Value::Matrix(_) => {
             ev.map_num(v, Span::default(), &|n| Ok(n.to_float(p)))
         }
+        Value::Expr(s) if s.sym().is_constant() => {
+            ev.map_num(v, Span::default(), &|n| Ok(n.to_float(p)))
+        }
+        Value::Expr(s) => Ok(Value::sym(crate::cas::evalf(s.sym(), p))),
         other => Ok(other.clone()),
     }
 }
@@ -624,6 +641,14 @@ impl Session {
         }
         self.locals = ev.take_scope();
         result.map(|()| out)
+    }
+
+    /// Evaluates `src` recording the CAS rewrite steps (spec §2.1.2):
+    /// the value and the steps, in order. Recording costs nothing when
+    /// this is not used.
+    pub fn eval_with_steps(&mut self, src: &str) -> EvalResult<(Value, Vec<crate::cas::Step>)> {
+        let (r, steps) = crate::cas::trace(|| self.eval(src));
+        r.map(|v| (v, steps))
     }
 
     /// Evaluates `src` and formats the result according to the session's

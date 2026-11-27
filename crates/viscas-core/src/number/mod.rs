@@ -68,6 +68,7 @@ mod float;
 mod format;
 mod functions;
 mod gamma;
+pub(crate) use gamma::gamma_f64;
 mod interrupt;
 mod parse;
 mod theory;

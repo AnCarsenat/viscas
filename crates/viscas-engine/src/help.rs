@@ -72,7 +72,11 @@ pub static FUNCTION_HELP: &[HelpEntry] = &[
     h("binom", "binom(n, k)", "binomial coefficient"),
     h("perm", "perm(n, k)", "k-permutations of n"),
     h("isprime", "isprime(n)", "primality test"),
-    h("factor", "factor(n)", "prime factors with multiplicity"),
+    h(
+        "factor",
+        "factor(n)",
+        "prime factors of an integer, or factorization of a polynomial",
+    ),
     h("min", "min(a, b, …)", "minimum of numbers or a list"),
     h("max", "max(a, b, …)", "maximum of numbers or a list"),
     h("sum", "sum(L)", "sum of a list"),
@@ -96,6 +100,63 @@ pub static FUNCTION_HELP: &[HelpEntry] = &[
     h("conj", "conj(z)", "complex conjugate"),
     h("arg", "arg(z)", "argument (angle) of a complex number"),
     h("transpose", "transpose(M)", "matrix transpose"),
+    // computer algebra (full docs: viscas_core::eval::catalog())
+    h(
+        "simplify",
+        "simplify(expr)",
+        "simplest form (fractions, trig/log/root identities)",
+    ),
+    h("expand", "expand(expr)", "multiply out products and powers"),
+    h("together", "together(expr)", "combine into one fraction"),
+    h(
+        "cancel",
+        "cancel(expr)",
+        "cancel common factors of a fraction",
+    ),
+    h("numerator", "numerator(expr)", "numerator of a fraction"),
+    h(
+        "denominator",
+        "denominator(expr)",
+        "denominator of a fraction",
+    ),
+    h("collect", "collect(expr, x)", "group terms by powers of x"),
+    h(
+        "coeffs",
+        "coeffs(p, x)",
+        "polynomial coefficients, highest degree first",
+    ),
+    h("degree", "degree(p, x)", "degree of a polynomial"),
+    h(
+        "partfrac",
+        "partfrac(expr, x)",
+        "partial fraction decomposition",
+    ),
+    h(
+        "subs",
+        "subs(expr, x, value)",
+        "substitute a value for a variable",
+    ),
+    h("diff", "diff(expr, x, n)", "symbolic derivative"),
+    h(
+        "solve",
+        "solve(eq, x, a, b)",
+        "exact solutions of equations, systems, inequalities",
+    ),
+    h(
+        "nsolve",
+        "nsolve(eq, x, a, b)",
+        "numeric roots (from a guess or in [a, b])",
+    ),
+    h(
+        "roots",
+        "roots(p, x)",
+        "roots of a polynomial with multiplicity",
+    ),
+    h(
+        "steps",
+        "steps(expr)",
+        "step-by-step rewrite steps of a CAS computation",
+    ),
 ];
 
 /// Constants (canonical names).
